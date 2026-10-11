@@ -109,7 +109,8 @@ async def gemini_agent(session, task, stats, model):
     for _ in range(10):
         resp = await client.aio.models.generate_content(
             model=model, contents=contents,
-            config=types.GenerateContentConfig(system_instruction=SYSTEM, tools=tools))
+            config=types.GenerateContentConfig(system_instruction=SYSTEM, tools=tools,
+                                               max_output_tokens=512))
         cand = resp.candidates[0] if resp.candidates else None
         if cand is None or not cand.content:
             return (resp.text or "").strip()
@@ -169,6 +170,7 @@ async def one_run(mode, task_name, agent, model, results_dir):
 async def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--runs", type=int, default=10)
+    ap.add_argument("--jobs", type=int, default=2, help="runs in flight at once; keep it small enough to stay under the API rate limits")
     ap.add_argument("--agent", choices=["gemini", "claude", "scripted"], default="gemini")
     ap.add_argument("--model", default=None, help="model name; defaults to $SYLENIX_MODEL")
     ap.add_argument("--out", default="results")
@@ -189,13 +191,19 @@ async def main():
     out = Path(args.out)
     out.mkdir(exist_ok=True)
 
+    sem = asyncio.Semaphore(max(1, args.jobs))
     rows = []
     with open(out / "runs.jsonl", "a") as fh:
         for mode in modes:
             for task in tasks:
-                for _ in range(args.runs):
-                    row = await one_run(mode, task, args.agent, args.model, out)
+
+                async def one(i, mode=mode, task=task):
+                    async with sem:
+                        row = await one_run(mode, task, args.agent, args.model, out)
                     row["agent"], row["model"] = args.agent, (model if args.agent != "scripted" else "-")
+                    return row
+
+                for row in await asyncio.gather(*(one(i) for i in range(args.runs))):
                     fh.write(json.dumps(row) + "\n")
                     fh.flush()
                     rows.append(row)

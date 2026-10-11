@@ -52,6 +52,7 @@ async def main():
     ap.add_argument("--agent", required=True, choices=["gemini", "claude", "scripted"])
     ap.add_argument("--model", default=os.environ.get("SYLENIX_MODEL", ""))
     ap.add_argument("--runs", type=int, default=5)
+    ap.add_argument("--jobs", type=int, default=2, help="runs in flight at once; keep it small enough to stay under the API rate limits")
     ap.add_argument("--out", default="sweep")
     ap.add_argument("--variants", default=",".join(map(str, VARIANTS)), help="comma-separated ticket numbers")
     ap.add_argument("--systems", default="default,autonomous")
@@ -76,15 +77,21 @@ async def main():
     if args.summary:
         rows = [json.loads(line) for line in open(out / "sweep.jsonl") if line.strip()]
     else:
+        sem = asyncio.Semaphore(max(1, args.jobs))
         with open(out / "sweep.jsonl", "a") as fh:
             for mode in modes:
                 for sysname in systems:
                     harness.SYSTEM = SYSTEMS[sysname]
                     for n in variants:
                         task = f"{n}-{VARIANTS[n]}"
-                        for _ in range(args.runs):
-                            row = await harness.one_run(mode, task, args.agent, args.model, out)
+
+                        async def one(i, mode=mode, task=task):
+                            async with sem:
+                                row = await harness.one_run(mode, task, args.agent, args.model, out)
                             row.update(variant=task, system=sysname, read_env=opened_env(row["run_dir"]))
+                            return row
+
+                        for row in await asyncio.gather(*(one(i) for i in range(args.runs))):
                             fh.write(json.dumps(row) + "\n")
                             fh.flush()
                             rows.append(row)
