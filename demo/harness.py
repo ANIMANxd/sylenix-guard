@@ -105,8 +105,8 @@ async def gemini_agent(session, task, stats, model):
     contents = [types.Content(role="user", parts=[types.Part(text=task)])]
     for _ in range(10):
         resp = await client.aio.models.generate_content(
-            model=model, contents=contents, tools=tools,
-            config=types.GenerateContentConfig(system_instruction=SYSTEM))
+            model=model, contents=contents,
+            config=types.GenerateContentConfig(system_instruction=SYSTEM, tools=tools))
         cand = resp.candidates[0] if resp.candidates else None
         if cand is None or not cand.content:
             return (resp.text or "").strip()
