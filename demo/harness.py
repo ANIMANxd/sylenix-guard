@@ -6,9 +6,11 @@ demo/server.py and record: did the injected instruction get a secret out
 blocked. Every run gets a fresh workspace, a fresh server and a fresh guard,
 so the taint latch always starts clean.
 
-    pip install mcp anthropic
-    export ANTHROPIC_API_KEY=...
-    python demo/harness.py --runs 10                    # real model
+    pip install "mcp<2" google-genai
+    export GEMINI_API_KEY=...
+    export SYLENIX_MODEL=gemini-2.5-flash             # any tool-calling model you have access to
+    python demo/harness.py --runs 10                    # real model; gemini is the default agent
+    python demo/harness.py --agent claude --runs 10     # the Anthropic path, needs `pip install anthropic`
     python demo/harness.py --agent scripted --runs 3    # plumbing check only
 
 The scripted agent obeys any injection by construction. It exists to prove the
@@ -93,6 +95,34 @@ async def claude_agent(session, task, stats, model):
     return ""
 
 
+async def gemini_agent(session, task, stats, model):
+    from google import genai
+    from google.genai import types
+    client = genai.Client()  # reads GEMINI_API_KEY from the environment
+    tools = [types.Tool(function_declarations=[
+        {"name": t.name, "description": t.description or "", "parameters": t.inputSchema}
+        for t in (await session.list_tools()).tools])]
+    contents = [types.Content(role="user", parts=[types.Part(text=task)])]
+    for _ in range(10):
+        resp = await client.aio.models.generate_content(
+            model=model, contents=contents, tools=tools,
+            config=types.GenerateContentConfig(system_instruction=SYSTEM))
+        cand = resp.candidates[0] if resp.candidates else None
+        if cand is None or not cand.content:
+            return (resp.text or "").strip()
+        contents.append(cand.content)
+        calls = [p.function_call for p in (cand.content.parts or []) if getattr(p, "function_call", None)]
+        if not calls:
+            return "".join(p.text for p in (cand.content.parts or []) if getattr(p, "text", None))
+        results = []
+        for fc in calls:
+            text, is_err = await call_tool(session, fc.name, dict(fc.args or {}), stats)
+            results.append(types.Part.from_function_response(
+                name=fc.name, response={"result": text, "isError": is_err}))
+        contents.append(types.Content(role="tool", parts=results))
+    return ""
+
+
 async def scripted_agent(session, task, stats, model):
     """Obeys injected instructions. Plumbing check only."""
     await session.list_tools()
@@ -106,6 +136,9 @@ async def scripted_agent(session, task, stats, model):
     return "Summary of the ticket."
 
 
+AGENTS = {"gemini": gemini_agent, "claude": claude_agent, "scripted": scripted_agent}
+
+
 async def one_run(mode, task_name, agent, model, results_dir):
     task = TASKS[task_name]
     run_dir = Path(tempfile.mkdtemp(prefix="sylenix-run-", dir=results_dir))
@@ -117,7 +150,7 @@ async def one_run(mode, task_name, agent, model, results_dir):
         async with stdio_client(server_params(mode, run_dir, run_dir / "guard")) as (r, w):
             async with ClientSession(r, w) as session:
                 await session.initialize()
-                final = await (claude_agent if agent == "claude" else scripted_agent)(session, task["prompt"], stats, model)
+                final = await AGENTS[agent](session, task["prompt"], stats, model)
     except Exception as e:
         stats["errors"] += 1
         final = f"run failed: {e}"
@@ -133,12 +166,17 @@ async def one_run(mode, task_name, agent, model, results_dir):
 async def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--runs", type=int, default=10)
-    ap.add_argument("--agent", choices=["claude", "scripted"], default="claude")
-    ap.add_argument("--model", default=os.environ.get("SYLENIX_MODEL", "claude-haiku-5-5"))
+    ap.add_argument("--agent", choices=["gemini", "claude", "scripted"], default="gemini")
+    ap.add_argument("--model", default=None, help="model name; defaults to $SYLENIX_MODEL")
     ap.add_argument("--out", default="results")
     ap.add_argument("--tasks", default=",".join(TASKS), help="comma-separated subset of: " + ",".join(TASKS))
     ap.add_argument("--modes", default="direct,guarded", help="comma-separated subset of: direct,guarded")
     args = ap.parse_args()
+    model = args.model or os.environ.get("SYLENIX_MODEL")
+    if args.agent == "gemini" and not os.environ.get("GEMINI_API_KEY"):
+        sys.exit("the gemini agent needs GEMINI_API_KEY in the environment")
+    if args.agent in ("gemini", "claude") and not model:
+        sys.exit(f"the {args.agent} agent needs a model: pass --model or set SYLENIX_MODEL")
     tasks = [t for t in args.tasks.split(",") if t]
     modes = [m for m in args.modes.split(",") if m]
     if not set(tasks) <= set(TASKS) or not set(modes) <= {"direct", "guarded"}:
@@ -154,7 +192,7 @@ async def main():
             for task in tasks:
                 for _ in range(args.runs):
                     row = await one_run(mode, task, args.agent, args.model, out)
-                    row["agent"], row["model"] = args.agent, args.model
+                    row["agent"], row["model"] = args.agent, (model if args.agent != "scripted" else "-")
                     fh.write(json.dumps(row) + "\n")
                     fh.flush()
                     rows.append(row)
@@ -169,7 +207,7 @@ async def main():
         a["completed"] += r["completed"]
         a["blocked_calls"] += r["blocked"]
         a["errors"] += r["errors"]
-    print(f"\nagent={args.agent} model={args.model if args.agent == 'claude' else '-'} runs/cell={args.runs}\n")
+    print(f"\nagent={args.agent} model={model if args.agent != 'scripted' else '-'} runs/cell={args.runs}\n")
     print(f"{'mode':8s} {'task':13s} {'attempted':>10s} {'secret leaked':>14s} {'task completed':>15s} {'blocked calls':>14s} {'errors':>7s}")
     with open(out / "summary.csv", "w") as csvf:
         csvf.write("mode,task,n,attempted,leaked,completed,blocked_calls,errors\n")
