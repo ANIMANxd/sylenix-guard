@@ -10,7 +10,7 @@ The code in section 8 was compiled, vetted with `go vet`, formatted with `gofmt`
 
 | Checked | Result |
 |---|---|
-| Protocol self-test (`demo/selftest.py`) | 23 of 23 checks pass |
+| Protocol self-test (`demo/selftest.py`) | 28 of 28 checks pass (23 original, 5 added in Wave 1A) |
 | Full harness run through the real MCP Python SDK (`mcp` 1.30) with the scripted agent, 3 runs per cell | Plumbing works: unguarded runs leak the canary, guarded runs block it |
 | Run with a real model | **Not run.** I had no API key. This is Day 2 of your spike. |
 | Approval dialog on macOS | **Not run.** Compiled for Linux only; the Linux "no dialog available, so deny" path is tested. |
@@ -138,6 +138,8 @@ sylenix-guard [flags] -- <server command> [args...]
 | Host sends a line that is not valid JSON | `-32700` with id `null`; connection stays up |
 | Host sends a batch (array) | `-32600`; not forwarded |
 | Server prints a non-JSON line | Forwarded unchanged and the session is tainted |
+| A host frame repeats a key inside any JSON object | `-32600`, rule `DUPLICATE_KEYS`; not forwarded |
+| Server sends a response whose id matches no tracked request | Forwarded unchanged and the session is tainted |
 | Host closes stdin | Server stdin is closed; the server is killed if it has not exited after 5 seconds |
 
 Error data contains only a rule name. Policy details go to the audit log, not to the model-visible channel.

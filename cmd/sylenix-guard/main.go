@@ -207,6 +207,10 @@ func (g *Guard) fromHost(line []byte) (forward bool, reply []byte) {
 		g.event("unparseable_host_frame", map[string]any{"bytes": len(line)})
 		return false, errorFrame(nil, -32700, "Parse error", "UNPARSEABLE")
 	}
+	if hasDuplicateKeys(trim) {
+		g.event("block", map[string]any{"rule": "DUPLICATE_KEYS"})
+		return false, errorFrame(nil, -32600, "Invalid request", "DUPLICATE_KEYS")
+	}
 	var method string
 	_ = json.Unmarshal(f["method"], &method)
 	id := f["id"]
@@ -283,6 +287,7 @@ func (g *Guard) fromServer(line []byte) []byte {
 
 	p, ok := g.take(f["id"])
 	if !ok {
+		g.latch("unmatched_response") // a response to nothing we tracked: assume untrusted
 		g.event("unmatched_response", nil)
 		return line
 	}
@@ -493,6 +498,57 @@ func isInvisible(r rune) bool {
 		return true
 	}
 	return false
+}
+
+// hasDuplicateKeys reports whether any JSON object inside b repeats a key.
+// Parsers disagree about which duplicate wins, so the guard refuses such frames
+// instead of guessing which value the server will act on.
+func hasDuplicateKeys(b []byte) bool {
+	type level struct {
+		isObj     bool
+		expectKey bool
+		keys      map[string]bool
+	}
+	dec := json.NewDecoder(bytes.NewReader(b))
+	var stack []level
+	valueDone := func() {
+		if n := len(stack); n > 0 && stack[n-1].isObj {
+			stack[n-1].expectKey = true
+		}
+	}
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			return false // io.EOF, or malformed input that json.Unmarshal already rejected
+		}
+		switch t := tok.(type) {
+		case json.Delim:
+			switch t {
+			case '{':
+				stack = append(stack, level{isObj: true, expectKey: true, keys: map[string]bool{}})
+			case '[':
+				stack = append(stack, level{})
+			default: // '}' or ']'
+				stack = stack[:len(stack)-1]
+				valueDone()
+			}
+		default: // string, number, bool or null
+			n := len(stack)
+			if n == 0 || !stack[n-1].isObj {
+				continue
+			}
+			if stack[n-1].expectKey {
+				key, _ := t.(string)
+				if stack[n-1].keys[key] {
+					return true
+				}
+				stack[n-1].keys[key] = true
+				stack[n-1].expectKey = false
+			} else {
+				stack[n-1].expectKey = true
+			}
+		}
+	}
 }
 
 func hasInvisible(s string) bool {

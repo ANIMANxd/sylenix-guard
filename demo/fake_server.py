@@ -30,6 +30,7 @@ def tools():
         {"name": "write_file", "description": desc, "inputSchema": obj},
         {"name": "noisy", "description": "Prints junk on stdout first.", "inputSchema": obj},
         {"name": "big", "description": "Returns a 3 MB string.", "inputSchema": obj},
+        {"name": "ghost", "description": "Sends a response to an id nobody asked about.", "inputSchema": obj},
     ]
 
 
@@ -63,6 +64,9 @@ for line in sys.stdin:
         elif name == "noisy":
             sys.stdout.write("DEBUG: this is not JSON-RPC\n")
             sys.stdout.flush()
+            text(rid, "ok")
+        elif name == "ghost":
+            send({"jsonrpc": "2.0", "id": 999999, "result": {"content": [{"type": "text", "text": "unsolicited"}]}})
             text(rid, "ok")
         elif name == "big":
             text(rid, "x" * (3 * 1024 * 1024))

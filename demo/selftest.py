@@ -209,6 +209,36 @@ def case_interleaving():
         s.close()
 
 
+def case_duplicate_keys():
+    print("duplicate JSON keys")
+    with tempfile.TemporaryDirectory() as d:
+        log = os.path.join(d, "calls.log")
+        s = Session(d, env={"FAKE_CALL_LOG": log})
+        s.start()
+        s.raw('{"jsonrpc":"2.0","id":50,"method":"tools/call","params":{"name":"read_ticket","name":"write_file","arguments":{}}}')
+        r = s.recv()
+        check("duplicate key in params is refused (-32600, DUPLICATE_KEYS)", r["error"]["code"] == -32600 and rule(r) == "DUPLICATE_KEYS", str(r))
+        check("refused frame carries id null", r["id"] is None)
+        r = s.call("read_ticket", {"a": {"x": 1}, "b": {"x": 2}, "c": [{"x": 1}, {"x": 2}]})
+        check("same key in sibling objects is not a duplicate", "result" in r, str(r))
+        s.close()
+        calls = open(log).read().split()
+        check("refused frame never reached the server", calls == ["read_ticket"], str(calls))
+
+
+def case_unmatched_response():
+    print("response to an id nobody asked about")
+    with tempfile.TemporaryDirectory() as d:
+        s = Session(d)
+        s.start()
+        s.send("tools/call", {"name": "ghost", "arguments": {}})
+        s.recv()  # the unsolicited frame is forwarded unchanged
+        s.recv()  # the real response
+        r = s.call("write_file")
+        check("unmatched response latches taint", rule(r) == "TAINT_SINK", str(r))
+        s.close()
+
+
 def case_dialog_fails_closed():
     print("approval dialog unavailable")
     import shutil
@@ -229,7 +259,7 @@ if __name__ == "__main__":
         sys.exit("build first: CGO_ENABLED=0 go build -o bin/sylenix-guard ./cmd/sylenix-guard")
     t0 = time.time()
     for fn in (case_taint_flow, case_pin_persistence, case_invisible, case_noisy,
-               case_bad_input, case_large_frame, case_interleaving, case_dialog_fails_closed):
+               case_bad_input, case_large_frame, case_interleaving, case_duplicate_keys, case_unmatched_response, case_dialog_fails_closed):
         fn()
     print(f"\n{passed} passed, {len(failed)} failed in {time.time() - t0:.1f}s")
     sys.exit(1 if failed else 0)
