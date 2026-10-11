@@ -112,7 +112,7 @@ export SYLENIX_MODEL=<any tool-calling model you have access to>
 python demo/harness.py --runs 10
 ```
 
-The harness writes every run to `results/runs.jsonl` and prints a table of secret leaks, completed tasks, blocked calls and errors for each mode and task.
+The harness writes every run to `results/runs.jsonl`, a per-run `transcript.json`, and `results/summary.csv`, and prints a table of attempted leaks, actual leaks, completed tasks, blocked calls and errors for each mode and task. `--tasks` and `--modes` limit what runs.
 
 ## 6. How the guard behaves
 
