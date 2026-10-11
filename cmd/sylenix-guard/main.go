@@ -25,12 +25,14 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unicode"
 )
 
-const maxFrame = 10 << 20 // 10 MB per JSON-RPC line
+const maxFrame = 10 << 20      // longest accepted JSON-RPC line: 10 MiB
+const discardBudget = 64 << 20 // most bytes thrown away while skipping one oversize line
 
 type frame map[string]json.RawMessage
 
@@ -54,6 +56,8 @@ type Guard struct {
 	pins        map[string]string
 	quarantined map[string]string
 
+	serverGone atomic.Bool // set once the server's stdout has closed
+
 	outMu sync.Mutex // serializes every write to the host's stdout
 	out   io.Writer
 
@@ -68,6 +72,7 @@ func main() {
 	trust := flag.String("trust", "", "comma-separated tools whose results do NOT taint the session")
 	approve := flag.String("approve", "deny", "what to do with a blocked call: deny | dialog")
 	noSpot := flag.Bool("no-spotlight", false, "do not datamark untrusted tool results")
+	resetPins := flag.Bool("reset-pins", false, "discard existing pins and trust every tool as new on first sight")
 	flag.Parse()
 
 	args := flag.Args()
@@ -113,7 +118,10 @@ func main() {
 		out:         os.Stdout,
 		log:         logf,
 	}
-	g.loadPins()
+	if !g.loadPins(*resetPins) {
+		fmt.Fprintf(os.Stderr, "[sylenix-guard] pin file %s exists but cannot be read; refusing to start. Inspect it, or restart with --reset-pins to trust every tool as new.\n", g.pinsPath())
+		os.Exit(2)
+	}
 
 	cmd := exec.Command(args[0], args[1:]...)
 	childIn, err := cmd.StdinPipe()
@@ -141,12 +149,34 @@ func main() {
 		os.Exit(1)
 	}()
 
+	// Closing the server's stdin asks it to exit; the kill timer makes sure it does.
+	var shutdownOnce sync.Once
+	shutdownServer := func() {
+		shutdownOnce.Do(func() {
+			_ = childIn.Close()
+			time.AfterFunc(5*time.Second, func() { _ = cmd.Process.Kill() })
+		})
+	}
+
 	// Host -> server. Every tools/call is checked before it is forwarded.
 	go func() {
-		sc := bufio.NewScanner(os.Stdin)
-		sc.Buffer(make([]byte, 64*1024), maxFrame)
-		for sc.Scan() {
-			line := append([]byte(nil), sc.Bytes()...)
+		rd := bufio.NewReaderSize(os.Stdin, 64*1024)
+		for {
+			line, tooLong, broken, err := readFrame(rd, maxFrame)
+			if err != nil {
+				if err != io.EOF {
+					g.event("host_read_error", map[string]any{"error": err.Error()})
+				}
+				break
+			}
+			if tooLong {
+				g.event("host_frame_too_large", map[string]any{"fatal": broken})
+				g.write(errorFrame(nil, -32600, "Frame too large", "FRAME_TOO_LARGE"))
+				if broken {
+					break
+				}
+				continue
+			}
 			if len(bytes.TrimSpace(line)) == 0 {
 				continue
 			}
@@ -158,36 +188,48 @@ func main() {
 				_, _ = childIn.Write(append(line, '\n'))
 			}
 		}
-		if err := sc.Err(); err != nil {
-			g.event("host_read_error", map[string]any{"error": err.Error()})
-		}
-		// Host closed stdin: let the server finish, then make sure it exits.
-		_ = childIn.Close()
-		time.AfterFunc(5*time.Second, func() { _ = cmd.Process.Kill() })
+		// Host closed stdin (or the stream can no longer be framed): let the server finish.
+		shutdownServer()
 	}()
 
 	// Server -> host. Results are inspected, taint is latched, then forwarded.
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		sc := bufio.NewScanner(childOut)
-		sc.Buffer(make([]byte, 64*1024), maxFrame)
-		for sc.Scan() {
-			line := append([]byte(nil), sc.Bytes()...)
+		rd := bufio.NewReaderSize(childOut, 64*1024)
+		for {
+			line, tooLong, broken, err := readFrame(rd, maxFrame)
+			if err != nil {
+				if err != io.EOF {
+					g.event("server_read_error", map[string]any{"error": err.Error()})
+				}
+				break
+			}
+			if tooLong {
+				// We cannot inspect it and we cannot tell which request it answered.
+				g.latch("oversize_server_frame")
+				g.event("server_frame_too_large", map[string]any{"fatal": broken})
+				g.failPending(-32000, "Server frame too large", "SERVER_FRAME_TOO_LARGE")
+				if broken {
+					break
+				}
+				continue
+			}
 			g.write(g.fromServer(line))
 		}
-		if err := sc.Err(); err != nil {
-			g.event("server_read_error", map[string]any{"error": err.Error()})
-		}
+		// The server's output is gone, so anything still pending will never be answered.
+		g.serverGone.Store(true)
+		g.event("server_stream_closed", nil)
+		g.failPending(-32000, "Server stream closed", "SERVER_STREAM_CLOSED")
+		shutdownServer()
 	}()
 
 	<-done
 	code := 0
 	if err := cmd.Wait(); err != nil {
-		if ee, ok := err.(*exec.ExitError); ok {
-			code = ee.ExitCode()
-		} else {
-			code = 1
+		code = 1
+		if ee, ok := err.(*exec.ExitError); ok && ee.ExitCode() >= 0 {
+			code = ee.ExitCode() // -1 means the guard killed the server; report 1
 		}
 	}
 	g.event("exit", map[string]any{"code": code})
@@ -216,6 +258,15 @@ func (g *Guard) fromHost(line []byte) (forward bool, reply []byte) {
 	id := f["id"]
 	if method == "" {
 		return true, nil // a response from the host to a server request
+	}
+	if g.serverGone.Load() {
+		return false, replyIfRequest(id, -32000, "Server stream closed", "SERVER_STREAM_CLOSED")
+	}
+	if len(id) > 0 && g.isPending(id) {
+		// A response must only ever carry the identity of the request it answers.
+		// The reply uses id null so it cannot be mistaken for the answer to the first request.
+		g.event("block", map[string]any{"rule": "DUPLICATE_ID", "method": method})
+		return false, errorFrame(nil, -32600, "Invalid request", "DUPLICATE_ID")
 	}
 	if method != "tools/call" {
 		g.track(id, method, "")
@@ -350,6 +401,17 @@ func (g *Guard) datamark(f frame, origin string, orig []byte) []byte {
 		return orig
 	}
 	res["content"] = nc
+	if raw, ok := res["structuredContent"]; ok {
+		// Not wrapped (that would break schema validation); invisible characters are stripped.
+		dec := json.NewDecoder(bytes.NewReader(raw))
+		dec.UseNumber()
+		var v any
+		if dec.Decode(&v) == nil {
+			if nb, err := json.Marshal(stripAll(v)); err == nil {
+				res["structuredContent"] = nb
+			}
+		}
+	}
 	nr, err := json.Marshal(res)
 	if err != nil {
 		return orig
@@ -385,7 +447,7 @@ func (g *Guard) inspectToolsList(raw json.RawMessage) {
 
 		reason := ""
 		switch {
-		case hasInvisible(string(b)):
+		case containsInvisible(t):
 			reason = "hidden characters in tool definition"
 		case seen && old != h:
 			reason = "definition changed since it was pinned"
@@ -413,15 +475,25 @@ func (g *Guard) inspectToolsList(raw json.RawMessage) {
 
 func (g *Guard) pinsPath() string { return filepath.Join(g.stateDir, "pins-"+g.name+".json") }
 
-func (g *Guard) loadPins() {
+// loadPins returns false when a pin file exists but cannot be trusted. Trust on
+// first use applies only to genuine first sight, never to a file that is damaged.
+func (g *Guard) loadPins(reset bool) bool {
+	if reset {
+		_ = os.Remove(g.pinsPath())
+		g.event("pins_reset", nil)
+		return true
+	}
 	b, err := os.ReadFile(g.pinsPath())
-	if err != nil {
-		return
+	if os.IsNotExist(err) {
+		return true
 	}
-	if err := json.Unmarshal(b, &g.pins); err != nil {
-		g.pins = map[string]string{}
+	var pins map[string]string
+	if err != nil || json.Unmarshal(b, &pins) != nil || pins == nil {
 		g.event("pins_unreadable", nil)
+		return false
 	}
+	g.pins = pins
+	return true
 }
 
 func (g *Guard) savePins() {
@@ -487,14 +559,24 @@ func cleanForDialog(s string, max int) string {
 
 // ---------------------------------------------------------------- helpers
 
+// isInvisible reports characters that render as nothing, or that reorder or
+// hide text. Zero-width joiners and non-joiners are included, which means
+// stripping them also breaks some emoji sequences and some Persian and Indic text.
 func isInvisible(r rune) bool {
 	switch {
-	case r >= 0x200B && r <= 0x200F, // zero-width and direction marks
-		r >= 0x202A && r <= 0x202E, // bidi embeddings and overrides
-		r >= 0x2060 && r <= 0x2064,
-		r >= 0x2066 && r <= 0x2069,
+	case r == 0x00AD, // soft hyphen
+		r == 0x034F,                                        // combining grapheme joiner
+		r == 0x061C,                                        // Arabic letter mark
+		r == 0x115F, r == 0x1160, r == 0x3164, r == 0xFFA0, // Hangul fillers
+		r == 0x17B4, r == 0x17B5, // Khmer inherent vowels
+		r == 0x180E,                // Mongolian vowel separator
+		r >= 0x200B && r <= 0x200F, // zero-width and direction marks
+		r >= 0x2028 && r <= 0x202E, // line and paragraph separators, bidi embeddings and overrides
+		r >= 0x2060 && r <= 0x206F, // word joiner, invisible operators, deprecated format controls
 		r == 0xFEFF,
-		r >= 0xE0000 && r <= 0xE007F: // Unicode tag characters
+		r >= 0xFFF9 && r <= 0xFFFB,   // interlinear annotation
+		r >= 0xE0000 && r <= 0xE007F, // Unicode tag characters
+		r >= 0xE0100 && r <= 0xE01EF: // variation selectors supplement
 		return true
 	}
 	return false
@@ -551,6 +633,29 @@ func hasDuplicateKeys(b []byte) bool {
 	}
 }
 
+// containsInvisible checks the decoded strings (keys and values) of a JSON value.
+// Checking the re-encoded bytes would miss U+2028 and U+2029, which encoding/json
+// writes as escape sequences.
+func containsInvisible(v any) bool {
+	switch t := v.(type) {
+	case string:
+		return hasInvisible(t)
+	case []any:
+		for _, x := range t {
+			if containsInvisible(x) {
+				return true
+			}
+		}
+	case map[string]any:
+		for k, x := range t {
+			if hasInvisible(k) || containsInvisible(x) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func hasInvisible(s string) bool {
 	for _, r := range s {
 		if isInvisible(r) {
@@ -558,6 +663,55 @@ func hasInvisible(s string) bool {
 		}
 	}
 	return false
+}
+
+// stripAll removes invisible characters from every string inside a decoded JSON value.
+func stripAll(v any) any {
+	switch t := v.(type) {
+	case string:
+		return stripInvisible(t)
+	case []any:
+		for i := range t {
+			t[i] = stripAll(t[i])
+		}
+		return t
+	case map[string]any:
+		for k, x := range t {
+			t[k] = stripAll(x)
+		}
+		return t
+	}
+	return v
+}
+
+// readFrame reads one newline-terminated line of at most max bytes. A longer
+// line is discarded up to its newline and reported as tooLong. If no newline
+// turns up within discardBudget bytes, broken is also true: the stream can no
+// longer be framed and the caller should stop reading it.
+func readFrame(r *bufio.Reader, max int) (line []byte, tooLong, broken bool, err error) {
+	var buf []byte
+	skipped := 0
+	for {
+		chunk, isPrefix, e := r.ReadLine()
+		if e != nil {
+			return nil, tooLong, false, e
+		}
+		if !tooLong {
+			if len(buf)+len(chunk) > max {
+				tooLong, buf, skipped = true, nil, len(chunk)
+			} else {
+				buf = append(buf, chunk...)
+			}
+		} else {
+			skipped += len(chunk)
+			if skipped > discardBudget {
+				return nil, true, true, nil
+			}
+		}
+		if !isPrefix {
+			return buf, tooLong, false, nil
+		}
+	}
 }
 
 func stripInvisible(s string) string {
@@ -576,6 +730,32 @@ func (g *Guard) track(id json.RawMessage, method, tool string) {
 	g.mu.Lock()
 	g.pending[string(bytes.TrimSpace(id))] = pendingReq{method, tool}
 	g.mu.Unlock()
+}
+
+func (g *Guard) isPending(id json.RawMessage) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	_, ok := g.pending[string(bytes.TrimSpace(id))]
+	return ok
+}
+
+// failPending answers every request that is still waiting, so the host is never
+// left waiting for a response that cannot arrive.
+func (g *Guard) failPending(code int, msg, rule string) {
+	g.mu.Lock()
+	ids := make([]string, 0, len(g.pending))
+	for k := range g.pending {
+		ids = append(ids, k)
+	}
+	g.pending = map[string]pendingReq{}
+	g.mu.Unlock()
+	sort.Strings(ids)
+	for _, k := range ids {
+		g.write(errorFrame(json.RawMessage(k), code, msg, rule))
+	}
+	if len(ids) > 0 {
+		g.event("pending_failed", map[string]any{"count": len(ids), "rule": rule})
+	}
 }
 
 func (g *Guard) take(id json.RawMessage) (pendingReq, bool) {

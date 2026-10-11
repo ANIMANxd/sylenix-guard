@@ -10,7 +10,7 @@ The code in section 8 was compiled, vetted with `go vet`, formatted with `gofmt`
 
 | Checked | Result |
 |---|---|
-| Protocol self-test (`demo/selftest.py`) | 28 of 28 checks pass (23 original, 5 added in Wave 1A) |
+| Protocol self-test (`demo/selftest.py`) | 68 of 68 checks pass (23 original, 5 added in Wave 1A, 40 in Wave 1C) |
 | Full harness run through the real MCP Python SDK (`mcp` 1.30) with the scripted agent, 3 runs per cell | Plumbing works: unguarded runs leak the canary, guarded runs block it |
 | Run with a real model | **Not run.** I had no API key. This is Day 2 of your spike. |
 | Approval dialog on macOS | **Not run.** Compiled for Linux only; the Linux "no dialog available, so deny" path is tested. |
@@ -128,6 +128,7 @@ sylenix-guard [flags] -- <server command> [args...]
 | `--trust a,b` | Tools whose results do not taint the session. |
 | `--approve deny\|dialog` | What to do with a blocked call. Default `deny`. |
 | `--no-spotlight` | Skip datamarking. |
+| `--reset-pins` | Discard existing pins and trust every tool as new on first sight. Needed to recover from an unreadable pin file. |
 
 | Situation | Result |
 |---|---|
@@ -140,6 +141,11 @@ sylenix-guard [flags] -- <server command> [args...]
 | Server prints a non-JSON line | Forwarded unchanged and the session is tainted |
 | A host frame repeats a key inside any JSON object | `-32600`, rule `DUPLICATE_KEYS`; not forwarded |
 | Server sends a response whose id matches no tracked request | Forwarded unchanged and the session is tainted |
+| Host frame longer than 10 MiB | `-32600`, rule `FRAME_TOO_LARGE`, id null; the rest of the line is discarded and the session continues |
+| Server frame longer than 10 MiB | Discarded; the session is tainted; every pending request fails with `-32000`, rule `SERVER_FRAME_TOO_LARGE` |
+| Server closes its stdout | Every pending request fails with `-32000`, rule `SERVER_STREAM_CLOSED`; later requests fail the same way; the server is killed after 5 seconds and the guard exits with code 1 |
+| Host reuses an id that is still pending | `-32600`, rule `DUPLICATE_ID`, id null; not forwarded |
+| Pin file exists but cannot be read | The guard refuses to start (exit 2). `--reset-pins` starts over. |
 | Host closes stdin | Server stdin is closed; the server is killed if it has not exited after 5 seconds |
 
 Error data contains only a rule name. Policy details go to the audit log, not to the model-visible channel.
@@ -150,8 +156,8 @@ Error data contains only a rule name. Policy details go to the audit log, not to
 - **Your `--readonly` list is a trust decision.** A "read-only" tool that can reach the network or has side effects defeats the latch. List only tools you are sure are pure reads.
 - **Taint never clears,** and a session lasts as long as the guard process. With a real filesystem server almost everything taints after the first read. That is the friction you are measuring; `--trust` lets you test the alternative.
 - **No confidentiality latch.** Reading a secret and then calling a read-only tool is not tracked.
-- **Pinning is trust on first use.** Whatever the server says on first sight is accepted. Pin files are not signed. Hashes use Go's JSON encoding, not RFC 8785.
-- **Spotlighting is friction, not protection.** It wraps `tools/call` text results and strips invisible characters. Resource and prompt results latch taint but are not wrapped.
+- **Pinning is trust on first use.** Whatever the server says on first sight is accepted. Pin files are not signed, and anyone who can write the file can rewrite it. A pin file that exists but cannot be read stops the guard from starting; `--reset-pins` is the explicit way to start over. Hashes use Go's JSON encoding, not RFC 8785.
+- **Spotlighting is friction, not protection.** It wraps `tools/call` text results and strips invisible characters. Resource and prompt results latch taint but are not wrapped. `structuredContent` is not wrapped either, because that would break schema validation; only invisible characters are stripped from its strings. Stripping also removes zero-width joiners and non-joiners, which breaks some emoji sequences and some Persian and Indic text.
 - **The dialog is not biometric.** It shows the tool name and the arguments with control and invisible characters removed, cut at 300 characters. Long or confusable arguments can still mislead. While a dialog is open (up to 60 seconds) the host's other requests wait.
 - **Process cleanup is minimal.** On a signal the guard kills the child it started, not its descendants (for example the node process behind `npx`).
 - **Unbounded bookkeeping.** The map of pending request ids never expires entries for requests that are never answered.

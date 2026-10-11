@@ -139,11 +139,19 @@ def case_pin_persistence():
 
 def case_invisible():
     print("hidden characters in a tool definition")
+    for cp in ("200B", "00AD", "034F", "061C", "115F", "1160", "17B4", "180E", "2028", "2029", "202E",
+               "2060", "206A", "3164", "FEFF", "FFA0", "FFF9", "E0041", "E0100"):
+        with tempfile.TemporaryDirectory() as d:
+            s = Session(d, env={"FAKE_INVISIBLE": cp})
+            s.start()
+            r = s.call("write_file")
+            check(f"U+{cp} in a definition quarantines the tool", r.get("error", {}).get("code") == -32001, str(r))
+            s.close()
     with tempfile.TemporaryDirectory() as d:
-        s = Session(d, env={"FAKE_INVISIBLE": "1"})
+        s = Session(d, env={"FAKE_PLAIN_UNICODE": "1"})
         s.start()
         r = s.call("write_file")
-        check("tool with zero-width character is quarantined", r.get("error", {}).get("code") == -32001, str(r))
+        check("ordinary non-ASCII text (accents, CJK, emoji) is not quarantined", "result" in r, str(r))
         s.close()
 
 
@@ -239,6 +247,114 @@ def case_unmatched_response():
         s.close()
 
 
+def case_oversize_frames():
+    print("frames at and over the 10 MiB limit")
+    with tempfile.TemporaryDirectory() as d:
+        s = Session(d)
+        s.start()
+        head = '{"jsonrpc":"2.0","id":70,"method":"ping","params":{"pad":"'
+        tail = '"}}'
+        pad = (10 << 20) - len(head) - len(tail)
+        s.raw(head + "a" * pad + tail)  # exactly 10 MiB
+        r = s.recv(timeout=30)
+        check("a frame of exactly 10 MiB is accepted", r.get("id") == 70 and "result" in r, str(r)[:120])
+        s.raw(head + "a" * (pad + 1) + tail)  # one byte over
+        r = s.recv(timeout=30)
+        check("one byte over is refused with -32600 FRAME_TOO_LARGE and id null",
+              r["error"]["code"] == -32600 and rule(r) == "FRAME_TOO_LARGE" and r["id"] is None, str(r)[:160])
+        s.send("ping")
+        r = s.recv()
+        check("the session survives an oversize frame", "result" in r, str(r))
+        s.close()
+    with tempfile.TemporaryDirectory() as d:
+        s = Session(d, extra_flags=("--trust", "huge"))
+        s.start()
+        s.send("tools/call", {"name": "huge", "arguments": {}})
+        r = s.recv(timeout=30)
+        check("oversize server frame fails the pending request (SERVER_FRAME_TOO_LARGE)", rule(r) == "SERVER_FRAME_TOO_LARGE", str(r)[:160])
+        r = s.call("write_file")
+        check("oversize server frame latches taint", rule(r) == "TAINT_SINK", str(r))
+        s.close()
+
+
+def case_server_stream_closed():
+    print("server closes its stdout but keeps running")
+    with tempfile.TemporaryDirectory() as d:
+        s = Session(d)
+        s.start()
+        t0 = time.time()
+        s.send("tools/call", {"name": "close_stdout", "arguments": {}})
+        r = s.recv(timeout=10)
+        check("pending request fails with SERVER_STREAM_CLOSED", rule(r) == "SERVER_STREAM_CLOSED", str(r))
+        s.send("ping")
+        r = s.recv(timeout=10)
+        check("later requests fail the same way, not silently", rule(r) == "SERVER_STREAM_CLOSED", str(r))
+        code = s.close()
+        check("guard exits within 10 s with code 1", code == 1 and time.time() - t0 < 10, f"code={code} elapsed={time.time() - t0:.1f}")
+
+
+def case_duplicate_ids():
+    print("a request id that is still pending")
+    with tempfile.TemporaryDirectory() as d:
+        log = os.path.join(d, "calls.log")
+        s = Session(d, env={"FAKE_CALL_LOG": log})
+        s.start()
+        s.raw('{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"slow","arguments":{}}}')
+        s.raw('{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"write_file","arguments":{}}}')
+        first = s.recv()
+        second = s.recv()
+        refused = first if "error" in first else second
+        answered = second if "error" in first else first
+        check("second use of the id is refused (-32600 DUPLICATE_ID) with id null", rule(refused) == "DUPLICATE_ID" and refused["id"] is None, str(refused))
+        check("first request is still answered, with its own identity",
+              answered.get("id") == 7 and answered["result"]["content"][0]["text"].startswith('<untrusted_tool_result origin="slow"'), str(answered)[:160])
+        s.close()
+        calls = open(log).read().split()
+        check("the refused request never reached the server", calls == ["slow"], str(calls))
+        with tempfile.TemporaryDirectory() as d2:
+            s = Session(d2)
+            s.start()
+            ok = True
+            for _ in range(3):
+                s.raw('{"jsonrpc":"2.0","id":9,"method":"ping"}')
+                ok = ok and "result" in s.recv()
+            check("an id can be reused once its request has been answered", ok)
+            s.close()
+
+
+def case_pin_file_damage():
+    print("pin file that exists but cannot be read")
+    for label, content in (("invalid JSON", "{corrupted json"), ("null", "null"), ("a list", "[]"), ("empty", "")):
+        with tempfile.TemporaryDirectory() as d:
+            open(os.path.join(d, "pins-t.json"), "w").write(content)
+            p = subprocess.run([GUARD, "--name", "t", "--state-dir", d, "--", sys.executable, FAKE],
+                               stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
+            audit = open(os.path.join(d, "audit-t.jsonl")).read()
+            check(f"{label}: guard refuses to start (exit 2, no server launched)",
+                  p.returncode == 2 and "pins_unreadable" in audit and '"event":"start"' not in audit, f"rc={p.returncode}")
+    with tempfile.TemporaryDirectory() as d:
+        open(os.path.join(d, "pins-t.json"), "w").write("{corrupted json")
+        s = Session(d, extra_flags=("--reset-pins",))
+        s.start()
+        r = s.call("write_file")
+        check("--reset-pins recovers: the guard starts and works", "result" in r, str(r))
+        s.close()
+        check("--reset-pins is recorded in the audit log", "pins_reset" in open(os.path.join(d, "audit-t.jsonl")).read())
+
+
+def case_structured_content():
+    print("structuredContent")
+    with tempfile.TemporaryDirectory() as d:
+        s = Session(d)
+        s.start()
+        r = s.call("structured")
+        sc = r["result"]["structuredContent"]
+        check("invisible characters are stripped from structuredContent strings", sc["note"] == "ab" and sc["n"][1]["k"] == "xy", str(sc))
+        check("numbers in structuredContent are preserved exactly", sc["big"] == 12345678901234567890 and sc["n"][0] == 1, str(sc))
+        check("the text item is still datamarked", r["result"]["content"][0]["text"].startswith("<untrusted_tool_result"))
+        s.close()
+
+
 def case_dialog_fails_closed():
     print("approval dialog unavailable")
     import shutil
@@ -259,7 +375,9 @@ if __name__ == "__main__":
         sys.exit("build first: CGO_ENABLED=0 go build -o bin/sylenix-guard ./cmd/sylenix-guard")
     t0 = time.time()
     for fn in (case_taint_flow, case_pin_persistence, case_invisible, case_noisy,
-               case_bad_input, case_large_frame, case_interleaving, case_duplicate_keys, case_unmatched_response, case_dialog_fails_closed):
+               case_bad_input, case_large_frame, case_interleaving, case_duplicate_keys, case_unmatched_response, case_oversize_frames,
+               case_server_stream_closed, case_duplicate_ids, case_pin_file_damage,
+               case_structured_content, case_dialog_fails_closed):
         fn()
     print(f"\n{passed} passed, {len(failed)} failed in {time.time() - t0:.1f}s")
     sys.exit(1 if failed else 0)
