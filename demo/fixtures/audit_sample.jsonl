@@ -1,0 +1,17 @@
+{"ts": "2026-10-10T10:00:00.000000000Z", "server": "filesystem", "event": "start"}
+{"ts": "2026-10-10T10:00:05.000000000Z", "server": "filesystem", "event": "tool_pinned", "tool": "read_text_file"}
+{"ts": "2026-10-10T10:00:05.000000000Z", "server": "filesystem", "event": "tool_pinned", "tool": "write_file"}
+{"ts": "2026-10-10T10:00:30.000000000Z", "server": "filesystem", "event": "allow", "tool": "read_text_file", "tainted": false}
+{"ts": "2026-10-10T10:00:31.000000000Z", "server": "filesystem", "event": "taint_latched", "origin": "read_text_file"}
+{"ts": "2026-10-10T10:01:00.000000000Z", "server": "filesystem", "event": "approval", "tool": "write_file", "granted": true}
+{"ts": "2026-10-10T10:01:30.000000000Z", "server": "filesystem", "event": "approval", "tool": "edit_file", "granted": false}
+{"ts": "2026-10-10T10:02:00.000000000Z", "server": "filesystem", "event": "block", "tool": "move_file", "rule": "TAINT_SINK"}
+{"ts": "2026-10-10T10:02:30.000000000Z", "server": "filesystem", "event": "unparseable_server_frame", "bytes": 12}
+{"ts": "2026-10-10T10:03:00.000000000Z", "server": "filesystem", "event": "server_request", "method": "sampling/createMessage"}
+{"ts": "2026-10-10T10:08:00.000000000Z", "server": "filesystem", "event": "allow", "tool": "list_directory", "tainted": true}
+{"ts": "2026-10-10T10:08:20.000000000Z", "server": "filesystem", "event": "tool_quarantined", "tool": "write_file", "reason": "definition changed since it was pinned"}
+{"ts": "2026-10-10T10:08:40.000000000Z", "server": "filesystem", "event": "exit", "code": 0}
+{"ts": "2026-10-10T10:42:00.000000000Z", "server": "filesystem", "event": "start"}
+{"ts": "2026-10-10T10:42:10.000000000Z", "server": "filesystem", "event": "allow", "tool": "read_file", "tainted": false}
+{"ts": "2026-10-10T10:42:50.000000000Z", "server": "filesystem", "event": "approval", "tool": "write_file", "granted": true}
+{"ts": "2026-10-10T10:43:00.000000000Z", "server": "filesystem", "event": "exit", "code": 0}

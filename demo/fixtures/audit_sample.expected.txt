@@ -1,0 +1,13 @@
+file: demo/fixtures/audit_sample.jsonl
+events: 17   span: 2026-10-10T10:00:00.000000000Z -> 2026-10-10T10:43:00.000000000Z
+sessions: 2  (tainted: 1)
+active time: 0.16 h   (gaps over 600 s excluded)
+tool calls allowed: 3   blocked: 1   approvals granted: 2   approvals denied: 1
+approval prompts per active hour: 18.6
+blocks by tool/rule:
+  move_file TAINT_SINK : 1
+approvals by tool:
+  edit_file granted=0 denied=1
+  write_file granted=2 denied=0
+tools quarantined: write_file
+unparseable server frames: 1   unparseable host frames: 0   server-initiated requests: 1

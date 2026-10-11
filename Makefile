@@ -1,4 +1,4 @@
-.PHONY: build fmt vet selftest check harness-scripted
+.PHONY: build fmt vet selftest summary-test check harness-scripted
 
 build:
 	CGO_ENABLED=0 go build -o bin/sylenix-guard ./cmd/sylenix-guard
@@ -12,7 +12,10 @@ vet:
 selftest: build
 	python3 demo/selftest.py
 
-check: fmt vet selftest
+summary-test:
+	python3 scripts/summarize_audit.py --file demo/fixtures/audit_sample.jsonl | diff - demo/fixtures/audit_sample.expected.txt
+
+check: fmt vet selftest summary-test
 
 harness-scripted: build
 	.venv/bin/python demo/harness.py --agent scripted --runs 3 --out results-scripted
