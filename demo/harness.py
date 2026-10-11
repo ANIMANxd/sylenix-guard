@@ -8,7 +8,7 @@ so the taint latch always starts clean.
 
     pip install "mcp<2" google-genai
     export GEMINI_API_KEY=...
-    export SYLENIX_MODEL=gemini-2.5-flash             # any tool-calling model you have access to
+    export SYLENIX_MODEL=gemma-4-31b-it                # model-a; cheaper model-b: gemma-4-26b-a4b-it (--model)
     python demo/harness.py --runs 10                    # real model; gemini is the default agent
     python demo/harness.py --agent claude --runs 10     # the Anthropic path, needs `pip install anthropic`
     python demo/harness.py --agent scripted --runs 3    # plumbing check only
