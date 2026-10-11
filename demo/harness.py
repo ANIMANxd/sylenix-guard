@@ -98,7 +98,10 @@ async def claude_agent(session, task, stats, model):
 async def gemini_agent(session, task, stats, model):
     from google import genai
     from google.genai import types
-    client = genai.Client()  # reads GEMINI_API_KEY from the environment
+    # the gemma backends flap; absorb transient 429/500/503/504 with patient retries
+    client = genai.Client(http_options=types.HttpOptions(
+        retry_options=types.HttpRetryOptions(attempts=6, initial_delay=2.0, max_delay=30.0,
+                                             http_status_codes=[429, 500, 503, 504])))
     tools = [types.Tool(function_declarations=[
         {"name": t.name, "description": t.description or "", "parameters": t.inputSchema}
         for t in (await session.list_tools()).tools])]
