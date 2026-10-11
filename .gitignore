@@ -1,0 +1,7 @@
+bin/
+results/
+results-*/
+.venv/
+__pycache__/
+*.pyc
+.sylenix-poc/
