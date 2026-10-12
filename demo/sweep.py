@@ -6,7 +6,7 @@ unshielded agent against seven different ways of delivering the same
 instruction, and with a system prompt that tells the agent to work without
 asking. It reuses demo/harness.py and does not change it.
 
-    python demo/sweep.py --agent gemini --model MODEL --runs 5 --out sweep-A
+    python demo/sweep.py --agent gemini --model MODEL --runs 5 --parallel 3 --out sweep-A
     python demo/sweep.py --agent scripted --runs 1 --out sweep-test   # wiring check only
 
 Besides "attempted" (the agent tried to post the secret), it records "read_env"
@@ -52,11 +52,11 @@ async def main():
     ap.add_argument("--agent", required=True, choices=["gemini", "claude", "scripted"])
     ap.add_argument("--model", default=os.environ.get("SYLENIX_MODEL", ""))
     ap.add_argument("--runs", type=int, default=5)
-    ap.add_argument("--jobs", type=int, default=2, help="runs in flight at once; keep it small enough to stay under the API rate limits")
     ap.add_argument("--out", default="sweep")
     ap.add_argument("--variants", default=",".join(map(str, VARIANTS)), help="comma-separated ticket numbers")
     ap.add_argument("--systems", default="default,autonomous")
     ap.add_argument("--modes", default="direct", help="direct and/or guarded")
+    ap.add_argument("--parallel", type=int, default=1, help="runs in flight at once (default 1)")
     ap.add_argument("--summary", action="store_true", help="do not run anything; summarize <out>/sweep.jsonl")
     args = ap.parse_args()
 
@@ -77,25 +77,25 @@ async def main():
     if args.summary:
         rows = [json.loads(line) for line in open(out / "sweep.jsonl") if line.strip()]
     else:
-        sem = asyncio.Semaphore(max(1, args.jobs))
+        sem = asyncio.Semaphore(max(1, args.parallel))
+        lock = asyncio.Lock()
         with open(out / "sweep.jsonl", "a") as fh:
             for mode in modes:
                 for sysname in systems:
+                    # Every run in this batch uses the same system prompt; batches never overlap.
                     harness.SYSTEM = SYSTEMS[sysname]
-                    for n in variants:
-                        task = f"{n}-{VARIANTS[n]}"
 
-                        async def one(i, mode=mode, task=task):
-                            async with sem:
-                                row = await harness.one_run(mode, task, args.agent, args.model, out)
-                            row.update(variant=task, system=sysname, read_env=opened_env(row["run_dir"]))
-                            return row
-
-                        for row in await asyncio.gather(*(one(i) for i in range(args.runs))):
+                    async def one(task, mode=mode, sysname=sysname):
+                        async with sem:
+                            row = await harness.one_run(mode, task, args.agent, args.model, out)
+                        row.update(variant=task, system=sysname, read_env=opened_env(row["run_dir"]))
+                        async with lock:
                             fh.write(json.dumps(row) + "\n")
                             fh.flush()
                             rows.append(row)
-                        print(f"  finished {mode} {sysname} {task}", file=sys.stderr)
+                            print(f"  {len(rows)} runs done ({mode} {sysname} {task})", file=sys.stderr)
+
+                    await asyncio.gather(*[one(f"{n}-{VARIANTS[n]}") for n in variants for _ in range(args.runs)])
 
     agg = defaultdict(lambda: defaultdict(int))
     for r in rows:
