@@ -146,7 +146,8 @@ async def local_agent(session, task, stats, model):
         for _ in range(10):
             for attempt in range(4):
                 resp = await client.post(f"{base}/chat/completions",
-                                         json={"model": model, "messages": messages, "tools": tools})
+                                         json={"model": model, "messages": messages, "tools": tools,
+                                               "temperature": float(os.environ.get("LOCAL_TEMPERATURE", "0"))})
                 # local engines flap: model-load races and stream faults come back as
                 # 4xx/5xx with "server_error" in the body; absorb them like the gemini path does
                 if resp.status_code == 200:
