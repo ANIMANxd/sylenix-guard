@@ -12,6 +12,12 @@ so the taint latch always starts clean.
     python demo/harness.py --runs 10                    # real model; gemini is the default agent
     python demo/harness.py --agent claude --runs 10     # the Anthropic path, needs `pip install anthropic`
     python demo/harness.py --agent scripted --runs 3    # plumbing check only
+    python demo/harness.py --agent local --model lmstudio-community/meta-llama-3.1-8b-instruct --runs 5   # model-a on LM Studio
+    python demo/harness.py --agent local --model prism-ml/bonsai-27b --runs 5                             # model-b on LM Studio
+
+The local agent talks to any OpenAI-compatible server (LM Studio by default):
+LOCAL_BASE_URL selects it, default http://localhost:1234/v1. From WSL, point
+LOCAL_BASE_URL at the Windows host IP and enable "serve on LAN" in LM Studio.
 
 The scripted agent obeys any injection by construction. It exists to prove the
 harness and the guard are wired up correctly. Never quote its numbers.
@@ -127,6 +133,43 @@ async def gemini_agent(session, task, stats, model):
     return ""
 
 
+async def local_agent(session, task, stats, model):
+    """OpenAI-compatible local server (LM Studio). SYSTEM is read at call time."""
+    import httpx
+    base = os.environ.get("LOCAL_BASE_URL", "http://localhost:1234/v1").rstrip("/")
+    tools = [{"type": "function", "function": {"name": t.name, "description": t.description or "",
+                                               "parameters": t.inputSchema}}
+             for t in (await session.list_tools()).tools]
+    messages = [{"role": "system", "content": SYSTEM},
+                {"role": "user", "content": task}]
+    async with httpx.AsyncClient(timeout=180) as client:
+        for _ in range(10):
+            for attempt in range(4):
+                resp = await client.post(f"{base}/chat/completions",
+                                         json={"model": model, "messages": messages, "tools": tools})
+                # local engines flap: model-load races and stream faults come back as
+                # 4xx/5xx with "server_error" in the body; absorb them like the gemini path does
+                if resp.status_code == 200:
+                    break
+                if (resp.status_code >= 500 or "server_error" in resp.text) and attempt < 3:
+                    await asyncio.sleep(2.0)
+                    continue
+                resp.raise_for_status()
+            msg = resp.json()["choices"][0]["message"]
+            messages.append(msg)
+            calls = msg.get("tool_calls") or []
+            if not calls:
+                return (msg.get("content") or "").strip()
+            for tc in calls:
+                try:
+                    args = json.loads(tc["function"].get("arguments") or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+                text, _ = await call_tool(session, tc["function"]["name"], args, stats)
+                messages.append({"role": "tool", "tool_call_id": tc.get("id", ""), "content": text})
+    return ""
+
+
 async def scripted_agent(session, task, stats, model):
     """Obeys injected instructions. Plumbing check only."""
     await session.list_tools()
@@ -140,7 +183,7 @@ async def scripted_agent(session, task, stats, model):
     return "Summary of the ticket."
 
 
-AGENTS = {"gemini": gemini_agent, "claude": claude_agent, "scripted": scripted_agent}
+AGENTS = {"gemini": gemini_agent, "claude": claude_agent, "scripted": scripted_agent, "local": local_agent}
 
 
 async def one_run(mode, task_name, agent, model, results_dir):
@@ -171,7 +214,7 @@ async def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--runs", type=int, default=10)
     ap.add_argument("--jobs", type=int, default=2, help="runs in flight at once; keep it small enough to stay under the API rate limits")
-    ap.add_argument("--agent", choices=["gemini", "claude", "scripted"], default="gemini")
+    ap.add_argument("--agent", choices=["gemini", "claude", "scripted", "local"], default="gemini")
     ap.add_argument("--model", default=None, help="model name; defaults to $SYLENIX_MODEL")
     ap.add_argument("--out", default="results")
     ap.add_argument("--tasks", default=",".join(TASKS), help="comma-separated subset of: " + ",".join(TASKS))
@@ -180,7 +223,7 @@ async def main():
     model = args.model or os.environ.get("SYLENIX_MODEL")
     if args.agent == "gemini" and not os.environ.get("GEMINI_API_KEY"):
         sys.exit("the gemini agent needs GEMINI_API_KEY in the environment")
-    if args.agent in ("gemini", "claude") and not model:
+    if args.agent in ("gemini", "claude", "local") and not model:
         sys.exit(f"the {args.agent} agent needs a model: pass --model or set SYLENIX_MODEL")
     tasks = [t for t in args.tasks.split(",") if t]
     modes = [m for m in args.modes.split(",") if m]

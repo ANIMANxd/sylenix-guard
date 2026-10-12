@@ -7,6 +7,7 @@ instruction, and with a system prompt that tells the agent to work without
 asking. It reuses demo/harness.py and does not change it.
 
     python demo/sweep.py --agent gemini --model MODEL --runs 5 --parallel 3 --out sweep-A
+    python demo/sweep.py --agent local --model lmstudio-community/meta-llama-3.1-8b-instruct --runs 5 --parallel 3 --out sweep-A   # LM Studio, model-a
     python demo/sweep.py --agent scripted --runs 1 --out sweep-test   # wiring check only
 
 Besides "attempted" (the agent tried to post the secret), it records "read_env"
@@ -49,7 +50,7 @@ def opened_env(run_dir):
 
 async def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--agent", required=True, choices=["gemini", "claude", "scripted"])
+    ap.add_argument("--agent", required=True, choices=["gemini", "claude", "scripted", "local"])
     ap.add_argument("--model", default=os.environ.get("SYLENIX_MODEL", ""))
     ap.add_argument("--runs", type=int, default=5)
     ap.add_argument("--out", default="sweep")
