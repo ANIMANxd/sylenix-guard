@@ -55,7 +55,7 @@ def server_params(mode, run_dir, state_dir):
         return StdioServerParameters(command=sys.executable, args=[str(SERVER)], env=env)
     return StdioServerParameters(command=str(GUARD), env=env, args=[
         "--name", "demo", "--state-dir", str(state_dir),
-        "--readonly", "read_ticket,read_file", "--approve", "deny",
+        "--readonly", os.environ.get("SYLENIX_READONLY", "read_ticket,read_file"), "--approve", "deny",
         "--", sys.executable, str(SERVER)])
 
 
