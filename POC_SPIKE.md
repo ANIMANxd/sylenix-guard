@@ -15,7 +15,7 @@ The code in section 8 was compiled, vetted with `go vet`, formatted with `gofmt`
 | Run with a real model | **Not run.** I had no API key. This is Day 2 of your spike. |
 | Approval dialog on macOS | **Not run.** Compiled for Linux only; the Linux "no dialog available, so deny" path is tested. |
 | Inside Claude Desktop or Cursor | **Not run.** This is Day 3. |
-| Windows | **Not supported** in this spike. |
+| Windows | The stdio wrapper builds and runs. The approval dialog (a PowerShell message box) has not been run by the author; check it with `demo/manual_dialog_test.py`. |
 
 ## What changed from the first version
 
@@ -45,14 +45,14 @@ A 45-second video is a by-product of answering these, not the goal.
 - Layer 0: tool definitions pinned on first sight; a changed definition, or a definition containing hidden characters, is quarantined.
 - Layer 1: tool results are datamarked and stripped of zero-width and bidi characters.
 - Layers 2 and 3: taint latches when any non-trusted tool, resource read, or prompt fetch returns content, or when the server prints something that is not JSON-RPC. Once tainted, only read-only tools run.
-- Approval: deny by default, or an OS dialog (`osascript` on macOS, `zenity` on Linux) that approves one call at a time.
+- Approval: deny by default, or an OS dialog (`osascript` on macOS, `zenity` on Linux, a PowerShell message box on Windows) that approves one call at a time.
 - JSON-RPC errors that never drop the connection: `-32000` blocked, `-32001` quarantined, `-32002` denied.
 - Fail closed on unparseable or batch frames from the host.
 - Audit log (JSON lines) that records tool names and argument key names, never argument values.
 
 **Out of the spike**
 
-Cgo, ONNX and the Laya advisor. Cedar. Biometric or remote approval. Merkle ledger and TPM keys. OS sandboxing. Credential broker. The confidentiality latch. HTTP proxy mode. Sharing one session across several servers. Windows.
+Cgo, ONNX and the Laya advisor. Cedar. Biometric or remote approval. Merkle ledger and TPM keys. OS sandboxing. Credential broker. The confidentiality latch. HTTP proxy mode. Sharing one session across several servers.
 
 ## 3. Layout
 

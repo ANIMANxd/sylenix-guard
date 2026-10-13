@@ -11,6 +11,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -527,6 +528,21 @@ func askHuman(tool string, args map[string]any, origin string) (bool, string) {
 			return true, "zenity"
 		}
 		return false, "zenity: denied, timed out, or unavailable"
+	case "windows":
+		// The message travels in an environment variable, never inside the script text,
+		// so attacker-influenced characters cannot change what PowerShell runs.
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		script := `Add-Type -AssemblyName System.Windows.Forms; ` +
+			`$f = New-Object System.Windows.Forms.Form; $f.TopMost = $true; ` +
+			`$r = [System.Windows.Forms.MessageBox]::Show($f, $env:SYLENIX_MSG, 'Sylenix Guard', 'YesNo', 'Warning', 'Button2'); ` +
+			`if ($r -eq 'Yes') { exit 0 } else { exit 1 }`
+		cmd := exec.CommandContext(ctx, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script)
+		cmd.Env = append(os.Environ(), "SYLENIX_MSG="+msg)
+		if err := cmd.Run(); err == nil {
+			return true, "powershell"
+		}
+		return false, "powershell: denied, timed out, or unavailable"
 	}
 	return false, "no dialog support on " + runtime.GOOS
 }
