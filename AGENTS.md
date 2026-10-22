@@ -1,4 +1,4 @@
-# AGENTS.md — Sylenix Guard (POC phase)
+    # AGENTS.md — Sylenix Guard (POC phase)
 
 Sylenix Guard is a stdio gateway that sits between an AI agent host and one MCP server. This repository is in its 72-hour proof-of-concept phase and contains Sylenix Guard only.
 

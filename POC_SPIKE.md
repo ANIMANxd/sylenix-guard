@@ -1,7 +1,7 @@
 # POC_SPIKE.md — Sylenix Guard: 72-Hour Spike (v2)
 
 **Timebox:** 72 hours (one weekend)
-**Code:** about 600 lines of Go (standard library only, `CGO_ENABLED=0`) plus about 500 lines of Python for the demo and tests
+**Code:** about 1200 lines of Go (standard library only, `CGO_ENABLED=0`) plus about 1000 lines of Python for the demo and tests
 **Goal:** find out, with real evidence, whether a deterministic stdio gateway stops a real agent from being hijacked, what that costs legitimate work, and whether anyone would leave it switched on.
 
 ## Verification status (read this first)
@@ -10,12 +10,12 @@ The code in section 8 was compiled, vetted with `go vet`, formatted with `gofmt`
 
 | Checked | Result |
 |---|---|
-| Protocol self-test (`demo/selftest.py`) | 68 of 68 checks pass (23 original, 5 added in Wave 1A, 40 in Wave 1C) |
+| Protocol self-test (`demo/selftest.py`) | 92 checks, all passing (23 original, 5 added in Wave 1A, 40 in Wave 1C, 24 in Wave 6). On Windows the dialog-fails-closed check skips, so 91 run there. |
 | Full harness run through the real MCP Python SDK (`mcp` 1.30) with the scripted agent, 3 runs per cell | Plumbing works: unguarded runs leak the canary, guarded runs block it |
 | Run with a real model | **Not run.** I had no API key. This is Day 2 of your spike. |
 | Approval dialog on macOS | **Not run.** Compiled for Linux only; the Linux "no dialog available, so deny" path is tested. |
 | Inside Claude Desktop or Cursor | **Not run.** This is Day 3. |
-| Windows | The stdio wrapper builds and runs. The approval dialog (a PowerShell message box) has not been run by the author; check it with `demo/manual_dialog_test.py`. |
+| Windows | The stdio wrapper builds and runs. The approval dialog (a three-button PowerShell form) has been syntax-checked but not clicked through by the author; check it with `demo/manual_dialog_test.py`. |
 
 ## What changed from the first version
 
@@ -45,7 +45,10 @@ A 45-second video is a by-product of answering these, not the goal.
 - Layer 0: tool definitions pinned on first sight; a changed definition, or a definition containing hidden characters, is quarantined.
 - Layer 1: tool results are datamarked and stripped of zero-width and bidi characters.
 - Layers 2 and 3: taint latches when any non-trusted tool, resource read, or prompt fetch returns content, or when the server prints something that is not JSON-RPC. Once tainted, only read-only tools run.
-- Approval: deny by default, or an OS dialog (`osascript` on macOS, `zenity` on Linux, a PowerShell message box on Windows) that approves one call at a time.
+- Approval: deny by default, or an OS dialog (`osascript` on macOS, `zenity` on Linux, a PowerShell form on Windows) that offers three answers: deny, allow this one call, or allow this tool for 15 minutes.
+- Scoped grants: "Allow Tool for 15m" records a time-bounded grant in memory that covers the tool and the directory tree the approved call touched, so the same work in the same folder does not ask again. `--grant TOOL[:DIR]=DURATION` pre-approves the same calls without a dialog.
+- Scratch writes: `--allow-write-under DIR` (or `TOOL=DIR`) lets tainted calls through without a prompt while every path argument stays inside that directory.
+- Hard blocks that neither a grant nor a dialog can override: a tainted call that addresses a network target, or whose paths touch `.git`, `.env*`, key or certificate files, or a known config file name, is refused outright (`EGRESS_TARGET`, `SENSITIVE_TARGET`).
 - JSON-RPC errors that never drop the connection: `-32000` blocked, `-32001` quarantined, `-32002` denied.
 - Fail closed on unparseable or batch frames from the host.
 - Audit log (JSON lines) that records tool names and argument key names, never argument values.
@@ -96,6 +99,12 @@ sylenix-guard-poc/
 # build
 CGO_ENABLED=0 go build -o bin/sylenix-guard ./cmd/sylenix-guard
 
+# on Windows build the .exe too: the MCP client resolves commands through
+# PATHEXT and runs bin/sylenix-guard.exe, which silently shadows the
+# extensionless build when it is stale. demo/harness.py and demo/selftest.py
+# point at the .exe on Windows for the same reason.
+CGO_ENABLED=0 go build -o bin/sylenix-guard.exe ./cmd/sylenix-guard
+
 # protocol tests (no dependencies)
 python3 demo/selftest.py
 
@@ -129,12 +138,19 @@ sylenix-guard [flags] -- <server command> [args...]
 | `--approve deny\|dialog` | What to do with a blocked call. Default `deny`. |
 | `--no-spotlight` | Skip datamarking. |
 | `--reset-pins` | Discard existing pins and trust every tool as new on first sight. Needed to recover from an unreadable pin file. |
+| `--allow-write-under DIR` | Tainted calls need no prompt while every path argument stays inside `DIR`. `TOOL=DIR` limits the fast path to one tool. Repeatable. |
+| `--grant TOOL[:DIR]=DURATION` | Pre-approve the sink calls a dialog grant covers, without a dialog, for example `write_file=15m` or `write_file:out=15m`. Repeatable. |
 
 | Situation | Result |
 |---|---|
 | Tool call, session clean | Forwarded |
 | Tool call, session tainted, tool is in `--readonly` | Forwarded |
-| Tool call, session tainted, any other tool | `-32000`, rule `TAINT_SINK` (or a dialog with `--approve dialog`; denied is `-32002`) |
+| Tool call, session tainted, any other tool | Decided in this order: the hard blocks below, then a live grant, then `--allow-write-under`, then the dialog or `-32000`, rule `TAINT_SINK` |
+| Tainted call whose arguments address a network target (an argument named url/uri/endpoint/webhook/href/link, or a value that is a URL) | `-32000`, rule `EGRESS_TARGET`. Never shown as a dialog, never covered by a grant |
+| Tainted call whose path touches `.git`, `.env*`, `id_rsa*`, `*.pem`/`*.key`/`*.p12`/`*.pfx`, or a known config name (go.mod, package.json, Makefile, ...) | `-32000`, rule `SENSITIVE_TARGET`. Never shown as a dialog, never covered by a grant |
+| Tainted call covered by a live grant (from `--grant` or a 15-minute dialog grant) | Forwarded |
+| Tainted call with every path argument inside `--allow-write-under DIR` | Forwarded without a prompt |
+| Tainted call with `--approve dialog` | Three buttons: Deny (`-32002`, rule `APPROVAL_DENIED`), Allow Once (forwarded), Allow Tool for 15m (forwarded and recorded as a grant scoped to the call's directory) |
 | Tool definition changed since first seen, or contains hidden characters | Tool quarantined; calls get `-32001` |
 | Host sends a line that is not valid JSON | `-32700` with id `null`; connection stays up |
 | Host sends a batch (array) | `-32600`; not forwarded |
@@ -158,7 +174,13 @@ Error data contains only a rule name. Policy details go to the audit log, not to
 - **No confidentiality latch.** Reading a secret and then calling a read-only tool is not tracked.
 - **Pinning is trust on first use.** Whatever the server says on first sight is accepted. Pin files are not signed, and anyone who can write the file can rewrite it. A pin file that exists but cannot be read stops the guard from starting; `--reset-pins` is the explicit way to start over. Hashes use Go's JSON encoding, not RFC 8785.
 - **Spotlighting is friction, not protection.** It wraps `tools/call` text results and strips invisible characters. Resource and prompt results latch taint but are not wrapped. `structuredContent` is not wrapped either, because that would break schema validation; only invisible characters are stripped from its strings. Stripping also removes zero-width joiners and non-joiners, which breaks some emoji sequences and some Persian and Indic text.
-- **The dialog is not biometric.** It shows the tool name and the arguments with control and invisible characters removed, cut at 300 characters. Long or confusable arguments can still mislead. While a dialog is open (up to 60 seconds) the host's other requests wait.
+- **The dialog is not biometric.** It shows the tool name and the arguments with control and invisible characters removed, cut at 300 characters. Long or confusable arguments can still mislead. The three buttons are Deny, Allow Once and Allow Tool for 15m, and the dialog text states what the 15-minute grant covers. While a dialog is open (up to 60 seconds) the host's other requests wait.
+- **A grant covers a tool and a directory tree, not one call.** The 15-minute grant from the dialog (and anything passed with `--grant`) is held in memory and ends with the guard process. A hijacked agent that acts while a grant is live is not stopped inside that window.
+- **Argument classification is a heuristic.** What counts as a path, a network target or free text is decided from argument key names and value shapes. Text under a content-named key is never treated as a path: such a call gets no scratch shortcut, and a path smuggled under a content-named key is not checked against the scratch directory. Unknown means the stricter answer.
+- **`--allow-write-under` interprets relative names against the scratch directory,** which is how workspace-rooted servers resolve them. For a server that resolves relative names against its own working directory, run the guard from the scratch directory or pass absolute paths. Symlinks are resolved on the deepest existing part of the path before the comparison, and this is still not a sandbox: nothing stops a race between the check and the write.
+- **Scratch writes can still carry attacker-chosen content.** `--allow-write-under` decides where a write lands, not what it writes. See `docs/qwen-guarded-data/WRITE_ALLOWED.md`.
+- **The sensitive-name list is short and fixed** (`.git`, `.env*`, key and certificate names, about fifteen config file names). Other sensitive names are not recognized.
+- **`--readonly` bypasses every sink check,** including the hard blocks above. Listing a tool there is a trust decision, and a mis-listed tool defeats all of this.
 - **Process cleanup is minimal.** On a signal the guard kills the child it started, not its descendants (for example the node process behind `npx`).
 - **Unbounded bookkeeping.** The map of pending request ids never expires entries for requests that are never answered.
 - **Not tested** on macOS, Windows, or inside a real host. See the status table.
