@@ -7,3 +7,5 @@ __pycache__/
 .sylenix-poc/
 sweep-*/
 video/
+# Local secrets written by `elevenlabs onboard`
+/.env.local
