@@ -246,7 +246,7 @@ async def main():
         sys.exit("build the guard first: CGO_ENABLED=0 go build -o bin/sylenix-guard ./cmd/sylenix-guard "
                  "(on Windows: -o bin/sylenix-guard.exe, which is the file the MCP client runs)")
     out = Path(args.out)
-    out.mkdir(exist_ok=True)
+    out.mkdir(parents=True, exist_ok=True)
 
     sem = asyncio.Semaphore(max(1, args.jobs))
     rows = []

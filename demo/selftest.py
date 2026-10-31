@@ -327,7 +327,9 @@ def case_duplicate_ids():
 
 def case_pin_file_damage():
     print("pin file that exists but cannot be read")
-    for label, content in (("invalid JSON", "{corrupted json"), ("null", "null"), ("a list", "[]"), ("empty", "")):
+    for label, content in (("invalid JSON", "{corrupted json"), ("null", "null"), ("a list", "[]"), ("empty", ""),
+                           ("null value", '{"write_file": null}'), ("not a hash", '{"write_file": "nothex"}'),
+                           ("empty name", '{"": "' + "0" * 64 + '"}')):
         with tempfile.TemporaryDirectory() as d:
             open(os.path.join(d, "pins-t.json"), "w").write(content)
             p = subprocess.run([GUARD, "--name", "t", "--state-dir", d, "--", sys.executable, FAKE],

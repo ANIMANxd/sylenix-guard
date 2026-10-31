@@ -587,6 +587,19 @@ func (g *Guard) loadPins(reset bool) bool {
 		g.event("pins_unreadable", nil)
 		return false
 	}
+	// A null or malformed value unmarshals into an empty string without an
+	// error and would brick that tool on the next tools/list. Refuse the whole
+	// file instead: only a hex SHA-256 is a pin this build wrote.
+	for name, h := range pins {
+		if name == "" || len(h) != sha256.Size*2 {
+			g.event("pins_unreadable", nil)
+			return false
+		}
+		if _, err := hex.DecodeString(h); err != nil {
+			g.event("pins_unreadable", nil)
+			return false
+		}
+	}
 	g.pins = pins
 	return true
 }

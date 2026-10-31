@@ -1,5 +1,13 @@
 # Audit 2 — Re-audit of the fixed guard (Wave 1D)
 
+**Status update (2026-10-31).** AUD-10 is fixed: `loadPins` now refuses a pin file whose
+values are not 64-character hex SHA-256 strings, and the self-test has fixtures for a
+`null` value, a non-hex value and an empty tool name. AUD-09 is mitigated for
+newline-terminated frames (the 64 MiB discard budget and the fatal `FRAME_TOO_LARGE`
+path); an unterminated oversize line can still stall until EOF, which is an availability
+residual, not a confidentiality one. AUD-08 remains the documented grandchild-process
+limitation. The findings below are the original audit record.
+
 Date: 2026-10-11. Target: `bin/sylenix-guard` built from the Wave 1C tree
 (commit `484d5bf`, sha256 `2264fa45c2e36e5c4691fb27d52fe0f7197739275b54c256092e56cca60358e4`),
 run under WSL2 Ubuntu (Linux); `make check` green (68 passed, 0 failed) before

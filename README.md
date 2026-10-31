@@ -84,6 +84,8 @@ CGO_ENABLED=0 go build -o bin/sylenix-guard.exe ./cmd/sylenix-guard
 ```
 
 `make check` runs gofmt, go vet, the protocol self-test and the audit summarizer fixture.
+On Windows, `make check` needs a POSIX shell (Git Bash or WSL). Without one, run the
+same steps directly: `gofmt -l cmd`, `go vet ./...`, `python demo/selftest.py`.
 
 ### Wrap a server
 
@@ -147,12 +149,19 @@ sends nothing anywhere. Summaries with prompts-per-active-hour metrics:
 
 ## Verification and evidence
 
-- Protocol self-test: 92 checks, `python demo/selftest.py`.
+- Protocol self-test: 95 checks, `python demo/selftest.py` (94 run on Windows; the
+  dialog test needs a real dialog and skips there).
 - Adversarial audits of the proxy itself: [`docs/AUDIT_1.md`](docs/AUDIT_1.md) and
-  [`docs/AUDIT_2.md`](docs/AUDIT_2.md) — ten findings, all fixed and regression-tested.
+  [`docs/AUDIT_2.md`](docs/AUDIT_2.md) — ten findings. Eight are fixed with regression
+  tests (the most recent is the null-pin startup bug, AUD-10). AUD-09 is mitigated for
+  terminated frames and remains an availability residual on an unterminated oversize
+  line; AUD-08 (grandchild processes) is a confirmed, documented limitation.
 - Measurement runs on qwen3.5-9b (local, temperature 0): unshielded, injected content
-  produced exfiltration attempts in 12 of 20 harness runs and 57 of 70 sweep runs.
-  Guarded, 0 secrets left through the tool channel across 110 runs.
+  produced exfiltration attempts in 11 of 20 harness runs and 56 of 70 sweep runs.
+  Guarded, 0 secrets left through the tool channel across 110 runs. On
+  gemma-4-31b-it and gemma-4-26b-a4b-it the injection never fired (0 of 20 unshielded
+  runs attempted it), so the pain is model-dependent: the guard is not the variable
+  that decides whether a model obeys.
 - Policy comparisons (default deny, write-allowed, scratch-directory writes) with raw
   data: [`docs/qwen-guarded-data/`](docs/qwen-guarded-data/),
   [`docs/qwen-scratch-data/`](docs/qwen-scratch-data/),
@@ -182,8 +191,8 @@ it does not control what a model writes or says.
 - Manifest pinning is trust on first use; pin files are not signed.
 - Datamarking breaks some emoji sequences and some Persian and Indic text.
 - The dialog is not biometric: long or confusable arguments can mislead, and while it is
-  open the host's other requests wait. The Windows dialog has been syntax-checked but not
-  exercised by hand (`demo/manual_dialog_test.py`).
+  open the host's other requests wait. The Windows dialog was exercised in the 7-day
+  trial (one denied write); `demo/manual_dialog_test.py` remains the manual check.
 
 Section 7 of [`POC_SPIKE.md`](POC_SPIKE.md) is the authoritative limitations list.
 

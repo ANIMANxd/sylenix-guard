@@ -10,12 +10,12 @@ The code in section 8 was compiled, vetted with `go vet`, formatted with `gofmt`
 
 | Checked | Result |
 |---|---|
-| Protocol self-test (`demo/selftest.py`) | 92 checks, all passing (23 original, 5 added in Wave 1A, 40 in Wave 1C, 24 in Wave 6). On Windows the dialog-fails-closed check skips, so 91 run there. |
+| Protocol self-test (`demo/selftest.py`) | 95 checks, all passing (23 original, 5 added in Wave 1A, 40 in Wave 1C, 24 in Wave 6, 3 for the null-pin fix). On Windows the dialog-fails-closed check skips, so 94 run there. |
 | Full harness run through the real MCP Python SDK (`mcp` 1.30) with the scripted agent, 3 runs per cell | Plumbing works: unguarded runs leak the canary, guarded runs block it |
-| Run with a real model | **Not run.** I had no API key. This is Day 2 of your spike. |
-| Approval dialog on macOS | **Not run.** Compiled for Linux only; the Linux "no dialog available, so deny" path is tested. |
-| Inside Claude Desktop or Cursor | **Not run.** This is Day 3. |
-| Windows | The stdio wrapper builds and runs. The approval dialog (a three-button PowerShell form) has been syntax-checked but not clicked through by the author; check it with `demo/manual_dialog_test.py`. |
+| Run with a real model | **Run.** qwen/qwen3.5-9b via LM Studio, temperature 0, 10 runs per cell; raw data in `docs/qwen-guarded-data/` and `docs/day2b-data/`. The harness later gained local and Gemini agents. |
+| Approval dialog on macOS | **Not run.** The Linux "no dialog available, so deny" path and the Windows dialog are tested. |
+| Inside Claude Desktop or Cursor | **Not run.** LM Studio was the real host used for the 7-day trial. |
+| Windows | The stdio wrapper builds and runs. A 7-day LM Studio trial used the native Windows dialog: 0 false blocks, 5.6 prompts per active hour (`docs/FEEDBACK_LOG.md`). `demo/manual_dialog_test.py` remains the manual check. |
 
 ## What changed from the first version
 
@@ -161,7 +161,7 @@ sylenix-guard [flags] -- <server command> [args...]
 | Server frame longer than 10 MiB | Discarded; the session is tainted; every pending request fails with `-32000`, rule `SERVER_FRAME_TOO_LARGE` |
 | Server closes its stdout | Every pending request fails with `-32000`, rule `SERVER_STREAM_CLOSED`; later requests fail the same way; the server is killed after 5 seconds and the guard exits with code 1 |
 | Host reuses an id that is still pending | `-32600`, rule `DUPLICATE_ID`, id null; not forwarded |
-| Pin file exists but cannot be read | The guard refuses to start (exit 2). `--reset-pins` starts over. |
+| Pin file exists but cannot be read, or holds a value that is not a SHA-256 hash | The guard refuses to start (exit 2). `--reset-pins` starts over. |
 | Host closes stdin | Server stdin is closed; the server is killed if it has not exited after 5 seconds |
 
 Error data contains only a rule name. Policy details go to the audit log, not to the model-visible channel.
@@ -183,7 +183,8 @@ Error data contains only a rule name. Policy details go to the audit log, not to
 - **`--readonly` bypasses every sink check,** including the hard blocks above. Listing a tool there is a trust decision, and a mis-listed tool defeats all of this.
 - **Process cleanup is minimal.** On a signal the guard kills the child it started, not its descendants (for example the node process behind `npx`).
 - **Unbounded bookkeeping.** The map of pending request ids never expires entries for requests that are never answered.
-- **Not tested** on macOS, Windows, or inside a real host. See the status table.
+- **Not tested** on macOS, or inside Claude Desktop or Cursor. Windows and LM Studio
+  were exercised in the 7-day trial (`docs/FEEDBACK_LOG.md`).
 
 ## 8. Code
 
