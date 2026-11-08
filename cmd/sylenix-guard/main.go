@@ -436,6 +436,55 @@ func (g *Guard) fromHost(line []byte) (forward bool, reply []byte) {
 
 // ---------------------------------------------------------------- server -> host
 
+// serverMessageHasContent reports whether a server-to-client request or
+// notification carries text or resource content toward the model or user.
+// Content is not logged: callers only record the method and reason code.
+func serverMessageHasContent(method string, line []byte) bool {
+	switch method {
+	case "sampling/createMessage", "elicitation/create":
+		return true
+	}
+	dec := json.NewDecoder(bytes.NewReader(line))
+	dec.UseNumber()
+	var v any
+	if dec.Decode(&v) != nil {
+		return true // a method-bearing frame we cannot inspect: fail closed
+	}
+	return hasServerContent(v, "")
+}
+
+func hasServerContent(v any, key string) bool {
+	if key != "" && serverContentKey(strings.ToLower(key)) {
+		switch t := v.(type) {
+		case nil:
+			return false
+		case string:
+			return strings.TrimSpace(t) != ""
+		case []any:
+			return len(t) > 0
+		case map[string]any:
+			return len(t) > 0
+		default:
+			return true
+		}
+	}
+	switch t := v.(type) {
+	case []any:
+		for _, x := range t {
+			if hasServerContent(x, key) {
+				return true
+			}
+		}
+	case map[string]any:
+		for k, x := range t {
+			if hasServerContent(x, k) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (g *Guard) fromServer(line []byte) []byte {
 	trim := bytes.TrimSpace(line)
 	if len(trim) == 0 {
@@ -453,6 +502,10 @@ func (g *Guard) fromServer(line []byte) []byte {
 	if method != "" { // request or notification from the server
 		if len(f["id"]) > 0 {
 			g.event("server_request", map[string]any{"method": method})
+		}
+		if serverMessageHasContent(method, line) {
+			g.event("server_request_content", map[string]any{"method": method, "rule": "TAINT_SERVER_REQUEST"})
+			g.latchReason("server_request", "TAINT_SERVER_REQUEST")
 		}
 		return line
 	}
@@ -484,6 +537,10 @@ func (g *Guard) fromServer(line []byte) []byte {
 }
 
 func (g *Guard) latch(origin string) {
+	g.latchReason(origin, "")
+}
+
+func (g *Guard) latchReason(origin, reason string) {
 	g.mu.Lock()
 	first := !g.tainted
 	g.tainted = true
@@ -492,7 +549,11 @@ func (g *Guard) latch(origin string) {
 	}
 	g.mu.Unlock()
 	if first {
-		g.event("taint_latched", map[string]any{"origin": origin})
+		fields := map[string]any{"origin": origin}
+		if reason != "" {
+			fields["reason"] = reason
+		}
+		g.event("taint_latched", fields)
 		alert("session tainted by %q; non-read-only tools now need approval", origin)
 	}
 }
@@ -653,6 +714,19 @@ var contentKeys = map[string]bool{
 	"html": true, "markdown": true, "snippet": true, "diff": true, "patch": true,
 	"title": true, "subject": true, "reason": true, "answer": true, "details": true,
 	"oldtext": true, "newtext": true, "old_text": true, "new_text": true,
+}
+
+// serverContentKeys are additional content-bearing fields in server-to-client
+// requests and notifications. They are checked together with contentKeys.
+var serverContentKeys = map[string]bool{
+	"messages": true, "contents": true, "resource": true, "resources": true,
+	"blob": true, "image": true, "images": true, "audio": true,
+	"structuredcontent": true, "systemprompt": true, "output": true, "outputs": true,
+}
+
+func serverContentKey(k string) bool {
+	return keyMatches(contentKeys, k) || serverContentKeys[k] ||
+		serverContentKeys[keyNormalizer.Replace(k)]
 }
 
 var pathKeys = map[string]bool{

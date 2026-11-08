@@ -10,7 +10,7 @@ The code in section 8 was compiled, vetted with `go vet`, formatted with `gofmt`
 
 | Checked | Result |
 |---|---|
-| Protocol self-test (`demo/selftest.py`) | 95 checks, all passing (23 original, 5 added in Wave 1A, 40 in Wave 1C, 24 in Wave 6, 3 for the null-pin fix). On Windows the dialog-fails-closed check skips, so 94 run there. |
+| Protocol self-test (`demo/selftest.py`) | 101 checks, all passing (23 original, 5 added in Wave 1A, 40 in Wave 1C, 24 in Wave 6, 3 for the null-pin fix, 6 for server-request taint). On Windows the dialog-fails-closed check skips, so 100 run there. |
 | Full harness run through the real MCP Python SDK (`mcp` 1.30) with the scripted agent, 3 runs per cell | Plumbing works: unguarded runs leak the canary, guarded runs block it |
 | Run with a real model | **Run.** qwen/qwen3.5-9b via LM Studio, temperature 0, 10 runs per cell; raw data in `docs/qwen-guarded-data/` and `docs/day2b-data/`. The harness later gained local and Gemini agents. |
 | Approval dialog on macOS | **Not run.** The Linux "no dialog available, so deny" path and the Windows dialog are tested. |
@@ -44,7 +44,7 @@ A 45-second video is a by-product of answering these, not the goal.
 - Transparent stdio wrapper around one MCP server, with no change to the handshake.
 - Layer 0: tool definitions pinned on first sight; a changed definition, or a definition containing hidden characters, is quarantined.
 - Layer 1: tool results are datamarked and stripped of zero-width and bidi characters.
-- Layers 2 and 3: taint latches when any non-trusted tool, resource read, or prompt fetch returns content, or when the server prints something that is not JSON-RPC. Once tainted, only read-only tools run.
+- Layers 2 and 3: taint latches when any non-trusted tool, resource read, or prompt fetch returns content, when the server prints something that is not JSON-RPC, or when the server sends a request or notification carrying text or resource content toward the model/user (for example sampling or elicitation). Once tainted, only read-only tools run.
 - Approval: deny by default, or an OS dialog (`osascript` on macOS, `zenity` on Linux, a PowerShell form on Windows) that offers three answers: deny, allow this one call, or allow this tool for 15 minutes.
 - Scoped grants: "Allow Tool for 15m" records a time-bounded grant in memory that covers the tool and the directory tree the approved call touched, so the same work in the same folder does not ask again. `--grant TOOL[:DIR]=DURATION` pre-approves the same calls without a dialog.
 - Scratch writes: `--allow-write-under DIR` (or `TOOL=DIR`) lets tainted calls through without a prompt while every path argument stays inside that directory.
@@ -157,6 +157,7 @@ sylenix-guard [flags] -- <server command> [args...]
 | Host sends a line that is not valid JSON | `-32700` with id `null`; connection stays up |
 | Host sends a batch (array) | `-32600`; not forwarded |
 | Server prints a non-JSON line | Forwarded unchanged and the session is tainted |
+| Server sends a request or notification carrying text/resource content (sampling, elicitation, logging message, resource content) | Forwarded so the host can answer; the session is tainted with reason `TAINT_SERVER_REQUEST`; content is not logged |
 | A host frame repeats a key inside any JSON object | `-32600`, rule `DUPLICATE_KEYS`; not forwarded |
 | Server sends a response whose id matches no tracked request | Forwarded unchanged and the session is tainted |
 | Host frame longer than 10 MiB | `-32600`, rule `FRAME_TOO_LARGE`, id null; the rest of the line is discarded and the session continues |
@@ -175,7 +176,7 @@ Error data contains only a rule name. Policy details go to the audit log, not to
 - **Taint never clears,** and a session lasts as long as the guard process. With a real filesystem server almost everything taints after the first read. That is the friction you are measuring; `--trust` lets you test the alternative.
 - **No confidentiality latch.** Reading a secret and then calling a read-only tool is not tracked.
 - **Pinning is trust on first use.** Whatever the server says on first sight is accepted. Pin files are not signed, and anyone who can write the file can rewrite it. A pin file that exists but cannot be read stops the guard from starting; `--reset-pins` is the explicit way to start over. Hashes use Go's JSON encoding, not RFC 8785.
-- **Spotlighting is friction, not protection.** It wraps `tools/call` text results and strips invisible characters. Resource and prompt results latch taint but are not wrapped. `structuredContent` is not wrapped either, because that would break schema validation; only invisible characters are stripped from its strings. Stripping also removes zero-width joiners and non-joiners, which breaks some emoji sequences and some Persian and Indic text.
+- **Spotlighting is friction, not protection.** It wraps `tools/call` text results and strips invisible characters. Resource and prompt results latch taint but are not wrapped. Server-to-client request and notification content also latches taint but is forwarded unwrapped so the host can answer. `structuredContent` is not wrapped either, because that would break schema validation; only invisible characters are stripped from its strings. Stripping also removes zero-width joiners and non-joiners, which breaks some emoji sequences and some Persian and Indic text.
 - **The dialog is not biometric.** It shows the tool name and the arguments with control and invisible characters removed, cut at 300 characters. Long or confusable arguments can still mislead. The three buttons are Deny, Allow Once and Allow Tool for 15m, and the dialog text states what the 15-minute grant covers. While a dialog is open (up to 60 seconds) the host's other requests wait.
 - **A grant covers a tool and a directory tree, not one call.** The 15-minute grant from the dialog (and anything passed with `--grant`) is held in memory and ends with the guard process. A hijacked agent that acts while a grant is live is not stopped inside that window.
 - **Argument classification is a heuristic.** What counts as a path, a network target or free text is decided from argument key names and value shapes. Only values under known path keys are treated as paths for the grant and scratch fast paths. Any other non-content value that looks like a path or destination makes that call ineligible for a fast path rather than being silently ignored. Text under a content-named key is never treated as a path: such a call gets no scratch shortcut, and a path smuggled under a content-named key is not checked against the scratch directory. Unknown means the stricter answer.

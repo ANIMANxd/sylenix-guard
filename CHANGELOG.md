@@ -23,6 +23,10 @@
   shell startup profiles, cron, launchd, systemd user units and Windows Startup.
   These are `SENSITIVE_TARGET` after taint, never use a grant or scratch
   shortcut, and can only proceed through `--approve dialog`.
+- Server-to-client requests and notifications that carry text or resource
+  content now latch taint with reason `TAINT_SERVER_REQUEST` before the host
+  sees them. This covers sampling, elicitation, logging messages and resource
+  content; only the method and reason code are logged, never the content.
 
 ### Repository
 
@@ -44,6 +48,9 @@
 - Added `tests/probes/test_protected_targets.py`: every protected-target category
   is checked before taint (allowed) and after taint (blocked), under scratch and
   scoped grant, with an optional fake-zenity approval check on Linux.
+- Extended `demo/fake_server.py` and `demo/selftest.py` with a sampling request
+  carrying injected text followed by an egress call; the call is blocked and the
+  audit records `TAINT_SERVER_REQUEST` without the content.
 - Added the `probe-test` Make target and included it in `make check`.
 - `summary-test` now strips carriage returns before the fixture diff, so
   `make check` also passes under the Git Bash shell on Windows.

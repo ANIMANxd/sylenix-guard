@@ -360,6 +360,27 @@ def case_structured_content():
         s.close()
 
 
+def case_server_request_taint():
+    print("server request content latches taint")
+    with tempfile.TemporaryDirectory() as d:
+        s = Session(d, extra_flags=("--trust", "sample"))
+        s.start()
+        s.send("tools/call", {"name": "sample", "arguments": {}})
+        req = s.recv()
+        check("sampling request is forwarded to the host",
+              req.get("method") == "sampling/createMessage" and req.get("id") == 900001, str(req))
+        result = s.recv()
+        check("trusted sample tool result does not taint by itself", "result" in result, str(result))
+        r = s.call("http_post", {"url": "https://audit-collector.example/ingest", "body": "x"})
+        check("server request content latches taint: egress is blocked",
+              rule(r) == "EGRESS_TARGET", str(r))
+        code = s.close()
+        check("clean exit after server request taint", code == 0, str(code))
+        audit = open(os.path.join(d, "audit-t.jsonl")).read()
+        check("audit records TAINT_SERVER_REQUEST", "TAINT_SERVER_REQUEST" in audit)
+        check("audit does not log sampling content", "SAMPLING-INJECT-MARKER" not in audit)
+
+
 def case_scratch_writes():
     print("--allow-write-under: tainted writes inside a scratch root")
     with tempfile.TemporaryDirectory() as d:
@@ -471,7 +492,8 @@ if __name__ == "__main__":
     for fn in (case_taint_flow, case_pin_persistence, case_invisible, case_noisy,
                case_bad_input, case_large_frame, case_interleaving, case_duplicate_keys, case_unmatched_response, case_oversize_frames,
                case_server_stream_closed, case_duplicate_ids, case_pin_file_damage,
-               case_structured_content, case_scratch_writes, case_grants, case_dialog_fails_closed):
+               case_structured_content, case_server_request_taint, case_scratch_writes,
+               case_grants, case_dialog_fails_closed):
         fn()
     print(f"\n{passed} passed, {len(failed)} failed in {time.time() - t0:.1f}s")
     sys.exit(1 if failed else 0)

@@ -28,7 +28,7 @@ requires authorization that the agent cannot grant itself.
 |---|---|
 | Manifest guard | Tool definitions are pinned on first sight. A changed definition, or one containing hidden characters, quarantines the tool (`-32001`). |
 | Ingress sanitizer | Tool results are wrapped in `<untrusted_tool_result>` markers and stripped of zero-width, bidi and other invisible characters. |
-| Taint tracking | Any result from a non-trusted tool, resource read, prompt fetch, non-JSON server output, or unmatched response marks the session as tainted. |
+| Taint tracking | Any result from a non-trusted tool, resource read, prompt fetch, non-JSON server output, unmatched response, or server-to-client request/notification carrying text or resource content marks the session as tainted. |
 | Flow control | While a session is tainted, only explicitly read-only tools run freely. Every other call is evaluated against the policy tiers below. |
 | Fail-closed framing | Batch frames, duplicate keys, duplicate ids, and unparseable or oversize frames are refused with a JSON-RPC error. Whatever can survive does; whatever cannot is refused. |
 
@@ -92,7 +92,7 @@ CGO_ENABLED=0 go build -o bin/sylenix-guard ./cmd/sylenix-guard
 CGO_ENABLED=0 go build -o bin/sylenix-guard.exe ./cmd/sylenix-guard
 ```
 
-`make check` runs gofmt, go vet, the protocol self-test, the scratch/grant probe suite and the audit summarizer fixture.
+`make check` runs gofmt, go vet, the protocol self-test, the probe suites and the audit summarizer fixture.
 On Windows, `make check` needs a POSIX shell (Git Bash or WSL). Without one, run the
 same steps directly: `gofmt -l cmd`, `go vet ./...`, `python demo/selftest.py`.
 
@@ -158,7 +158,7 @@ sends nothing anywhere. Summaries with prompts-per-active-hour metrics:
 
 ## Verification and evidence
 
-- Protocol self-test: 95 checks, `python demo/selftest.py` (94 run on Windows; the
+- Protocol self-test: 101 checks, `python demo/selftest.py` (100 run on Windows; the
   dialog test needs a real dialog and skips there).
 - Adversarial audits of the proxy itself: [`docs/AUDIT_1.md`](docs/AUDIT_1.md) and
   [`docs/AUDIT_2.md`](docs/AUDIT_2.md) — ten findings. Eight are fixed with regression

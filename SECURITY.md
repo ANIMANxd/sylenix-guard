@@ -35,6 +35,9 @@ Examples include:
   misclassification;
 - reaching a hard-blocked network, sensitive or protected persistence target
   through a grant, scratch rule, dialog decision or path alias;
+- letting content from a server-to-client request or notification (sampling,
+  elicitation, logging message or resource content) reach the model or user
+  without latching taint;
 - defeating pinning or quarantine by changing a tool definition without
   detection;
 - making an unparseable, duplicate, batched, oversize or otherwise ambiguous
