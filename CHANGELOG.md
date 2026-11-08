@@ -2,6 +2,36 @@
 
 ## 2026-11-08
 
+### Policy file
+
+- Added a versioned policy file (`version: 1`). Location order is `--policy
+  PATH`, then `<state-dir>/policy.yaml`, then built-in defaults. A file that
+  exists but cannot be read or parsed is a startup error; the guard never falls
+  back to a weaker policy.
+- Added per-server/per-tool classes (`read`, `write`, `exec`, `egress`),
+  optional per-tool `path_keys` and `allow_paths`, optional per-tool `trust`,
+  global `sensitive_paths`, `egress.allow_hosts`/`deny_hosts`, `approval` and
+  `spotlight`. Unknown tools default to `exec`. Unknown fields, duplicate keys,
+  unsupported YAML features, bad versions/classes/patterns and a missing
+  `servers.<name>` entry fail closed with exit 2.
+- The built-in sensitive-name list now lives in the policy defaults and can be
+  extended by `sensitive_paths`; it cannot be removed. The `.git/hooks`
+  protected-target exception remains.
+- Added `sylenix-guard policy validate <file>` and `sylenix-guard policy
+  print-default`. The loader accepts a strict YAML subset and JSON.
+- `--readonly`, `--trust`, `--approve`, `--allow-write-under` and
+  `--no-spotlight` still work, override the corresponding policy section when
+  explicitly set, and print a deprecation note pointing at the policy
+  equivalent. `--grant` remains flag-only.
+- Added `docs/POLICY.md` with the schema, decision table, precedence rules and
+  three examples. Updated README and POC_SPIKE scope/limitations.
+- Added `tests/probes/test_policy.py` (validation failures, auto-load and
+  explicit-path precedence, classes, unknown tools, path keys, allow paths,
+  egress allow/deny, trust/spotlight, flag precedence, deprecation notes and
+  audit non-logging) and wired it into `make check`.
+- `demo/selftest.py` now runs in flags mode or `--policy` mode; `make check`
+  runs both. No existing check was weakened, deleted or skipped.
+
 ### Security
 
 - Tightened `--allow-write-under` and `--grant`: only values under known path
@@ -30,6 +60,9 @@
 
 ### Repository
 
+- `make build` now also builds `bin/sylenix-guard.exe` on Windows, so
+  `make check` exercises the same binary that MCP clients resolve through
+  `PATHEXT`.
 - Added the Apache License 2.0 `LICENSE` (Copyright 2026 Sylenix Labs) and the
   SPDX header to the Go source.
 - Added `SECURITY.md` for private bypass reporting, response expectations and

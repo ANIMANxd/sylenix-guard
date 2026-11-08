@@ -10,7 +10,7 @@ The code in section 8 was compiled, vetted with `go vet`, formatted with `gofmt`
 
 | Checked | Result |
 |---|---|
-| Protocol self-test (`demo/selftest.py`) | 101 checks, all passing (23 original, 5 added in Wave 1A, 40 in Wave 1C, 24 in Wave 6, 3 for the null-pin fix, 6 for server-request taint). On Windows the dialog-fails-closed check skips, so 100 run there. |
+| Protocol self-test (`demo/selftest.py`) | 101 checks, all passing in both flags mode and `--policy` mode (23 original, 5 added in Wave 1A, 40 in Wave 1C, 24 in Wave 6, 3 for the null-pin fix, 6 for server-request taint). On Windows the dialog-fails-closed check skips, so 100 run there. |
 | Full harness run through the real MCP Python SDK (`mcp` 1.30) with the scripted agent, 3 runs per cell | Plumbing works: unguarded runs leak the canary, guarded runs block it |
 | Run with a real model | **Run.** qwen/qwen3.5-9b via LM Studio, temperature 0, 10 runs per cell; raw data in `docs/qwen-guarded-data/` and `docs/day2b-data/`. The harness later gained local and Gemini agents. |
 | Approval dialog on macOS | **Not run.** The Linux "no dialog available, so deny" path and the Windows dialog are tested. |
@@ -50,6 +50,7 @@ A 45-second video is a by-product of answering these, not the goal.
 - Scratch writes: `--allow-write-under DIR` (or `TOOL=DIR`) lets tainted calls through without a prompt while every path argument stays inside that directory.
 - Hard blocks that neither a grant nor a dialog can override: a tainted call that addresses a network target (a URL/URI value, a URL-named or destination-named argument), or whose paths touch `.git` (except `.git/hooks`), `.env*`, key or certificate files, or a known config file name, is refused outright (`EGRESS_TARGET`, `SENSITIVE_TARGET`).
 - Protected agent-instruction and persistence targets (`AGENTS.md`, editor/MCP config, CI/hooks, shell startup, cron, launchd, systemd user units, Windows Startup) are `SENSITIVE_TARGET` after taint. They never use a grant or scratch shortcut; `--approve dialog` can ask a human, otherwise they are blocked.
+- Versioned policy file (`--policy PATH`, else `<state-dir>/policy.yaml`, else built-in defaults) with per-server/per-tool classes (`read`, `write`, `exec`, `egress`), optional path keys, allow paths and trust, global sensitive-path patterns, egress host allow/deny lists, approval mode and spotlight. Unknown tools default to `exec`; unknown fields are startup errors. Existing flags keep working and override the file.
 - JSON-RPC errors that never drop the connection: `-32000` blocked, `-32001` quarantined, `-32002` denied.
 - Fail closed on unparseable or batch frames from the host.
 - Audit log (JSON lines) that records tool names and argument key names, never argument values.
@@ -134,7 +135,8 @@ sylenix-guard [flags] -- <server command> [args...]
 |---|---|
 | `--name` | Label for this server. Names the pin file and audit log. Default: the command's name. |
 | `--state-dir` | Where pins and the audit log live. Default `~/.sylenix-poc`. |
-| `--readonly a,b` | Tools allowed even when the session is tainted. Everything else is a sink. |
+| `--policy PATH` | Versioned policy file. Default: `<state-dir>/policy.yaml` if present, else built-in defaults. |
+| `--readonly a,b` | Tools allowed even when the session is tainted. Everything else is a sink. Overrides policy read classes. |
 | `--trust a,b` | Tools whose results do not taint the session. |
 | `--approve deny\|dialog` | What to do with a blocked call. Default `deny`. |
 | `--no-spotlight` | Skip datamarking. |
@@ -172,7 +174,7 @@ Error data contains only a rule name. Policy details go to the audit log, not to
 ## 7. Known limitations (say them out loud in any demo)
 
 - **Coverage.** The guard only sees traffic for the server it wraps. The host's built-in tools, attachments and pasted text never pass through it, and taint tracking is blind to them.
-- **Your `--readonly` list is a trust decision.** A "read-only" tool that can reach the network or has side effects defeats the latch. List only tools you are sure are pure reads.
+- **Your `--readonly` list (or policy `class: read`) is a trust decision.** A "read-only" tool that can reach the network or has side effects defeats the latch. List only tools you are sure are pure reads.
 - **Taint never clears,** and a session lasts as long as the guard process. With a real filesystem server almost everything taints after the first read. That is the friction you are measuring; `--trust` lets you test the alternative.
 - **No confidentiality latch.** Reading a secret and then calling a read-only tool is not tracked.
 - **Pinning is trust on first use.** Whatever the server says on first sight is accepted. Pin files are not signed, and anyone who can write the file can rewrite it. A pin file that exists but cannot be read stops the guard from starting; `--reset-pins` is the explicit way to start over. Hashes use Go's JSON encoding, not RFC 8785.
@@ -181,8 +183,10 @@ Error data contains only a rule name. Policy details go to the audit log, not to
 - **A grant covers a tool and a directory tree, not one call.** The 15-minute grant from the dialog (and anything passed with `--grant`) is held in memory and ends with the guard process. A hijacked agent that acts while a grant is live is not stopped inside that window.
 - **Argument classification is a heuristic.** What counts as a path, a network target or free text is decided from argument key names and value shapes. Only values under known path keys are treated as paths for the grant and scratch fast paths. Any other non-content value that looks like a path or destination makes that call ineligible for a fast path rather than being silently ignored. Text under a content-named key is never treated as a path: such a call gets no scratch shortcut, and a path smuggled under a content-named key is not checked against the scratch directory. Unknown means the stricter answer.
 - **`--allow-write-under` interprets relative names against the scratch directory,** which is how workspace-rooted servers resolve them. For a server that resolves relative names against its own working directory, run the guard from the scratch directory or pass absolute paths. Symlinks and `..` are resolved in operating-system order before the comparison, drive-relative and environment-expanded forms are refused, and the approved root must still resolve to the same directory. This is still not a sandbox: nothing stops a race between the check and the write.
-- **Scratch writes can still carry attacker-chosen content.** `--allow-write-under` decides where a write lands, not what it writes. See `docs/qwen-guarded-data/WRITE_ALLOWED.md`.
-- **The sensitive-name and protected-target lists are short and fixed** (`.git` except `.git/hooks`, `.env*`, key and certificate names, about fifteen config file names, plus the agent-instruction and persistence table in the code). Other names are not recognized; the table is compiled in until the policy-file loader exists.
+- **Scratch writes can still carry attacker-chosen content.** `--allow-write-under` (and policy `allow_paths`) decides where a write lands, not what it writes. See `docs/qwen-guarded-data/WRITE_ALLOWED.md`.
+- **The sensitive-name and protected-target lists are short.** The built-in floor (`.git` except `.git/hooks`, `.env*`, key and certificate names, about fifteen config file names) cannot be removed; a policy file can add glob patterns with `sensitive_paths`. The protected agent-instruction and persistence table is still compiled in. Other names are not recognized by default; add them to `sensitive_paths`.
+- **The policy file is trusted local configuration.** It is read once at startup, is not signed or watched, and the loader accepts only a strict YAML subset. Unknown fields, duplicate keys, unsupported YAML features, bad versions, bad classes and malformed patterns stop the guard instead of being ignored. A policy file with several `servers` entries must contain the `--name` in use; a file with exactly one entry uses that entry when `--name` is omitted.
+- **Egress host matching is textual.** It compares the host in the argument value against the policy lists. It does not resolve DNS, follow redirects, inspect the actual connection, or pin the resolved IP, so DNS rebinding and redirect-based egress are not addressed.
 - **`--readonly` bypasses every sink check,** including the hard blocks above. Listing a tool there is a trust decision, and a mis-listed tool defeats all of this.
 - **Process cleanup is minimal.** On a signal the guard kills the child it started, not its descendants (for example the node process behind `npx`).
 - **Unbounded bookkeeping.** The map of pending request ids never expires entries for requests that are never answered.

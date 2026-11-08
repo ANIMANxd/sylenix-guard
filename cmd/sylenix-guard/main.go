@@ -21,18 +21,22 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path"
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 	"unicode"
+	"unicode/utf8"
 )
 
 const maxFrame = 10 << 20      // longest accepted JSON-RPC line: 10 MiB
@@ -42,6 +46,36 @@ const grantTTL = 15 * time.Minute // how long a "Allow Tool for 15m" click stays
 
 const guardMetaKey = "_sylenixGuard"
 const guardMetaVersion = 1
+
+const policyVersion = 1
+const policyFileName = "policy.yaml"
+
+// policyFile is the on-disk policy schema. It is decoded strictly: any field
+// this struct does not name is an error, never silently ignored.
+type policyFile struct {
+	Version        int                     `json:"version"`
+	Approval       string                  `json:"approval"`
+	Spotlight      *bool                   `json:"spotlight"`
+	SensitivePaths []string                `json:"sensitive_paths"`
+	Egress         *policyEgress           `json:"egress"`
+	Servers        map[string]policyServer `json:"servers"`
+}
+
+type policyEgress struct {
+	AllowHosts []string `json:"allow_hosts"`
+	DenyHosts  []string `json:"deny_hosts"`
+}
+
+type policyServer struct {
+	Tools map[string]policyTool `json:"tools"`
+}
+
+type policyTool struct {
+	Class      string   `json:"class"`
+	PathKeys   []string `json:"path_keys"`
+	AllowPaths []string `json:"allow_paths"`
+	Trust      bool     `json:"trust"`
+}
 
 type frame map[string]json.RawMessage
 
@@ -88,7 +122,15 @@ type Guard struct {
 	trust     map[string]bool // tools whose results do not taint the session
 	approve   string          // "deny" or "dialog"
 	spotlight bool
-	scratch   []scratchRule // --allow-write-under entries, fixed after startup
+	scratch   []scratchRule // --allow-write-under or policy allow_paths, fixed after startup
+
+	classes          map[string]string          // policy class for non-read tools
+	toolPathKeys     map[string]map[string]bool // per-tool extra path argument keys
+	egressAllow      map[string]bool            // policy host allowlist
+	egressDeny       map[string]bool            // policy host denylist (wins over allow)
+	policySource     string
+	policyVersion    int
+	readonlyOverride bool // --readonly was set, so policy class: read entries are ignored
 
 	mu          sync.Mutex
 	tainted     bool
@@ -114,10 +156,13 @@ func main() {
 			os.Exit(runConfigCommand("install", os.Args[2:]))
 		case "uninstall":
 			os.Exit(runConfigCommand("uninstall", os.Args[2:]))
+		case "policy":
+			os.Exit(runPolicyCommand(os.Args[2:]))
 		}
 	}
 	name := flag.String("name", "", "label for this server; names the pin and log files (default: command name)")
 	stateDir := flag.String("state-dir", "", "directory for pins and the audit log (default ~/.sylenix-poc)")
+	policyPath := flag.String("policy", "", "path to a versioned policy file (default: <state-dir>/policy.yaml, else built-in defaults)")
 	readonly := flag.String("readonly", "", "comma-separated tools that stay allowed when the session is tainted")
 	trust := flag.String("trust", "", "comma-separated tools whose results do NOT taint the session")
 	approve := flag.String("approve", "deny", "what to do with a blocked call: deny | dialog")
@@ -129,16 +174,19 @@ func main() {
 	flag.Var(&grantSpecs, "grant", "pre-approved sink calls: TOOL[:DIR]=DURATION (for example write_file=15m); repeatable")
 	flag.Parse()
 
+	visited := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { visited[f.Name] = true })
+
 	args := flag.Args()
 	if len(args) == 0 {
 		fmt.Fprintln(os.Stderr, "usage: sylenix-guard [flags] -- <server command> [args...]")
 		os.Exit(2)
 	}
-	if *approve != "deny" && *approve != "dialog" {
+	if visited["approve"] && *approve != "deny" && *approve != "dialog" {
 		fmt.Fprintln(os.Stderr, "sylenix-guard: --approve must be deny or dialog")
 		os.Exit(2)
 	}
-	var scratch []scratchRule
+	var flagScratch []scratchRule
 	for _, spec := range allowWriteUnder {
 		tool, dir := "", spec
 		if i := strings.Index(spec, "="); i >= 0 {
@@ -151,7 +199,7 @@ func main() {
 		if real, ok := canonicalPath(dir); ok {
 			dir = real
 		}
-		scratch = append(scratch, scratchRule{tool: tool, dir: dir})
+		flagScratch = append(flagScratch, scratchRule{tool: tool, dir: dir})
 	}
 	var seeded []grant
 	for _, spec := range grantSpecs {
@@ -180,6 +228,7 @@ func main() {
 		}
 		seeded = append(seeded, grant{tool: tool, dir: dir, expires: time.Now().Add(dur)})
 	}
+	nameExplicit := visited["name"] && *name != ""
 	if *name == "" {
 		*name = filepath.Base(args[0])
 	}
@@ -204,11 +253,8 @@ func main() {
 	g := &Guard{
 		name:        *name,
 		stateDir:    *stateDir,
-		readonly:    toSet(*readonly),
-		trust:       toSet(*trust),
-		approve:     *approve,
-		spotlight:   !*noSpot,
-		scratch:     scratch,
+		approve:     "deny",
+		spotlight:   true,
 		pending:     map[string]pendingReq{},
 		pins:        map[string]string{},
 		quarantined: map[string]string{},
@@ -216,6 +262,17 @@ func main() {
 		out:         os.Stdout,
 		log:         logf,
 	}
+	pf, source, _, err := loadPolicyForRun(*policyPath, visited["policy"], *stateDir, *name, nameExplicit)
+	if err != nil {
+		g.event("policy_invalid", map[string]any{"source": source, "reason": err.Error()})
+		fmt.Fprintln(os.Stderr, "sylenix-guard:", err)
+		os.Exit(2)
+	}
+	g.policySource = source
+	g.policyVersion = pf.Version
+	g.applyPolicy(pf, visited, *readonly, *trust, *approve, flagScratch, *noSpot)
+	printPolicyDeprecationNotes(visited, *policyPath, source)
+	g.event("policy_loaded", map[string]any{"source": source, "version": pf.Version, "approve": g.approve})
 	if !g.loadPins(*resetPins) {
 		fmt.Fprintf(os.Stderr, "[sylenix-guard] pin file %s exists but cannot be read; refusing to start. Inspect it, or restart with --reset-pins to trust every tool as new.\n", g.pinsPath())
 		os.Exit(2)
@@ -238,6 +295,7 @@ func main() {
 		os.Exit(1)
 	}
 	g.event("start", map[string]any{"command": args[0], "readonly": sortedKeys(g.readonly), "trust": sortedKeys(g.trust), "approve": g.approve,
+		"policy_source": g.policySource, "policy_version": g.policyVersion,
 		"allow_write_under": []string(allowWriteUnder), "grants": []string(grantSpecs)})
 
 	sig := make(chan os.Signal, 1)
@@ -335,6 +393,997 @@ func main() {
 	os.Exit(code)
 }
 
+// ---------------------------------------------------------------- policy file
+
+// loadPolicyForRun resolves --policy, then <state-dir>/policy.yaml, then the
+// built-in defaults. A policy that exists but cannot be read or parsed is a
+// startup error; the guard never silently falls back to a weaker policy.
+func loadPolicyForRun(explicitPath string, explicit bool, stateDir, serverName string, nameExplicit bool) (*policyFile, string, string, error) {
+	var data []byte
+	var pathUsed, source string
+	if explicit {
+		if explicitPath == "" {
+			return nil, "flag", "", fmt.Errorf("--policy needs a file path")
+		}
+		pathUsed, source = explicitPath, "flag"
+		b, err := os.ReadFile(pathUsed)
+		if err != nil {
+			return nil, source, pathUsed, fmt.Errorf("cannot read policy %s: %w", pathUsed, err)
+		}
+		data = b
+	} else {
+		pathUsed, source = filepath.Join(stateDir, policyFileName), "state-dir"
+		b, err := os.ReadFile(pathUsed)
+		if os.IsNotExist(err) {
+			return defaultPolicyFile(), "builtin", "", nil
+		}
+		if err != nil {
+			return nil, source, pathUsed, fmt.Errorf("cannot read policy %s: %w", pathUsed, err)
+		}
+		data = b
+	}
+	pf, err := parsePolicyBytes(data)
+	if err != nil {
+		return nil, source, pathUsed, fmt.Errorf("policy %s: %w", pathUsed, err)
+	}
+	if len(pf.Servers) > 0 {
+		if _, ok := pf.Servers[serverName]; !ok && (nameExplicit || len(pf.Servers) != 1) {
+			return nil, source, pathUsed, fmt.Errorf("policy %s: no entry for server %q; add servers.%s.tools or remove the servers block", pathUsed, serverName, serverName)
+		}
+	}
+	return pf, source, pathUsed, nil
+}
+
+func defaultPolicyFile() *policyFile {
+	spot := true
+	return &policyFile{
+		Version:        policyVersion,
+		Approval:       "deny",
+		Spotlight:      &spot,
+		SensitivePaths: append([]string(nil), defaultSensitivePaths...),
+		Egress:         &policyEgress{},
+		Servers:        map[string]policyServer{},
+	}
+}
+
+// UnmarshalJSON accepts both the canonical servers.<name>.tools.<tool> shape
+// and the shorter servers.<name>.<tool> shape. A server entry that uses
+// "tools" may not carry other keys; tool objects are always decoded strictly.
+func (s *policyServer) UnmarshalJSON(data []byte) error {
+	trim := bytes.TrimSpace(data)
+	if bytes.Equal(trim, []byte("null")) {
+		s.Tools = map[string]policyTool{}
+		return nil
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(trim, &raw); err != nil {
+		return err
+	}
+	if toolsRaw, ok := raw["tools"]; ok {
+		if len(raw) != 1 {
+			return fmt.Errorf("server entry has unknown fields alongside \"tools\"")
+		}
+		return decodePolicyJSON(toolsRaw, &s.Tools)
+	}
+	s.Tools = map[string]policyTool{}
+	for name, value := range raw {
+		var tool policyTool
+		if err := decodePolicyJSON(value, &tool); err != nil {
+			return fmt.Errorf("tool %q: %w", name, err)
+		}
+		s.Tools[name] = tool
+	}
+	return nil
+}
+
+func decodePolicyJSON(data []byte, v any) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil {
+		return err
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		return fmt.Errorf("trailing data")
+	}
+	return nil
+}
+
+func parsePolicyBytes(data []byte) (*policyFile, error) {
+	raw, err := parsePolicyRaw(data)
+	if err != nil {
+		return nil, err
+	}
+	if raw == nil {
+		return nil, fmt.Errorf("empty policy file")
+	}
+	b, err := json.Marshal(raw)
+	if err != nil {
+		return nil, fmt.Errorf("cannot encode policy: %w", err)
+	}
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.DisallowUnknownFields()
+	var pf policyFile
+	if err := dec.Decode(&pf); err != nil {
+		return nil, err
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		return nil, fmt.Errorf("trailing data after policy")
+	}
+	if err := validatePolicy(&pf); err != nil {
+		return nil, err
+	}
+	return &pf, nil
+}
+
+func parsePolicyRaw(data []byte) (any, error) {
+	if !utf8.Valid(data) {
+		return nil, fmt.Errorf("policy file is not valid UTF-8")
+	}
+	data = bytes.TrimPrefix(data, []byte{0xEF, 0xBB, 0xBF})
+	trim := bytes.TrimSpace(data)
+	if len(trim) == 0 {
+		return nil, fmt.Errorf("empty policy file")
+	}
+	if trim[0] == '{' {
+		if hasDuplicateKeys(trim) {
+			return nil, fmt.Errorf("duplicate key in JSON policy")
+		}
+		dec := json.NewDecoder(bytes.NewReader(trim))
+		dec.UseNumber()
+		var v any
+		if err := dec.Decode(&v); err == nil {
+			var extra any
+			if err := dec.Decode(&extra); err != io.EOF {
+				return nil, fmt.Errorf("trailing data after JSON policy")
+			}
+			return v, nil
+		}
+		// Not JSON: accept a one-document flow-style YAML mapping as well.
+		return parseYAMLFlow(string(trim))
+	}
+	if trim[0] == '[' {
+		return nil, fmt.Errorf("top-level policy must be a mapping")
+	}
+	return parseYAML(trim)
+}
+
+func validatePolicy(pf *policyFile) error {
+	if pf.Version != policyVersion {
+		return fmt.Errorf("version must be %d", policyVersion)
+	}
+	if pf.Approval != "" && pf.Approval != "deny" && pf.Approval != "dialog" {
+		return fmt.Errorf("approval must be deny or dialog")
+	}
+	for i, p := range pf.SensitivePaths {
+		norm, err := normalizePolicyGlob(p)
+		if err != nil {
+			return fmt.Errorf("sensitive_paths[%d]: %w", i, err)
+		}
+		pf.SensitivePaths[i] = norm
+	}
+	if pf.Egress != nil {
+		for i, h := range pf.Egress.AllowHosts {
+			norm, err := normalizePolicyHost(h)
+			if err != nil {
+				return fmt.Errorf("egress.allow_hosts[%d]: %w", i, err)
+			}
+			pf.Egress.AllowHosts[i] = norm
+		}
+		for i, h := range pf.Egress.DenyHosts {
+			norm, err := normalizePolicyHost(h)
+			if err != nil {
+				return fmt.Errorf("egress.deny_hosts[%d]: %w", i, err)
+			}
+			pf.Egress.DenyHosts[i] = norm
+		}
+	}
+	for name, srv := range pf.Servers {
+		if err := validatePolicyName("server", name); err != nil {
+			return err
+		}
+		for tname, tool := range srv.Tools {
+			if err := validatePolicyName("tool", tname); err != nil {
+				return fmt.Errorf("server %q: %w", name, err)
+			}
+			switch tool.Class {
+			case "read", "write", "exec", "egress":
+			default:
+				return fmt.Errorf("server %q tool %q: class must be read, write, exec or egress", name, tname)
+			}
+			if len(tool.AllowPaths) > 0 && tool.Class != "write" {
+				return fmt.Errorf("server %q tool %q: allow_paths is only valid for class write", name, tname)
+			}
+			seen := map[string]bool{}
+			for i, k := range tool.PathKeys {
+				k = strings.ToLower(strings.TrimSpace(k))
+				if k == "" || hasUnsafePolicyChars(k) {
+					return fmt.Errorf("server %q tool %q: path_keys[%d] is empty or contains control/invisible characters", name, tname, i)
+				}
+				if keyMatches(contentKeys, k) || keyMatches(urlKeys, k) || keyMatches(destinationKeys, k) {
+					return fmt.Errorf("server %q tool %q: path_keys[%d] conflicts with a content, URL or destination key", name, tname, i)
+				}
+				norm := keyNormalizer.Replace(k)
+				if seen[k] || seen[norm] {
+					return fmt.Errorf("server %q tool %q: path_keys[%d] is duplicated", name, tname, i)
+				}
+				seen[k] = true
+				seen[norm] = true
+				tool.PathKeys[i] = k
+			}
+			for i, p := range tool.AllowPaths {
+				if strings.TrimSpace(p) == "" || strings.TrimSpace(p) != p || hasUnsafePolicyChars(p) {
+					return fmt.Errorf("server %q tool %q: allow_paths[%d] is empty or has surrounding spaces/control characters", name, tname, i)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func hasUnsafePolicyChars(s string) bool {
+	for _, r := range s {
+		if unicode.IsControl(r) || isInvisible(r) {
+			return true
+		}
+	}
+	return false
+}
+
+func validatePolicyName(kind, name string) error {
+	if name == "" || strings.TrimSpace(name) != name || hasUnsafePolicyChars(name) {
+		return fmt.Errorf("%s name is empty or contains control/invisible characters", kind)
+	}
+	return nil
+}
+
+func normalizePolicyGlob(p string) (string, error) {
+	if p == "" || strings.TrimSpace(p) != p || hasUnsafePolicyChars(p) {
+		return "", fmt.Errorf("must be a non-empty pattern without surrounding spaces or control/invisible characters")
+	}
+	p = strings.ReplaceAll(p, `\`, "/")
+	if _, err := path.Match(strings.ToLower(p), "x"); err != nil {
+		return "", fmt.Errorf("invalid glob pattern")
+	}
+	return p, nil
+}
+
+func validHostPort(port string) bool {
+	n, err := strconv.Atoi(port)
+	return err == nil && n > 0 && n <= 65535
+}
+
+func normalizePolicyHost(h string) (string, error) {
+	h = strings.ToLower(strings.TrimSpace(h))
+	h = strings.TrimSuffix(h, ".")
+	if strings.Contains(h, "://") {
+		return "", fmt.Errorf("must be a host name or *.host pattern without a scheme, path or spaces")
+	}
+	if strings.HasPrefix(h, "[") {
+		if host, port, err := net.SplitHostPort(h); err == nil {
+			if !validHostPort(port) {
+				return "", fmt.Errorf("invalid port in host pattern")
+			}
+			h = host
+		} else {
+			h = strings.TrimPrefix(strings.TrimSuffix(h, "]"), "[")
+		}
+	} else if !strings.Contains(h, "::") {
+		if host, port, err := net.SplitHostPort(h); err == nil {
+			if !validHostPort(port) {
+				return "", fmt.Errorf("invalid port in host pattern")
+			}
+			h = host
+		}
+	}
+	if h == "" || hasUnsafePolicyChars(h) ||
+		strings.ContainsAny(h, " \t\r\n/?#@\\") || strings.Contains(h, "://") {
+		return "", fmt.Errorf("must be a host name or *.host pattern without a scheme, path or spaces")
+	}
+	if _, err := path.Match(h, "host"); err != nil {
+		return "", fmt.Errorf("invalid host pattern")
+	}
+	return h, nil
+}
+
+// applyPolicy merges the file with explicitly set flags. Flags replace the
+// corresponding policy section rather than adding to it, so an operator can
+// always recover the old behaviour with the old flag.
+func (g *Guard) applyPolicy(pf *policyFile, visited map[string]bool, readonlyFlag, trustFlag, approveFlag string, flagScratch []scratchRule, noSpot bool) {
+	g.classes = map[string]string{}
+	g.toolPathKeys = map[string]map[string]bool{}
+	g.egressAllow = map[string]bool{}
+	g.egressDeny = map[string]bool{}
+	if pf.Egress != nil {
+		g.egressAllow = policyHostSet(pf.Egress.AllowHosts)
+		g.egressDeny = policyHostSet(pf.Egress.DenyHosts)
+	}
+
+	g.approve = pf.Approval
+	if g.approve == "" {
+		g.approve = "deny"
+	}
+	if pf.Spotlight != nil {
+		g.spotlight = *pf.Spotlight
+	} else {
+		g.spotlight = true
+	}
+	if visited["approve"] {
+		g.approve = approveFlag
+	}
+	if visited["no-spotlight"] {
+		g.spotlight = !noSpot
+	}
+
+	setSensitivePatterns(mergeSensitivePatterns(pf.SensitivePaths))
+
+	g.readonly = map[string]bool{}
+	g.readonlyOverride = visited["readonly"]
+	if g.readonlyOverride {
+		g.readonly = toSet(readonlyFlag)
+	}
+	g.trust = map[string]bool{}
+	useFlagTrust := visited["trust"]
+	if useFlagTrust {
+		g.trust = toSet(trustFlag)
+	}
+
+	g.scratch = nil
+	useFlagScratch := visited["allow-write-under"]
+	if useFlagScratch {
+		g.scratch = append([]scratchRule(nil), flagScratch...)
+	}
+
+	var srv policyServer
+	if len(pf.Servers) == 1 {
+		for _, only := range pf.Servers {
+			srv = only
+		}
+	} else if len(pf.Servers) > 1 {
+		srv = pf.Servers[g.name] // loadPolicyForRun already required this entry
+	}
+	for tname, tool := range srv.Tools {
+		switch tool.Class {
+		case "read":
+			if !g.readonlyOverride {
+				g.readonly[tname] = true
+			}
+		case "write", "exec", "egress":
+			g.classes[tname] = tool.Class
+		}
+		if len(tool.PathKeys) > 0 {
+			keys := map[string]bool{}
+			for _, k := range tool.PathKeys {
+				keys[strings.ToLower(k)] = true
+				keys[keyNormalizer.Replace(strings.ToLower(k))] = true
+			}
+			g.toolPathKeys[tname] = keys
+		}
+		if tool.Trust && !useFlagTrust {
+			g.trust[tname] = true
+		}
+		if !useFlagScratch && tool.Class == "write" {
+			for _, p := range tool.AllowPaths {
+				dir := p
+				if real, ok := canonicalPath(dir); ok {
+					dir = real
+				}
+				g.scratch = append(g.scratch, scratchRule{tool: tname, dir: dir})
+			}
+		}
+	}
+}
+
+func printPolicyDeprecationNotes(visited map[string]bool, explicitPath, source string) {
+	where := "the policy file (--policy PATH or <state-dir>/policy.yaml)"
+	if explicitPath != "" {
+		where = "--policy " + explicitPath
+	} else if source == "state-dir" {
+		where = "<state-dir>/policy.yaml"
+	}
+	note := func(flagName, equivalent string) {
+		if visited[flagName] {
+			fmt.Fprintf(os.Stderr, "[sylenix-guard] note: --%s is deprecated; use %s in %s.\n", flagName, equivalent, where)
+		}
+	}
+	note("readonly", "servers.<name>.tools.<tool>.class: read")
+	note("trust", "servers.<name>.tools.<tool>.trust: true")
+	note("approve", "approval: deny|dialog")
+	note("allow-write-under", "servers.<name>.tools.<tool>.allow_paths")
+	note("no-spotlight", "spotlight: false")
+}
+
+func runPolicyCommand(args []string) int {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: sylenix-guard policy validate <file> | sylenix-guard policy print-default")
+		return 2
+	}
+	switch args[0] {
+	case "validate":
+		if len(args) != 2 {
+			fmt.Fprintln(os.Stderr, "usage: sylenix-guard policy validate <file>")
+			return 2
+		}
+		data, err := os.ReadFile(args[1])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "sylenix-guard policy validate: %v\n", err)
+			return 2
+		}
+		pf, err := parsePolicyBytes(data)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "sylenix-guard policy validate: %s: %v\n", args[1], err)
+			return 2
+		}
+		servers := len(pf.Servers)
+		tools := 0
+		for _, srv := range pf.Servers {
+			tools += len(srv.Tools)
+		}
+		fmt.Printf("policy %s: valid (version %d, %d server(s), %d tool(s))\n", args[1], pf.Version, servers, tools)
+		return 0
+	case "print-default":
+		if len(args) != 1 {
+			fmt.Fprintln(os.Stderr, "usage: sylenix-guard policy print-default")
+			return 2
+		}
+		fmt.Print(defaultPolicyYAML())
+		return 0
+	default:
+		fmt.Fprintf(os.Stderr, "sylenix-guard policy: unknown subcommand %q\n", args[0])
+		return 2
+	}
+}
+
+func defaultPolicyYAML() string {
+	var b strings.Builder
+	b.WriteString("version: 1\napproval: deny\nspotlight: true\nsensitive_paths:\n")
+	for _, p := range defaultSensitivePaths {
+		quoted, _ := json.Marshal(p)
+		fmt.Fprintf(&b, "  - %s\n", quoted)
+	}
+	b.WriteString("egress:\n  allow_hosts: []\n  deny_hosts: []\nservers: {}\n")
+	return b.String()
+}
+
+// ---------------------------------------------------------------- strict YAML subset
+
+// The policy loader intentionally supports only the YAML needed by the schema:
+// block mappings, block sequences of scalars, flow sequences/mappings, quoted
+// and plain scalars, comments and a leading document marker. Anchors, aliases,
+// tags, block scalars and multiple documents are refused instead of guessed.
+
+type yamlLine struct {
+	indent int
+	text   string
+	number int
+}
+
+func parseYAML(data []byte) (any, error) {
+	text := strings.ReplaceAll(string(data), "\r\n", "\n")
+	text = strings.ReplaceAll(text, "\r", "\n")
+	lines, err := yamlLines(text)
+	if err != nil {
+		return nil, err
+	}
+	if len(lines) == 0 {
+		return nil, fmt.Errorf("empty YAML document")
+	}
+	if lines[0].text == "---" {
+		lines = lines[1:]
+		if len(lines) == 0 {
+			return nil, fmt.Errorf("empty YAML document")
+		}
+	}
+	if lines[0].indent != 0 {
+		return nil, fmt.Errorf("line %d: top-level mapping must not be indented", lines[0].number)
+	}
+	pos := 0
+	v, err := parseYAMLBlock(lines, &pos, 0)
+	if err != nil {
+		return nil, err
+	}
+	if pos < len(lines) {
+		if lines[pos].text == "..." {
+			pos++
+		}
+		if pos < len(lines) {
+			return nil, fmt.Errorf("line %d: unexpected content", lines[pos].number)
+		}
+	}
+	return v, nil
+}
+
+func yamlLines(text string) ([]yamlLine, error) {
+	raw := strings.Split(text, "\n")
+	out := make([]yamlLine, 0, len(raw))
+	for i, line := range raw {
+		if strings.ContainsRune(line, 0) {
+			return nil, fmt.Errorf("line %d: NUL byte", i+1)
+		}
+		line = stripYAMLComment(line)
+		line = strings.TrimRight(line, " \t")
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		indent := 0
+		for indent < len(line) && line[indent] == ' ' {
+			indent++
+		}
+		if indent < len(line) && line[indent] == '\t' {
+			return nil, fmt.Errorf("line %d: tab indentation is not supported", i+1)
+		}
+		body := line[indent:]
+		if body == "" {
+			continue
+		}
+		out = append(out, yamlLine{indent: indent, text: body, number: i + 1})
+	}
+	return out, nil
+}
+
+func stripYAMLComment(s string) string {
+	inSingle, inDouble, escaped := false, false, false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inDouble {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if c == '\\' {
+				escaped = true
+				continue
+			}
+			if c == '"' {
+				inDouble = false
+			}
+			continue
+		}
+		if inSingle {
+			if c == '\'' {
+				if i+1 < len(s) && s[i+1] == '\'' {
+					i++
+					continue
+				}
+				inSingle = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inDouble = true
+		case '\'':
+			inSingle = true
+		case '#':
+			if i == 0 || s[i-1] == ' ' || s[i-1] == '\t' {
+				return s[:i]
+			}
+		}
+	}
+	return s
+}
+
+func isYAMLSequenceLine(text string) bool {
+	return text == "-" || strings.HasPrefix(text, "- ")
+}
+
+func parseYAMLBlock(lines []yamlLine, pos *int, indent int) (any, error) {
+	if *pos >= len(lines) {
+		return nil, nil
+	}
+	if lines[*pos].indent != indent {
+		return nil, fmt.Errorf("line %d: unexpected indentation", lines[*pos].number)
+	}
+	if isYAMLSequenceLine(lines[*pos].text) {
+		return parseYAMLSequence(lines, pos, indent)
+	}
+	return parseYAMLMap(lines, pos, indent)
+}
+
+func parseYAMLSequence(lines []yamlLine, pos *int, indent int) ([]any, error) {
+	out := []any{}
+	for *pos < len(lines) {
+		line := lines[*pos]
+		if line.indent < indent {
+			break
+		}
+		if line.indent > indent {
+			return nil, fmt.Errorf("line %d: unexpected indentation", line.number)
+		}
+		if !isYAMLSequenceLine(line.text) {
+			break
+		}
+		rest := strings.TrimSpace(line.text[1:])
+		*pos = *pos + 1
+		if rest == "" {
+			if *pos < len(lines) && lines[*pos].indent > indent {
+				child, err := parseYAMLBlock(lines, pos, lines[*pos].indent)
+				if err != nil {
+					return nil, err
+				}
+				out = append(out, child)
+			} else {
+				out = append(out, nil)
+			}
+			continue
+		}
+		if rest[0] != '"' && rest[0] != '\'' && rest[0] != '[' && rest[0] != '{' && strings.Contains(rest, ": ") {
+			return nil, fmt.Errorf("line %d: sequence mappings are not supported", line.number)
+		}
+		v, err := parseYAMLValue(rest)
+		if err != nil {
+			return nil, fmt.Errorf("line %d: %w", line.number, err)
+		}
+		out = append(out, v)
+		if *pos < len(lines) && lines[*pos].indent > indent {
+			return nil, fmt.Errorf("line %d: unexpected indentation after sequence item", lines[*pos].number)
+		}
+	}
+	return out, nil
+}
+
+func parseYAMLMap(lines []yamlLine, pos *int, indent int) (map[string]any, error) {
+	out := map[string]any{}
+	for *pos < len(lines) {
+		line := lines[*pos]
+		if line.indent < indent {
+			break
+		}
+		if line.indent > indent {
+			return nil, fmt.Errorf("line %d: unexpected indentation", line.number)
+		}
+		if isYAMLSequenceLine(line.text) {
+			break
+		}
+		key, rest, err := splitYAMLKey(line.text)
+		if err != nil {
+			return nil, fmt.Errorf("line %d: %w", line.number, err)
+		}
+		if _, exists := out[key]; exists {
+			return nil, fmt.Errorf("line %d: duplicate key %q", line.number, key)
+		}
+		*pos = *pos + 1
+		var v any
+		if rest == "" {
+			// YAML also permits an indentless sequence directly below a key:
+			//   sensitive_paths:
+			//   - .env
+			if *pos < len(lines) && (lines[*pos].indent > indent ||
+				(lines[*pos].indent == indent && isYAMLSequenceLine(lines[*pos].text))) {
+				child, err := parseYAMLBlock(lines, pos, lines[*pos].indent)
+				if err != nil {
+					return nil, err
+				}
+				v = child
+			}
+		} else {
+			v, err = parseYAMLValue(rest)
+			if err != nil {
+				return nil, fmt.Errorf("line %d: %w", line.number, err)
+			}
+			if *pos < len(lines) && lines[*pos].indent > indent {
+				return nil, fmt.Errorf("line %d: unexpected indentation after value", lines[*pos].number)
+			}
+		}
+		out[key] = v
+	}
+	return out, nil
+}
+
+func splitYAMLKey(text string) (string, string, error) {
+	if text == "" {
+		return "", "", fmt.Errorf("empty mapping line")
+	}
+	var key string
+	var i int
+	if text[0] == '"' || text[0] == '\'' {
+		q, end, err := parseYAMLQuotedPrefix(text)
+		if err != nil {
+			return "", "", err
+		}
+		key = q
+		i = end
+		for i < len(text) && (text[i] == ' ' || text[i] == '\t') {
+			i++
+		}
+		if i >= len(text) || text[i] != ':' {
+			return "", "", fmt.Errorf("expected ':' after quoted key")
+		}
+	} else {
+		found := -1
+		for j := 0; j < len(text); j++ {
+			if text[j] == ':' && (j+1 == len(text) || text[j+1] == ' ' || text[j+1] == '\t') {
+				found = j
+				break
+			}
+		}
+		if found < 0 {
+			return "", "", fmt.Errorf("expected key: value")
+		}
+		key = strings.TrimSpace(text[:found])
+		i = found
+	}
+	if key == "" {
+		return "", "", fmt.Errorf("empty mapping key")
+	}
+	return key, strings.TrimSpace(text[i+1:]), nil
+}
+
+func parseYAMLValue(s string) (any, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, nil
+	}
+	if s == "[]" {
+		return []any{}, nil
+	}
+	if s == "{}" {
+		return map[string]any{}, nil
+	}
+	switch s[0] {
+	case '[', '{':
+		return parseYAMLFlow(s)
+	case '|', '>':
+		return nil, fmt.Errorf("block scalars are not supported")
+	case '&', '!', '%', '@', '`':
+		return nil, fmt.Errorf("unsupported YAML feature")
+	case '"', '\'':
+		v, end, err := parseYAMLQuotedPrefix(s)
+		if err != nil {
+			return nil, err
+		}
+		if strings.TrimSpace(s[end:]) != "" {
+			return nil, fmt.Errorf("unexpected text after quoted value")
+		}
+		return v, nil
+	}
+	return parseYAMLPlain(s)
+}
+
+func parseYAMLQuotedPrefix(s string) (string, int, error) {
+	if s == "" {
+		return "", 0, fmt.Errorf("empty quoted value")
+	}
+	if s[0] == '"' {
+		escaped := false
+		for i := 1; i < len(s); i++ {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if s[i] == '\\' {
+				escaped = true
+				continue
+			}
+			if s[i] == '"' {
+				var out string
+				if err := json.Unmarshal([]byte(s[:i+1]), &out); err != nil {
+					return "", 0, fmt.Errorf("invalid double-quoted string: %w", err)
+				}
+				return out, i + 1, nil
+			}
+		}
+		return "", 0, fmt.Errorf("unterminated double-quoted string")
+	}
+	if s[0] == '\'' {
+		var b strings.Builder
+		for i := 1; i < len(s); i++ {
+			if s[i] == '\'' {
+				if i+1 < len(s) && s[i+1] == '\'' {
+					b.WriteByte('\'')
+					i++
+					continue
+				}
+				return b.String(), i + 1, nil
+			}
+			b.WriteByte(s[i])
+		}
+		return "", 0, fmt.Errorf("unterminated single-quoted string")
+	}
+	return "", 0, fmt.Errorf("not a quoted string")
+}
+
+func parseYAMLPlain(s string) (any, error) {
+	s = strings.TrimSpace(s)
+	if strings.ContainsAny(s, "\n\r") || strings.ContainsRune(s, 0) {
+		return nil, fmt.Errorf("invalid scalar")
+	}
+	// Anchors and tags are rejected above. A bare *name is an alias; wildcard
+	// patterns such as *.example.com or *secret* are still plain strings.
+	if strings.HasPrefix(s, "*") && len(s) > 1 && s[1] != '.' && !strings.ContainsAny(s, "/*?[].") {
+		return nil, fmt.Errorf("YAML aliases are not supported; quote the value")
+	}
+	switch strings.ToLower(s) {
+	case "null", "~":
+		return nil, nil
+	case "true":
+		return true, nil
+	case "false":
+		return false, nil
+	}
+	if isYAMLInteger(s) {
+		n, err := strconv.Atoi(s)
+		if err != nil {
+			return nil, fmt.Errorf("invalid integer")
+		}
+		return n, nil
+	}
+	return s, nil
+}
+
+func isYAMLInteger(s string) bool {
+	if s == "" {
+		return false
+	}
+	i := 0
+	if s[0] == '+' || s[0] == '-' {
+		i++
+		if i == len(s) {
+			return false
+		}
+	}
+	for ; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+type yamlFlowParser struct {
+	s string
+	i int
+}
+
+func parseYAMLFlow(s string) (any, error) {
+	p := &yamlFlowParser{s: s}
+	v, err := p.value()
+	if err != nil {
+		return nil, err
+	}
+	p.skipSpace()
+	if p.i != len(p.s) {
+		return nil, fmt.Errorf("unexpected text after flow value")
+	}
+	return v, nil
+}
+
+func (p *yamlFlowParser) skipSpace() {
+	for p.i < len(p.s) && (p.s[p.i] == ' ' || p.s[p.i] == '\t' || p.s[p.i] == '\n' || p.s[p.i] == '\r') {
+		p.i++
+	}
+}
+
+func (p *yamlFlowParser) value() (any, error) {
+	p.skipSpace()
+	if p.i >= len(p.s) {
+		return nil, fmt.Errorf("missing flow value")
+	}
+	switch p.s[p.i] {
+	case '[':
+		return p.sequence()
+	case '{':
+		return p.mapping()
+	case '"', '\'':
+		v, end, err := parseYAMLQuotedPrefix(p.s[p.i:])
+		if err != nil {
+			return nil, err
+		}
+		p.i += end
+		return v, nil
+	default:
+		return p.plain()
+	}
+}
+
+func (p *yamlFlowParser) sequence() ([]any, error) {
+	p.i++ // [
+	out := []any{}
+	p.skipSpace()
+	if p.i < len(p.s) && p.s[p.i] == ']' {
+		p.i++
+		return out, nil
+	}
+	for {
+		v, err := p.value()
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+		p.skipSpace()
+		if p.i >= len(p.s) {
+			return nil, fmt.Errorf("unterminated flow sequence")
+		}
+		switch p.s[p.i] {
+		case ',':
+			p.i++
+		case ']':
+			p.i++
+			return out, nil
+		default:
+			return nil, fmt.Errorf("expected ',' or ']' in flow sequence")
+		}
+	}
+}
+
+func (p *yamlFlowParser) mapping() (map[string]any, error) {
+	p.i++ // {
+	out := map[string]any{}
+	p.skipSpace()
+	if p.i < len(p.s) && p.s[p.i] == '}' {
+		p.i++
+		return out, nil
+	}
+	for {
+		key, err := p.key()
+		if err != nil {
+			return nil, err
+		}
+		p.skipSpace()
+		if p.i >= len(p.s) || p.s[p.i] != ':' {
+			return nil, fmt.Errorf("expected ':' in flow mapping")
+		}
+		p.i++
+		v, err := p.value()
+		if err != nil {
+			return nil, err
+		}
+		if _, exists := out[key]; exists {
+			return nil, fmt.Errorf("duplicate key %q", key)
+		}
+		out[key] = v
+		p.skipSpace()
+		if p.i >= len(p.s) {
+			return nil, fmt.Errorf("unterminated flow mapping")
+		}
+		switch p.s[p.i] {
+		case ',':
+			p.i++
+		case '}':
+			p.i++
+			return out, nil
+		default:
+			return nil, fmt.Errorf("expected ',' or '}' in flow mapping")
+		}
+	}
+}
+
+func (p *yamlFlowParser) key() (string, error) {
+	p.skipSpace()
+	if p.i >= len(p.s) {
+		return "", fmt.Errorf("missing flow mapping key")
+	}
+	if p.s[p.i] == '"' || p.s[p.i] == '\'' {
+		v, end, err := parseYAMLQuotedPrefix(p.s[p.i:])
+		if err != nil {
+			return "", err
+		}
+		p.i += end
+		return v, nil
+	}
+	start := p.i
+	for p.i < len(p.s) && p.s[p.i] != ':' {
+		p.i++
+	}
+	if p.i >= len(p.s) {
+		return "", fmt.Errorf("expected ':' in flow mapping")
+	}
+	key := strings.TrimSpace(p.s[start:p.i])
+	if key == "" {
+		return "", fmt.Errorf("empty flow mapping key")
+	}
+	return key, nil
+}
+
+func (p *yamlFlowParser) plain() (any, error) {
+	start := p.i
+	for p.i < len(p.s) && p.s[p.i] != ',' && p.s[p.i] != ']' && p.s[p.i] != '}' {
+		p.i++
+	}
+	return parseYAMLPlain(strings.TrimSpace(p.s[start:p.i]))
+}
+
 // ---------------------------------------------------------------- host -> server
 
 func (g *Guard) fromHost(line []byte) (forward bool, reply []byte) {
@@ -391,8 +1440,9 @@ func (g *Guard) fromHost(line []byte) (forward bool, reply []byte) {
 		alert("tool %q blocked: %s", p.Name, reason)
 		return false, replyIfRequest(id, -32001, "Blocked by Sylenix Guard", "MANIFEST_QUARANTINE")
 	}
-	if !tainted || g.readonly[p.Name] {
-		g.event("allow", map[string]any{"tool": p.Name, "tainted": tainted, "arg_keys": argKeys(p.Arguments)})
+	class := g.classFor(p.Name)
+	if !tainted || class == "read" {
+		g.event("allow", map[string]any{"tool": p.Name, "tainted": tainted, "class": class, "arg_keys": argKeys(p.Arguments)})
 		g.track(id, method, p.Name)
 		return true, nil
 	}
@@ -401,14 +1451,23 @@ func (g *Guard) fromHost(line []byte) (forward bool, reply []byte) {
 	// first, then protected persistence targets, then grants/scratch, then the
 	// dialog or default deny. A fast path can never reach a hard-blocked or
 	// protected target.
-	scan := scanArgs(p.Arguments)
+	scan := scanArgs(p.Arguments, g.toolPathKeys[p.Name])
+	egressAllowed := false
 	if scan.egress {
-		g.event("block", map[string]any{"tool": p.Name, "rule": "EGRESS_TARGET", "origin": origin, "arg_keys": argKeys(p.Arguments)})
-		alert("tool %q blocked: network target in a session tainted by %q", p.Name, origin)
-		return false, replyIfRequest(id, -32000, "Blocked by Sylenix Guard", "EGRESS_TARGET")
+		egressAllowed = len(scan.egressHosts) > 0
+		for _, host := range scan.egressHosts {
+			if g.hostDenied(host) || !g.hostAllowed(host) {
+				egressAllowed = false
+			}
+		}
+		if !egressAllowed {
+			g.event("block", map[string]any{"tool": p.Name, "rule": "EGRESS_TARGET", "origin": origin, "class": class, "arg_keys": argKeys(p.Arguments)})
+			alert("tool %q blocked: network target in a session tainted by %q", p.Name, origin)
+			return false, replyIfRequest(id, -32000, "Blocked by Sylenix Guard", "EGRESS_TARGET")
+		}
 	}
 	if scan.sensitive {
-		g.event("block", map[string]any{"tool": p.Name, "rule": "SENSITIVE_TARGET", "origin": origin, "arg_keys": argKeys(p.Arguments)})
+		g.event("block", map[string]any{"tool": p.Name, "rule": "SENSITIVE_TARGET", "origin": origin, "class": class, "arg_keys": argKeys(p.Arguments)})
 		alert("tool %q blocked: sensitive path in a session tainted by %q", p.Name, origin)
 		return false, replyIfRequest(id, -32000, "Blocked by Sylenix Guard", "SENSITIVE_TARGET")
 	}
@@ -416,28 +1475,44 @@ func (g *Guard) fromHost(line []byte) (forward bool, reply []byte) {
 		scan.protected = true
 	}
 	if scan.protected && g.approve != "dialog" {
-		g.event("block", map[string]any{"tool": p.Name, "rule": "SENSITIVE_TARGET", "origin": origin, "arg_keys": argKeys(p.Arguments)})
+		g.event("block", map[string]any{"tool": p.Name, "rule": "SENSITIVE_TARGET", "origin": origin, "class": class, "arg_keys": argKeys(p.Arguments)})
 		alert("tool %q blocked: protected persistence path in a session tainted by %q", p.Name, origin)
 		return false, replyIfRequest(id, -32000, "Blocked by Sylenix Guard", "SENSITIVE_TARGET")
+	}
+	// An egress-class tool whose every destination is on the policy allowlist
+	// is the one place an allowlist authorizes a tainted call without a prompt.
+	// Ambiguous values still fail closed; protected targets still ask a human.
+	if class == "egress" && scan.egress && egressAllowed {
+		if scan.ambiguous {
+			g.event("block", map[string]any{"tool": p.Name, "rule": "EGRESS_TARGET", "origin": origin, "class": class, "arg_keys": argKeys(p.Arguments)})
+			alert("tool %q blocked: ambiguous network target in a session tainted by %q", p.Name, origin)
+			return false, replyIfRequest(id, -32000, "Blocked by Sylenix Guard", "EGRESS_TARGET")
+		}
+		if !scan.protected {
+			g.event("allow", map[string]any{"tool": p.Name, "tainted": true, "class": class, "rule": "EGRESS_ALLOW", "arg_keys": argKeys(p.Arguments)})
+			g.track(id, method, p.Name)
+			return true, nil
+		}
 	}
 	// A grant or scratch rule may only short-cut a call whose path arguments
 	// are all understood and inside the approved tree. Anything ambiguous,
 	// and every protected target without a human dialog grant, falls through
-	// to denial or a fresh human decision.
-	if !scan.ambiguous && g.grantAllows(p.Name, scan.paths, scan.protected) {
-		g.event("allow", map[string]any{"tool": p.Name, "tainted": true, "rule": "GRANT", "arg_keys": argKeys(p.Arguments)})
+	// to denial or a fresh human decision. An allow-listed egress destination
+	// on a non-egress tool still needs a fresh human decision, never a fast path.
+	if !scan.egress && !scan.ambiguous && g.grantAllows(p.Name, scan.paths, scan.protected) {
+		g.event("allow", map[string]any{"tool": p.Name, "tainted": true, "class": class, "rule": "GRANT", "arg_keys": argKeys(p.Arguments)})
 		g.track(id, method, p.Name)
 		return true, nil
 	}
-	if !scan.protected && !scan.ambiguous && g.scratchAllows(p.Name, scan.paths) {
-		g.event("allow", map[string]any{"tool": p.Name, "tainted": true, "rule": "SCRATCH", "arg_keys": argKeys(p.Arguments)})
+	if !scan.egress && !scan.protected && !scan.ambiguous && g.scratchAllows(p.Name, scan.paths) {
+		g.event("allow", map[string]any{"tool": p.Name, "tainted": true, "class": class, "rule": "SCRATCH", "arg_keys": argKeys(p.Arguments)})
 		g.track(id, method, p.Name)
 		return true, nil
 	}
 	if g.approve == "dialog" {
 		scope := scopeDir(scan.paths)
 		decision, note := askHuman(p.Name, p.Arguments, origin, grantScopeNote(p.Name, scope))
-		g.event("approval", map[string]any{"tool": p.Name, "granted": decision != "deny", "decision": decision, "note": note, "arg_keys": argKeys(p.Arguments)})
+		g.event("approval", map[string]any{"tool": p.Name, "granted": decision != "deny", "decision": decision, "class": class, "note": note, "arg_keys": argKeys(p.Arguments)})
 		if decision == "grant" {
 			g.addGrant(p.Name, scope, grantTTL, scan.protected)
 			g.event("grant_recorded", map[string]any{"tool": p.Name, "scope": scopeKind(scope), "ttl_seconds": int(grantTTL.Seconds())})
@@ -448,7 +1523,7 @@ func (g *Guard) fromHost(line []byte) (forward bool, reply []byte) {
 		}
 		return false, replyIfRequest(id, -32002, "Authorization denied", "APPROVAL_DENIED")
 	}
-	g.event("block", map[string]any{"tool": p.Name, "rule": "TAINT_SINK", "origin": origin, "arg_keys": argKeys(p.Arguments)})
+	g.event("block", map[string]any{"tool": p.Name, "rule": "TAINT_SINK", "origin": origin, "class": class, "arg_keys": argKeys(p.Arguments)})
 	alert("tool %q blocked: session tainted by %q", p.Name, origin)
 	return false, replyIfRequest(id, -32000, "Blocked by Sylenix Guard", "TAINT_SINK")
 }
@@ -795,12 +1870,74 @@ var egressSchemes = map[string]bool{
 	"mailto": true, "file": true,
 }
 
-// sensitiveNames are file names no tainted call may ever touch, at any depth.
-var sensitiveNames = map[string]bool{
-	"go.mod": true, "go.sum": true, "package.json": true, "package-lock.json": true,
-	"makefile": true, "dockerfile": true, "docker-compose.yml": true, "docker-compose.yaml": true,
-	"cargo.toml": true, "pyproject.toml": true, "requirements.txt": true,
-	"tsconfig.json": true, "setup.py": true, "gemfile": true, "composer.json": true,
+// defaultSensitivePaths is the built-in sensitive-name list. A policy file may
+// add patterns but cannot remove these; the structural .git/.env/key checks
+// below remain a floor even if the list is changed.
+var defaultSensitivePaths = []string{
+	".git",
+	".env*",
+	"id_rsa*",
+	"id_ed25519*",
+	"*.pem",
+	"*.key",
+	"*.p12",
+	"*.pfx",
+	"go.mod", "go.sum", "package.json", "package-lock.json",
+	"makefile", "dockerfile", "docker-compose.yml", "docker-compose.yaml",
+	"cargo.toml", "pyproject.toml", "requirements.txt",
+	"tsconfig.json", "setup.py", "gemfile", "composer.json",
+}
+
+// activeSensitivePatterns is set once at startup, before any proxy goroutine
+// starts, and only read afterwards.
+var activeSensitivePatterns = append([]string(nil), defaultSensitivePaths...)
+
+func setSensitivePatterns(patterns []string) {
+	activeSensitivePatterns = append([]string(nil), patterns...)
+}
+
+func mergeSensitivePatterns(extra []string) []string {
+	out := append([]string(nil), defaultSensitivePaths...)
+	seen := map[string]bool{}
+	for _, p := range out {
+		seen[strings.ToLower(p)] = true
+	}
+	for _, p := range extra {
+		key := strings.ToLower(p)
+		if !seen[key] {
+			out = append(out, p)
+			seen[key] = true
+		}
+	}
+	return out
+}
+
+func sensitivePatternIsGit(p string) bool {
+	p = strings.ToLower(strings.ReplaceAll(strings.TrimSpace(p), `\`, "/"))
+	p = strings.TrimPrefix(p, "./")
+	return p == ".git" || strings.HasPrefix(p, ".git/")
+}
+
+func sensitivePatternMatches(pattern, p string) bool {
+	pattern = strings.ToLower(strings.ReplaceAll(pattern, `\`, "/"))
+	p = strings.ToLower(strings.ReplaceAll(p, `\`, "/"))
+	p = strings.TrimRight(p, "/")
+	components := strings.Split(p, "/")
+	if !strings.Contains(pattern, "/") {
+		for _, c := range components {
+			if ok, err := path.Match(pattern, c); err == nil && ok {
+				return true
+			}
+		}
+		return false
+	}
+	for i := range components {
+		suffix := strings.Join(components[i:], "/")
+		if ok, err := path.Match(pattern, suffix); err == nil && ok {
+			return true
+		}
+	}
+	return false
 }
 
 // protectedTargets is the single table of agent-instruction and persistence
@@ -969,17 +2106,19 @@ func (g *Guard) protectedCall(tool string, paths []string) bool {
 // non-content value that could be a path or destination but is not under a
 // known path key; such a call must never take a grant or scratch shortcut.
 type callScan struct {
-	paths     []string
-	egress    bool
-	sensitive bool
-	protected bool
-	ambiguous bool
+	paths       []string
+	egress      bool
+	egressHosts []string
+	sensitive   bool
+	protected   bool
+	ambiguous   bool
 }
 
 // scanArgs classifies every string inside a call's arguments. Paths are drawn
 // only from known path keys: a filename-shaped value under an unknown key is
 // not a path we can safely compare, so it disqualifies the fast paths instead.
-func scanArgs(args map[string]any) callScan {
+// extraPathKeys are the per-tool path_keys from the policy file.
+func scanArgs(args map[string]any, extraPathKeys map[string]bool) callScan {
 	var s callScan
 	var walk func(key string, v any)
 	walk = func(key string, v any) {
@@ -995,7 +2134,11 @@ func scanArgs(args map[string]any) callScan {
 			case keyMatches(urlKeys, kl) || keyMatches(destinationKeys, kl) ||
 				isURLValue(t) || hasEgressScheme(t) || isIPAddress(t):
 				s.egress = true
-			case keyMatches(pathKeys, kl):
+				if h := hostFromArgument(t); h != "" {
+					s.egressHosts = append(s.egressHosts, h)
+				}
+			case keyMatches(pathKeys, kl) ||
+				(extraPathKeys != nil && (extraPathKeys[kl] || extraPathKeys[keyNormalizer.Replace(kl)])):
 				// Keep the raw value: cleaning before symlink resolution can
 				// turn "link/../x" into a path the server never opens.
 				s.paths = append(s.paths, t)
@@ -1021,6 +2164,9 @@ func scanArgs(args map[string]any) callScan {
 				}
 			case isHostPort(t):
 				s.egress = true
+				if h := hostFromArgument(t); h != "" {
+					s.egressHosts = append(s.egressHosts, h)
+				}
 			case protectedTargetPath(t):
 				s.protected = true
 				if isSensitivePathWithoutGit(t) {
@@ -1131,6 +2277,109 @@ func isHostPort(s string) bool {
 
 // looksLikePath reports whether a value has a filename shape. It is used only
 // to refuse a fast path for values whose key does not identify them as paths.
+func (g *Guard) classFor(tool string) string {
+	if g.readonly[tool] {
+		return "read"
+	}
+	if class := g.classes[tool]; class != "" {
+		return class
+	}
+	return "exec"
+}
+
+func policyHostSet(hosts []string) map[string]bool {
+	m := map[string]bool{}
+	for _, h := range hosts {
+		if h = normalizePolicyHostValue(h); h != "" {
+			m[h] = true
+		}
+	}
+	return m
+}
+
+func normalizePolicyHostValue(h string) string {
+	h = strings.ToLower(strings.TrimSpace(h))
+	return strings.TrimSuffix(h, ".")
+}
+
+func hostMatchesPattern(host string, patterns map[string]bool) bool {
+	host = normalizePolicyHostValue(host)
+	if host == "" {
+		return false
+	}
+	for p := range patterns {
+		if p == host {
+			return true
+		}
+		if strings.ContainsAny(p, "*?[") {
+			if ok, err := path.Match(p, host); err == nil && ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (g *Guard) hostDenied(host string) bool {
+	return hostMatchesPattern(host, g.egressDeny)
+}
+
+func (g *Guard) hostAllowed(host string) bool {
+	return hostMatchesPattern(host, g.egressAllow)
+}
+
+// hostFromArgument extracts a lower-case host from a URL, URI, host:port or
+// bare destination value. An empty result means the destination is unknown,
+// which callers treat as not allow-listed.
+func hostFromArgument(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	lower := strings.ToLower(s)
+	if strings.HasPrefix(lower, "mailto:") {
+		addr := s[len("mailto:"):]
+		if i := strings.LastIndex(addr, "@"); i >= 0 {
+			return normalizePolicyHostValue(addr[i+1:])
+		}
+		return ""
+	}
+	if strings.HasPrefix(s, "//") {
+		if u, err := url.Parse("http:" + s); err == nil {
+			return normalizePolicyHostValue(u.Hostname())
+		}
+	}
+	if i := strings.Index(s, "://"); i > 0 {
+		if u, err := url.Parse(s); err == nil {
+			return normalizePolicyHostValue(u.Hostname())
+		}
+	}
+	if i := strings.IndexByte(s, ':'); i > 0 && egressSchemes[strings.ToLower(s[:i])] {
+		if u, err := url.Parse(s); err == nil {
+			if u.Hostname() != "" {
+				return normalizePolicyHostValue(u.Hostname())
+			}
+			if u.Opaque != "" {
+				if j := strings.LastIndex(u.Opaque, "@"); j >= 0 {
+					return normalizePolicyHostValue(u.Opaque[j+1:])
+				}
+			}
+		}
+		return ""
+	}
+	if i := strings.LastIndex(s, "@"); i >= 0 {
+		s = s[i+1:]
+	}
+	if i := strings.IndexAny(s, "/?#"); i >= 0 {
+		s = s[:i]
+	}
+	if h, _, err := net.SplitHostPort(s); err == nil {
+		s = h
+	}
+	s = strings.TrimPrefix(strings.TrimSuffix(s, "]"), "[")
+	return normalizePolicyHostValue(s)
+}
+
 func looksLikePath(s string) bool {
 	if s == "" || len(s) > 400 || strings.ContainsAny(s, "\n\r\t") {
 		return false
@@ -1213,7 +2462,15 @@ func isSensitivePathParts(p string, checkGit bool) bool {
 	case ".pem", ".key", ".p12", ".pfx":
 		return true
 	}
-	return sensitiveNames[base]
+	for _, pattern := range activeSensitivePatterns {
+		if !checkGit && sensitivePatternIsGit(pattern) {
+			continue
+		}
+		if sensitivePatternMatches(pattern, norm) {
+			return true
+		}
+	}
+	return false
 }
 
 // expandHome expands a leading ~ or ~/ or ~\ to the user's home directory.

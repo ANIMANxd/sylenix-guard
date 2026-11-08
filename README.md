@@ -69,6 +69,9 @@ wraps one MCP server per process over stdio.
 - Result datamarking and invisible-character stripping, including `structuredContent`
 - Session taint tracking with default-deny flow control
 - Hard blocks for network targets and sensitive paths
+- Versioned policy file (`--policy` or `<state-dir>/policy.yaml`) with per-tool
+  classes, path keys, allow paths, trust, sensitive patterns, egress host lists,
+  approval mode and spotlight; flags remain and override the file
 - Scratch-directory write policy (`--allow-write-under`)
 - Time-bounded, directory-scoped human approvals (dialog and `--grant`)
 - Native approval dialogs: osascript (macOS), zenity (Linux), PowerShell form (Windows)
@@ -89,7 +92,8 @@ current build. Scope and behavior are governed by [`POC_SPIKE.md`](POC_SPIKE.md)
 CGO_ENABLED=0 go build -o bin/sylenix-guard ./cmd/sylenix-guard
 
 # on Windows build the .exe as well: MCP clients resolve commands through PATHEXT
-# and run bin/sylenix-guard.exe, which can shadow a stale extensionless build
+# and run bin/sylenix-guard.exe, which can shadow a stale extensionless build.
+# `make build` does this automatically on Windows.
 CGO_ENABLED=0 go build -o bin/sylenix-guard.exe ./cmd/sylenix-guard
 ```
 
@@ -137,17 +141,41 @@ unclassifiable traffic is handled by the most restrictive tier.
 |---|---|
 | `--name` | Label for this server; names the pin and audit files. Default: the command's name. |
 | `--state-dir` | Where pins and the audit log live. Default `~/.sylenix-poc`. |
-| `--readonly a,b` | Tools allowed even when the session is tainted. Everything else is a sink. |
-| `--trust a,b` | Tools whose results do not taint the session. |
-| `--approve deny\|dialog` | What happens to a blocked call. Default `deny`. |
-| `--allow-write-under DIR` | Tainted calls need no prompt while every path argument stays inside `DIR`. `TOOL=DIR` scopes it to one tool. Repeatable. |
+| `--policy PATH` | Versioned policy file. Default: `<state-dir>/policy.yaml` if present, else built-in defaults. |
+| `--readonly a,b` | Tools allowed even when the session is tainted. Replaces all policy `class: read` entries. |
+| `--trust a,b` | Tools whose results do not taint the session. Overrides policy trust entries. |
+| `--approve deny\|dialog` | What happens to a blocked call. Default `deny`. Overrides policy `approval`. |
+| `--allow-write-under DIR` | Tainted calls need no prompt while every path argument stays inside `DIR`. `TOOL=DIR` scopes it to one tool. Repeatable; overrides policy `allow_paths`. |
 | `--grant TOOL[:DIR]=DURATION` | Pre-approved sink calls, e.g. `write_file=15m`. Repeatable. |
-| `--no-spotlight` | Skip datamarking of tool results. |
+| `--no-spotlight` | Skip datamarking of tool results. Overrides policy `spotlight`. |
 | `--reset-pins` | Discard existing pins and trust every tool as new on first sight. |
+
+Flags that are explicitly set override the policy file and print a deprecation
+note pointing at the policy equivalent. The full schema, semantics and examples
+are in [`docs/POLICY.md`](docs/POLICY.md).
+
+```bash
+sylenix-guard policy validate ./policy.yaml
+sylenix-guard policy print-default > policy.yaml
+```
 
 Blocked calls answer with JSON-RPC errors that never drop the connection: `-32000`
 blocked, `-32001` quarantined, `-32002` denied. Error data carries a rule name only;
 policy detail goes to the audit log, never to the model.
+
+## Policy file
+
+The policy file is a versioned YAML document (`version: 1`). It maps each server
+name and tool name to one of `read`, `write`, `exec` or `egress`, and can set
+per-tool path keys and allow paths plus global sensitive patterns, egress host
+allow/deny lists and the approval mode. Unknown tools default to `exec`; unknown
+fields, duplicate keys, bad versions and malformed patterns stop the guard at
+startup instead of being ignored. The file is read once at startup.
+
+Location order is `--policy PATH`, then `<state-dir>/policy.yaml`, then the
+built-in defaults. The built-in sensitive-name floor cannot be removed by a
+policy file; `sensitive_paths` only adds to it. See
+[`docs/POLICY.md`](docs/POLICY.md) for the schema and three worked examples.
 
 ## Audit log
 
@@ -200,8 +228,8 @@ never passes through its process. In particular, it does not:
 - clear taint automatically, or infer intent from the model's text.
 
 Path and destination classification is a heuristic, and a misconfigured
-`--readonly`, `--trust` or `--grant` is a trust decision. The detailed
-limitations are in the section below and in `POC_SPIKE.md` section 7.
+`--readonly`, `--trust`, `--grant` or policy class is a trust decision. The
+detailed limitations are in the section below and in `POC_SPIKE.md` section 7.
 
 Report a suspected bypass privately, not in a public issue. See
 [`SECURITY.md`](SECURITY.md) for the reporting channels, what counts as a
@@ -212,7 +240,7 @@ bypass, response expectations and safe harbour.
 - Coverage is one MCP server per process. Host built-in tools, attachments and pasted
   text never pass through the gateway.
 - Taint does not clear for the life of the process.
-- `--readonly` bypasses every sink check, including the hard blocks.
+- `--readonly` and policy `class: read` bypass every sink check, including the hard blocks.
 - The scratch policy governs where writes land, not what they write.
 - `--allow-write-under` interprets relative names against the scratch directory; the
   guarantee is literal only for servers that resolve paths the same way. Symlinks are
@@ -222,7 +250,11 @@ bypass, response expectations and safe harbour.
   argument key names and value shapes.
 - Approvals are held in memory, expire after 15 minutes, and an agent acting inside a
   live approval is not stopped.
-- The sensitive-name list is short and fixed.
+- The built-in sensitive-name floor is short. `sensitive_paths` can extend it but
+  cannot remove it. Policy files are local, unsigned and read once at startup; the
+  loader accepts only a strict YAML subset.
+- Egress host matching is textual on the argument value. It does not resolve DNS,
+  follow redirects, inspect the actual connection or pin the resolved IP.
 - Manifest pinning is trust on first use; pin files are not signed.
 - Datamarking breaks some emoji sequences and some Persian and Indic text.
 - The dialog is not biometric: long or confusable arguments can mislead, and while it is
@@ -244,6 +276,7 @@ POC_SPIKE.md                scope, behavior reference, decision gates
 
 ## Documentation
 
+- [`docs/POLICY.md`](docs/POLICY.md) — policy schema, precedence and examples
 - [`docs/TESTER_GUIDE.md`](docs/TESTER_GUIDE.md) — installing it on a real host
 - [`docs/SOAK_CHECKLIST.md`](docs/SOAK_CHECKLIST.md) — evaluating it over a working day
 - [`docs/SPEC_FULL.md`](docs/SPEC_FULL.md) — the full product architecture

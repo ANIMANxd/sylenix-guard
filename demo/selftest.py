@@ -22,6 +22,18 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GUARD = os.path.join(ROOT, "bin", "sylenix-guard.exe" if sys.platform == "win32" else "sylenix-guard")
 FAKE = os.path.join(ROOT, "demo", "fake_server.py")
 
+# --policy mode replaces only the --readonly flag with an equivalent file. The
+# rest of the suite keeps exercising the flags it is about.
+POLICY_MODE = False
+POLICY_TEXT = """version: 1
+approval: deny
+servers:
+  t:
+    tools:
+      read_ticket:
+        class: read
+"""
+
 passed, failed = 0, []
 
 
@@ -39,8 +51,13 @@ class Session:
     def __init__(self, state_dir, extra_flags=(), env=None):
         e = dict(os.environ)
         e.update(env or {})
-        cmd = [GUARD, "--name", "t", "--state-dir", state_dir, "--readonly", "read_ticket",
-               *extra_flags, "--", sys.executable, FAKE]
+        cmd = [GUARD, "--name", "t", "--state-dir", state_dir]
+        if POLICY_MODE:
+            with open(os.path.join(state_dir, "policy.yaml"), "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(POLICY_TEXT)
+        else:
+            cmd += ["--readonly", "read_ticket"]
+        cmd += [*extra_flags, "--", sys.executable, FAKE]
         self.p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                   stderr=subprocess.DEVNULL, env=e)
         self.q = queue.Queue()
@@ -486,8 +503,15 @@ def case_dialog_fails_closed():
 
 
 if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser(description="Protocol self-test for sylenix-guard.")
+    ap.add_argument("--policy", action="store_true",
+                    help="use an equivalent policy file instead of --readonly")
+    opts = ap.parse_args()
+    POLICY_MODE = opts.policy
     if not os.path.exists(GUARD):
         sys.exit("build first: CGO_ENABLED=0 go build -o bin/sylenix-guard ./cmd/sylenix-guard")
+    print(f"mode: {'policy file' if POLICY_MODE else 'flags'}")
     t0 = time.time()
     for fn in (case_taint_flow, case_pin_persistence, case_invisible, case_noisy,
                case_bad_input, case_large_frame, case_interleaving, case_duplicate_keys, case_unmatched_response, case_oversize_frames,
