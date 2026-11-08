@@ -35,13 +35,22 @@ requires authorization that the agent cannot grant itself.
 ### Policy tiers for a tainted call
 
 1. **Always blocked.** Calls that address a network target (an argument named
-   `url`/`uri`/`endpoint`/`webhook`/`href`/`link`, or a value that is a URL) and calls
-   whose paths touch `.git`, `.env*`, key or certificate files, or known config names
-   (`go.mod`, `package.json`, `Makefile`, …) are refused with `EGRESS_TARGET` and
-   `SENSITIVE_TARGET`. These cannot be approved through a dialog or a grant.
-2. **Scratch fast path.** With `--allow-write-under DIR` (or `TOOL=DIR`), calls whose
+   `url`/`uri`/`endpoint`/`webhook`/`href`/`link`, a destination key such as
+   `host`/`server`/`to`/`recipient`, or a value that is a URL/URI) and calls
+   whose paths touch `.git` (except `.git/hooks`), `.env*`, key or certificate
+   files, or known config names (`go.mod`, `package.json`, `Makefile`, …) are
+   refused with `EGRESS_TARGET` and `SENSITIVE_TARGET`. These cannot be approved
+   through a dialog or a grant.
+2. **Protected agent-instruction and persistence files.** Agent instruction files
+   (`AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, Cursor/Windsurf rules), MCP/editor config
+   (`.mcp.json`, `mcp.json`, `claude_desktop_config.json`, `.vscode`, `.idea`), CI
+   and hooks (`.github/workflows`, `.gitlab-ci.yml`, `.git/hooks`, `.husky`), shell
+   startup files, cron, launchd, systemd user units and Windows Startup are
+   `SENSITIVE_TARGET` after taint. They never use a grant or scratch shortcut; with
+   `--approve dialog` they require a human decision.
+3. **Scratch fast path.** With `--allow-write-under DIR` (or `TOOL=DIR`), calls whose
    every path argument stays inside `DIR` are forwarded without a prompt.
-3. **Authorization.** Everything else is denied (`-32000 TAINT_SINK`), or, with
+4. **Authorization.** Everything else is denied (`-32000 TAINT_SINK`), or, with
    `--approve dialog`, presented to a human with three choices: **Deny**, **Allow Once**,
    **Allow Tool for 15m**. A 15-minute approval is scoped to the directory the approved
    call touched and is held in memory for the life of the process.
@@ -83,7 +92,7 @@ CGO_ENABLED=0 go build -o bin/sylenix-guard ./cmd/sylenix-guard
 CGO_ENABLED=0 go build -o bin/sylenix-guard.exe ./cmd/sylenix-guard
 ```
 
-`make check` runs gofmt, go vet, the protocol self-test and the audit summarizer fixture.
+`make check` runs gofmt, go vet, the protocol self-test, the scratch/grant probe suite and the audit summarizer fixture.
 On Windows, `make check` needs a POSIX shell (Git Bash or WSL). Without one, run the
 same steps directly: `gofmt -l cmd`, `go vet ./...`, `python demo/selftest.py`.
 

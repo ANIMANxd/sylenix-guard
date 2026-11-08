@@ -18,6 +18,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -54,9 +55,11 @@ type scratchRule struct {
 // grant is a time-bounded approval: calls to tool need no prompt until expires,
 // as long as every path argument stays inside dir (any path when dir is empty).
 type grant struct {
-	tool    string
-	dir     string
-	expires time.Time
+	tool      string
+	dir       string
+	expires   time.Time
+	human     bool // recorded by the dialog, not by --grant
+	protected bool // the approved call was itself a protected target
 }
 
 // stringList collects a repeatable string flag.
@@ -124,7 +127,10 @@ func main() {
 			fmt.Fprintln(os.Stderr, "sylenix-guard: --allow-write-under wants DIR or TOOL=DIR")
 			os.Exit(2)
 		}
-		scratch = append(scratch, scratchRule{tool: tool, dir: filepath.Clean(dir)})
+		if real, ok := canonicalPath(dir); ok {
+			dir = real
+		}
+		scratch = append(scratch, scratchRule{tool: tool, dir: dir})
 	}
 	var seeded []grant
 	for _, spec := range grantSpecs {
@@ -145,6 +151,11 @@ func main() {
 		if tool == "" || strings.ContainsAny(tool, `/\`) {
 			fmt.Fprintln(os.Stderr, "sylenix-guard: --grant wants TOOL[:DIR]=DURATION, for example write_file=15m")
 			os.Exit(2)
+		}
+		if dir != "" {
+			if real, ok := canonicalPath(dir); ok {
+				dir = real
+			}
 		}
 		seeded = append(seeded, grant{tool: tool, dir: dir, expires: time.Now().Add(dur)})
 	}
@@ -365,36 +376,49 @@ func (g *Guard) fromHost(line []byte) (forward bool, reply []byte) {
 		return true, nil
 	}
 
-	// Tainted session, tool is not read-only: this is a sink. Three tiers,
-	// most restrictive first. Neither a grant nor a scratch rule can ever
-	// reach a network target or a sensitive path.
-	paths, egress, sensitive := scanArgs(p.Arguments)
-	if egress {
+	// Tainted session, tool is not read-only: this is a sink. Hard blocks go
+	// first, then protected persistence targets, then grants/scratch, then the
+	// dialog or default deny. A fast path can never reach a hard-blocked or
+	// protected target.
+	scan := scanArgs(p.Arguments)
+	if scan.egress {
 		g.event("block", map[string]any{"tool": p.Name, "rule": "EGRESS_TARGET", "origin": origin, "arg_keys": argKeys(p.Arguments)})
 		alert("tool %q blocked: network target in a session tainted by %q", p.Name, origin)
 		return false, replyIfRequest(id, -32000, "Blocked by Sylenix Guard", "EGRESS_TARGET")
 	}
-	if sensitive {
+	if scan.sensitive {
 		g.event("block", map[string]any{"tool": p.Name, "rule": "SENSITIVE_TARGET", "origin": origin, "arg_keys": argKeys(p.Arguments)})
 		alert("tool %q blocked: sensitive path in a session tainted by %q", p.Name, origin)
 		return false, replyIfRequest(id, -32000, "Blocked by Sylenix Guard", "SENSITIVE_TARGET")
 	}
-	if g.grantAllows(p.Name, paths) {
+	if !scan.protected && g.protectedCall(p.Name, scan.paths) {
+		scan.protected = true
+	}
+	if scan.protected && g.approve != "dialog" {
+		g.event("block", map[string]any{"tool": p.Name, "rule": "SENSITIVE_TARGET", "origin": origin, "arg_keys": argKeys(p.Arguments)})
+		alert("tool %q blocked: protected persistence path in a session tainted by %q", p.Name, origin)
+		return false, replyIfRequest(id, -32000, "Blocked by Sylenix Guard", "SENSITIVE_TARGET")
+	}
+	// A grant or scratch rule may only short-cut a call whose path arguments
+	// are all understood and inside the approved tree. Anything ambiguous,
+	// and every protected target without a human dialog grant, falls through
+	// to denial or a fresh human decision.
+	if !scan.ambiguous && g.grantAllows(p.Name, scan.paths, scan.protected) {
 		g.event("allow", map[string]any{"tool": p.Name, "tainted": true, "rule": "GRANT", "arg_keys": argKeys(p.Arguments)})
 		g.track(id, method, p.Name)
 		return true, nil
 	}
-	if g.scratchAllows(p.Name, paths) {
+	if !scan.protected && !scan.ambiguous && g.scratchAllows(p.Name, scan.paths) {
 		g.event("allow", map[string]any{"tool": p.Name, "tainted": true, "rule": "SCRATCH", "arg_keys": argKeys(p.Arguments)})
 		g.track(id, method, p.Name)
 		return true, nil
 	}
 	if g.approve == "dialog" {
-		scope := scopeDir(paths)
+		scope := scopeDir(scan.paths)
 		decision, note := askHuman(p.Name, p.Arguments, origin, grantScopeNote(p.Name, scope))
 		g.event("approval", map[string]any{"tool": p.Name, "granted": decision != "deny", "decision": decision, "note": note, "arg_keys": argKeys(p.Arguments)})
 		if decision == "grant" {
-			g.addGrant(p.Name, scope, grantTTL)
+			g.addGrant(p.Name, scope, grantTTL, scan.protected)
 			g.event("grant_recorded", map[string]any{"tool": p.Name, "scope": scopeKind(scope), "ttl_seconds": int(grantTTL.Seconds())})
 		}
 		if decision != "deny" {
@@ -626,17 +650,54 @@ var contentKeys = map[string]bool{
 	"comment": true, "comments": true, "instructions": true, "query": true, "code": true,
 	"html": true, "markdown": true, "snippet": true, "diff": true, "patch": true,
 	"title": true, "subject": true, "reason": true, "answer": true, "details": true,
+	"oldtext": true, "newtext": true, "old_text": true, "new_text": true,
 }
 
 var pathKeys = map[string]bool{
-	"path": true, "paths": true, "file": true, "files": true, "filename": true,
+	"path": true, "paths": true, "pathname": true, "file": true, "files": true, "filename": true,
 	"filepath": true, "file_path": true, "file_name": true, "dir": true, "directory": true,
 	"folder": true, "dest": true, "destination": true, "target": true, "source": true,
 	"src": true, "location": true, "root": true, "workspace": true,
+	"output": true, "output_path": true, "outputpath": true, "output_file": true,
+	"outputfile": true, "input_path": true, "inputpath": true,
+	"input_file": true, "inputfile": true, "from_file": true, "fromfile": true,
+	"to_file": true, "tofile": true,
+	"dest_path": true, "destpath": true, "dest_file": true, "destfile": true,
+	"destination_path": true, "destinationpath": true,
+	"destination_file": true, "destinationfile": true,
+	"target_path": true, "targetpath": true, "target_file": true, "targetfile": true,
+	"source_path": true, "sourcepath": true, "source_file": true, "sourcefile": true,
 }
 
 var urlKeys = map[string]bool{
 	"url": true, "uri": true, "endpoint": true, "webhook": true, "href": true, "link": true,
+}
+
+// destinationKeys name a recipient or remote endpoint even when the value is a
+// bare hostname rather than a URL. They are hard blocks once the session is
+// tainted; a grant or scratch rule must never carry data to them.
+var destinationKeys = map[string]bool{
+	"host": true, "hostname": true, "server": true, "address": true, "addr": true,
+	"to": true, "recipient": true, "recipients": true, "email": true,
+	"remote": true, "callback": true, "redirect": true, "upload": true,
+	"bucket": true, "queue": true, "topic": true,
+	"sendto": true, "postto": true, "exfil": true, "exfiltrate": true, "egress": true,
+	"endpointurl": true, "webhookurl": true, "callbackurl": true, "redirecturl": true,
+	"uploadurl": true, "serverurl": true, "remoteurl": true, "destinationurl": true,
+	"targeturl": true, "apiurl": true, "serviceurl": true, "posturl": true,
+	"sendurl": true, "exfilurl": true, "hosturl": true, "emailto": true,
+	"sendemail": true, "emailaddress": true, "serveraddress": true,
+	"remoteaddress": true, "destinationhost": true, "targethost": true,
+	"remotehost": true, "serverhost": true, "exfilhost": true,
+	"servername": true, "remotename": true, "endpointname": true,
+	"bucketname": true, "queuename": true, "topicname": true,
+	"uploadto": true, "redirectto": true, "forwardto": true,
+}
+
+var egressSchemes = map[string]bool{
+	"http": true, "https": true, "ftp": true, "ftps": true, "sftp": true,
+	"ssh": true, "smb": true, "nfs": true, "ws": true, "wss": true,
+	"mailto": true, "file": true,
 }
 
 // sensitiveNames are file names no tainted call may ever touch, at any depth.
@@ -647,10 +708,184 @@ var sensitiveNames = map[string]bool{
 	"tsconfig.json": true, "setup.py": true, "gemfile": true, "composer.json": true,
 }
 
-// scanArgs classifies every string inside a call's arguments. It returns the
-// cleaned path arguments, whether any argument addresses a network target, and
-// whether any path is on the sensitive list.
-func scanArgs(args map[string]any) (paths []string, egress, sensitive bool) {
+// protectedTargets is the single table of agent-instruction and persistence
+// paths. Parts are consecutive path components matched from any depth.
+// subtree means every path below the component sequence is protected too.
+// A one-part, non-subtree rule matches that file name at any depth.
+// Prompt 7 can replace this table from the policy file without changing the
+// matcher or the decision order.
+type protectedTarget struct {
+	category string
+	parts    []string
+	subtree  bool
+}
+
+var protectedTargets = []protectedTarget{
+	{category: "agent instructions", parts: []string{"AGENTS.md"}},
+	{category: "agent instructions", parts: []string{"CLAUDE.md"}},
+	{category: "agent instructions", parts: []string{"GEMINI.md"}},
+	{category: "agent instructions", parts: []string{".cursorrules"}},
+	{category: "agent instructions", parts: []string{".windsurfrules"}},
+	{category: "agent instructions", parts: []string{".cursor", "rules"}, subtree: true},
+
+	{category: "mcp and editor config", parts: []string{".mcp.json"}},
+	{category: "mcp and editor config", parts: []string{"mcp.json"}},
+	{category: "mcp and editor config", parts: []string{"claude_desktop_config.json"}},
+	{category: "mcp and editor config", parts: []string{".vscode"}, subtree: true},
+	{category: "mcp and editor config", parts: []string{".idea"}, subtree: true},
+
+	{category: "ci and hooks", parts: []string{".github", "workflows"}, subtree: true},
+	{category: "ci and hooks", parts: []string{".gitlab-ci.yml"}},
+	{category: "ci and hooks", parts: []string{".git", "hooks"}, subtree: true},
+	{category: "ci and hooks", parts: []string{".husky"}, subtree: true},
+
+	{category: "shell startup", parts: []string{".bashrc"}},
+	{category: "shell startup", parts: []string{".zshrc"}},
+	{category: "shell startup", parts: []string{".profile"}},
+	{category: "shell startup", parts: []string{".bash_profile"}},
+	{category: "shell startup", parts: []string{"Microsoft.PowerShell_profile.ps1"}},
+	{category: "shell startup", parts: []string{"Microsoft.PowerShellISE_profile.ps1"}},
+	{category: "shell startup", parts: []string{"Microsoft.VSCode_profile.ps1"}},
+	{category: "shell startup", parts: []string{"profile.ps1"}},
+
+	{category: "cron", parts: []string{"crontab"}},
+	{category: "cron", parts: []string{".crontab"}},
+	{category: "cron", parts: []string{"anacrontab"}},
+	{category: "cron", parts: []string{"cron"}, subtree: true},
+	{category: "cron", parts: []string{"cron.d"}, subtree: true},
+	{category: "cron", parts: []string{"cron.daily"}, subtree: true},
+	{category: "cron", parts: []string{"cron.hourly"}, subtree: true},
+	{category: "cron", parts: []string{"cron.weekly"}, subtree: true},
+	{category: "cron", parts: []string{"cron.monthly"}, subtree: true},
+	{category: "cron", parts: []string{"cron.yearly"}, subtree: true},
+	{category: "cron", parts: []string{"spool", "cron"}, subtree: true},
+	{category: "cron", parts: []string{"cron", "tabs"}, subtree: true},
+
+	{category: "launchd", parts: []string{"LaunchAgents"}, subtree: true},
+	{category: "launchd", parts: []string{"LaunchDaemons"}, subtree: true},
+	{category: "launchd", parts: []string{"launchd"}, subtree: true},
+
+	{category: "systemd user units", parts: []string{"systemd"}, subtree: true},
+	{category: "systemd user units", parts: []string{"systemd", "user"}, subtree: true},
+
+	{category: "windows startup", parts: []string{"Start Menu", "Programs", "Startup"}, subtree: true},
+	{category: "windows startup", parts: []string{"Startup"}, subtree: true},
+}
+
+var keyNormalizer = strings.NewReplacer("_", "", "-", "")
+
+func keyMatches(m map[string]bool, k string) bool {
+	return m[k] || m[keyNormalizer.Replace(k)]
+}
+
+func pathComponents(p string) []string {
+	return strings.FieldsFunc(filepath.ToSlash(p), func(r rune) bool { return r == '/' })
+}
+
+func componentEqual(a, b string, fold bool) bool {
+	if fold {
+		return strings.EqualFold(a, b)
+	}
+	return a == b
+}
+
+func (t protectedTarget) matches(components []string, fold bool) bool {
+	if len(t.parts) == 0 {
+		return false
+	}
+	if !t.subtree && len(t.parts) == 1 {
+		return len(components) > 0 && componentEqual(components[len(components)-1], t.parts[0], fold)
+	}
+	for i := 0; i+len(t.parts) <= len(components); i++ {
+		match := true
+		for j := range t.parts {
+			if !componentEqual(components[i+j], t.parts[j], fold) {
+				match = false
+				break
+			}
+		}
+		if match && (t.subtree || i+len(t.parts) == len(components)) {
+			return true
+		}
+	}
+	return false
+}
+
+// protectedCanonicalPath matches a path that has already been canonicalised.
+func protectedCanonicalPath(p string) bool {
+	components := pathComponents(p)
+	if len(components) == 0 {
+		return false
+	}
+	fold := caseInsensitiveFS(filepath.Dir(p))
+	for _, target := range protectedTargets {
+		if target.matches(components, fold) {
+			return true
+		}
+	}
+	return false
+}
+
+func protectedTargetPath(p string) bool {
+	if canonical, ok := canonicalPath(p); ok {
+		return protectedCanonicalPath(canonical)
+	}
+	// Even when a host would expand an environment variable or the path is
+	// otherwise unresolvable, an obvious protected shape must not be missed.
+	// The path itself is still refused by the normal canonicalisation rules.
+	return protectedCanonicalPath(filepath.Clean(strings.ReplaceAll(p, `\`, "/")))
+}
+
+// protectedCall also checks relative names against the approved roots, so a
+// symlink inside a scratch or grant directory cannot hide a protected target.
+func (g *Guard) protectedCall(tool string, paths []string) bool {
+	for _, p := range paths {
+		if protectedTargetPath(p) {
+			return true
+		}
+		if isExplicitlyRooted(p) {
+			continue
+		}
+		for _, rule := range g.scratch {
+			if rule.tool != "" && rule.tool != tool {
+				continue
+			}
+			if canonical, ok := canonicalPath(rule.dir + string(os.PathSeparator) + p); ok && protectedCanonicalPath(canonical) {
+				return true
+			}
+		}
+		g.mu.Lock()
+		grants := append([]grant(nil), g.grants...)
+		g.mu.Unlock()
+		for _, gr := range grants {
+			if gr.tool != tool || gr.dir == "" {
+				continue
+			}
+			if canonical, ok := canonicalPath(gr.dir + string(os.PathSeparator) + p); ok && protectedCanonicalPath(canonical) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// callScan is the classification of one tools/call's arguments. Only values
+// under a known path key are paths. ambiguous means the call contains a
+// non-content value that could be a path or destination but is not under a
+// known path key; such a call must never take a grant or scratch shortcut.
+type callScan struct {
+	paths     []string
+	egress    bool
+	sensitive bool
+	protected bool
+	ambiguous bool
+}
+
+// scanArgs classifies every string inside a call's arguments. Paths are drawn
+// only from known path keys: a filename-shaped value under an unknown key is
+// not a path we can safely compare, so it disqualifies the fast paths instead.
+func scanArgs(args map[string]any) callScan {
+	var s callScan
 	var walk func(key string, v any)
 	walk = func(key string, v any) {
 		switch t := v.(type) {
@@ -660,18 +895,47 @@ func scanArgs(args map[string]any) (paths []string, egress, sensitive bool) {
 			}
 			kl := strings.ToLower(key)
 			switch {
-			case urlKeys[kl]:
-				egress = true
-			case contentKeys[kl]:
+			case keyMatches(contentKeys, kl):
 				return // a body of text is neither a path nor a network target
-			case isURLValue(t):
-				egress = true
-			case pathKeys[kl] || looksLikePath(t):
-				p := filepath.Clean(t)
-				paths = append(paths, p)
-				if isSensitivePath(p) {
-					sensitive = true
+			case keyMatches(urlKeys, kl) || keyMatches(destinationKeys, kl) ||
+				isURLValue(t) || hasEgressScheme(t) || isIPAddress(t):
+				s.egress = true
+			case keyMatches(pathKeys, kl):
+				// Keep the raw value: cleaning before symlink resolution can
+				// turn "link/../x" into a path the server never opens.
+				s.paths = append(s.paths, t)
+				resolved, resolvedOK := canonicalPath(t)
+				protected := resolvedOK && protectedCanonicalPath(resolved)
+				if !protected {
+					protected = protectedTargetPath(t)
 				}
+				if protected {
+					// Agent-instruction and persistence targets are the one
+					// sensitive class a human may approve with --approve dialog.
+					s.protected = true
+					if isSensitivePathWithoutGit(t) ||
+						(resolvedOK && isSensitivePathWithoutGit(resolved)) {
+						s.sensitive = true
+					}
+				} else if isSensitivePath(t) {
+					s.sensitive = true
+				} else if resolvedOK && isSensitivePath(resolved) {
+					// A symlink inside the scratch root can hide a sensitive
+					// target; treat its resolved name as the destination too.
+					s.sensitive = true
+				}
+			case isHostPort(t):
+				s.egress = true
+			case protectedTargetPath(t):
+				s.protected = true
+				if isSensitivePathWithoutGit(t) {
+					s.sensitive = true
+				}
+			case isSensitivePath(t):
+				s.sensitive = true
+			case looksLikePath(t) || hasPathSyntax(t):
+				// Unknown destination: never let it ride a fast path.
+				s.ambiguous = true
 			}
 		case []any:
 			for _, x := range t {
@@ -686,7 +950,7 @@ func scanArgs(args map[string]any) (paths []string, egress, sensitive bool) {
 	for k, v := range args {
 		walk(k, v)
 	}
-	return
+	return s
 }
 
 // isURLValue reports whether the whole value is a URL, so a URL mentioned in
@@ -707,8 +971,71 @@ func isURLValue(s string) bool {
 	return true
 }
 
-// looksLikePath is the fallback for arguments whose key says nothing: a path
-// separator, or a bare name with an extension and no spaces.
+// hasEgressScheme catches URI forms that carry a destination without "://",
+// such as mailto: or file:.
+func hasEgressScheme(s string) bool {
+	i := strings.IndexByte(s, ':')
+	if i <= 0 || i > 16 {
+		return false
+	}
+	for j := 0; j < i; j++ {
+		c := s[j]
+		ok := c == '+' || c == '-' || c == '.' ||
+			(c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (j > 0 && c >= '0' && c <= '9')
+		if !ok {
+			return false
+		}
+	}
+	return egressSchemes[strings.ToLower(s[:i])]
+}
+
+func isIPAddress(s string) bool {
+	host := s
+	if h, _, err := net.SplitHostPort(s); err == nil {
+		host = h
+	}
+	host = strings.TrimPrefix(strings.TrimSuffix(host, "]"), "[")
+	return net.ParseIP(host) != nil
+}
+
+func isHostPort(s string) bool {
+	host, port, err := net.SplitHostPort(s)
+	if err != nil || host == "" || port == "" {
+		return false
+	}
+	n := 0
+	for _, c := range port {
+		if c < '0' || c > '9' {
+			return false
+		}
+		n = n*10 + int(c-'0')
+		if n > 65535 {
+			return false
+		}
+	}
+	if n == 0 {
+		return false
+	}
+	host = strings.TrimPrefix(strings.TrimSuffix(host, "]"), "[")
+	if net.ParseIP(host) != nil {
+		return true
+	}
+	hasName := false
+	for _, c := range host {
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
+			hasName = true
+			continue
+		}
+		if (c >= '0' && c <= '9') || c == '.' || c == '-' || c == '_' {
+			continue
+		}
+		return false
+	}
+	return hasName
+}
+
+// looksLikePath reports whether a value has a filename shape. It is used only
+// to refuse a fast path for values whose key does not identify them as paths.
 func looksLikePath(s string) bool {
 	if s == "" || len(s) > 400 || strings.ContainsAny(s, "\n\r\t") {
 		return false
@@ -723,13 +1050,67 @@ func looksLikePath(s string) bool {
 	return i > 0 && i < len(s)-1 && len(s)-i-1 <= 12
 }
 
+// hasPathSyntax catches destination shapes that do not need a normal filename
+// extension: drive-relative paths, UNC/backslash names, home paths, bare dot
+// directories and environment expansion.
+func hasPathSyntax(s string) bool {
+	if strings.ContainsRune(s, 0) || strings.ContainsAny(s, "\n\r\t") || hasInvisible(s) {
+		return true
+	}
+	if s != strings.TrimSpace(s) {
+		return true
+	}
+	if s == "." || s == ".." || strings.HasPrefix(s, ".") || strings.HasPrefix(s, "~") {
+		return true
+	}
+	if strings.HasSuffix(s, " ") || strings.HasSuffix(s, ".") {
+		return true // trailing spaces/dots are stripped by some filesystems
+	}
+	if strings.ContainsAny(s, `/\`) || isWindowsDrivePath(s) {
+		return true
+	}
+	if strings.ContainsAny(s, "$%") {
+		return true // environment/percent expansion is not resolved here
+	}
+	return false
+}
+
+func isWindowsDrivePath(s string) bool {
+	if len(s) < 2 || s[1] != ':' {
+		return false
+	}
+	c := s[0]
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
 func isSensitivePath(p string) bool {
-	for _, c := range strings.Split(filepath.ToSlash(p), "/") {
-		if strings.EqualFold(c, ".git") {
+	return isSensitivePathParts(p, true)
+}
+
+// isSensitivePathWithoutGit keeps .env, key, certificate and config checks but
+// lets a human approve .git/hooks targets without making every .git path
+// dialog-approvable.
+func isSensitivePathWithoutGit(p string) bool {
+	return isSensitivePathParts(p, false)
+}
+
+func isSensitivePathParts(p string, checkGit bool) bool {
+	// Invisible characters must not be able to hide a sensitive name.
+	p = stripInvisible(p)
+	// Treat both separators as path separators so Windows-shaped probes are
+	// classified the same way on every platform.
+	norm := strings.TrimRight(strings.ReplaceAll(p, `\`, "/"), "/")
+	for _, c := range strings.Split(norm, "/") {
+		lower := strings.ToLower(c)
+		if (checkGit && lower == ".git") || strings.HasPrefix(lower, ".env") ||
+			strings.HasPrefix(lower, "id_rsa") || strings.HasPrefix(lower, "id_ed25519") {
 			return true
 		}
 	}
-	base := strings.ToLower(filepath.Base(filepath.ToSlash(p)))
+	base := strings.ToLower(norm)
+	if i := strings.LastIndexByte(base, '/'); i >= 0 {
+		base = base[i+1:]
+	}
 	if strings.HasPrefix(base, ".env") || strings.HasPrefix(base, "id_rsa") || strings.HasPrefix(base, "id_ed25519") {
 		return true
 	}
@@ -740,38 +1121,224 @@ func isSensitivePath(p string) bool {
 	return sensitiveNames[base]
 }
 
-// resolvePath makes p absolute and resolves symlinks on the deepest part of it
-// that exists. It returns "" when that cannot be done, and callers treat "" as
-// "not inside anywhere": unknown means most restrictive.
-func resolvePath(p string) string {
-	abs, err := filepath.Abs(p)
-	if err != nil {
-		return ""
-	}
-	cur := filepath.Clean(abs)
-	var tail []string
-	for {
-		if _, err := os.Lstat(cur); err == nil {
-			real, err := filepath.EvalSymlinks(cur)
-			if err != nil {
-				return ""
-			}
-			for i := len(tail) - 1; i >= 0; i-- {
-				real = filepath.Join(real, tail[i])
-			}
-			return real
+// expandHome expands a leading ~ or ~/ or ~\ to the user's home directory.
+// ~user is not resolvable here, so it returns false and callers fail closed.
+func expandHome(p string) (string, bool) {
+	if p == "~" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", false
 		}
-		parent := filepath.Dir(cur)
-		if parent == cur {
-			return ""
-		}
-		tail = append(tail, filepath.Base(cur))
-		cur = parent
+		return home, true
 	}
+	if strings.HasPrefix(p, "~/") || strings.HasPrefix(p, `~\`) {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", false
+		}
+		return home + p[1:], true
+	}
+	if strings.HasPrefix(p, "~") {
+		return "", false
+	}
+	return p, true
 }
 
-// insideDir reports whether the resolved target directory lies under root.
+func hasWindowsUnsafeSuffix(p string) bool {
+	for _, part := range strings.FieldsFunc(p, func(r rune) bool { return r == '/' || r == '\\' }) {
+		if part == "" || part == "." || part == ".." {
+			continue
+		}
+		if strings.HasSuffix(part, ".") || strings.HasSuffix(part, " ") {
+			return true
+		}
+	}
+	return false
+}
+
+// absoluteNoClean makes p absolute without collapsing "." or "..", because
+// those must be resolved after symlinks to match what the server opens.
+func absoluteNoClean(p string) (string, bool) {
+	p, ok := expandHome(p)
+	if !ok || p == "" {
+		return "", false
+	}
+	if strings.ContainsRune(p, 0) || strings.ContainsAny(p, "\n\r\t") || hasInvisible(p) {
+		return "", false // control/invisible characters can change how a host or OS reads the name
+	}
+	if strings.TrimSpace(p) != p {
+		return "", false // leading/trailing space changes meaning on some hosts
+	}
+	if strings.ContainsAny(p, "$%") {
+		return "", false // environment/percent expansion is not resolved here
+	}
+	if runtime.GOOS == "windows" && hasWindowsUnsafeSuffix(p) {
+		return "", false // Windows would strip a trailing dot/space and change the name
+	}
+	if isWindowsDrivePath(p) && !filepath.IsAbs(p) {
+		return "", false // C:foo is drive-relative; its host meaning is unknown
+	}
+	if filepath.IsAbs(p) {
+		return p, true
+	}
+	if len(p) > 0 && (p[0] == '/' || p[0] == '\\') {
+		if runtime.GOOS != "windows" {
+			return "", false // backslash-rooted / UNC shape on a non-Windows host
+		}
+		wd, err := os.Getwd()
+		if err != nil {
+			return "", false
+		}
+		vol := filepath.VolumeName(wd)
+		if vol == "" {
+			return "", false
+		}
+		return vol + p, true
+	}
+	wd, err := os.Getwd()
+	if err != nil {
+		return "", false
+	}
+	return wd + string(os.PathSeparator) + p, true
+}
+
+// resolveExistingPrefix resolves symlinks on the longest existing prefix of
+// abs, then appends the missing tail. It never cleans before resolving, so
+// "link/../file" follows the link before applying "..", as the OS does.
+func lastPathSeparator(s string) int {
+	if runtime.GOOS == "windows" {
+		return strings.LastIndexAny(s, `/\`)
+	}
+	return strings.LastIndexByte(s, '/')
+}
+
+func hasDotDotComponent(p string) bool {
+	for _, part := range strings.FieldsFunc(p, func(r rune) bool { return r == '/' || r == '\\' }) {
+		if part == ".." {
+			return true
+		}
+	}
+	return false
+}
+
+func resolveExistingPrefix(abs string) (string, bool) {
+	real, err := filepath.EvalSymlinks(abs)
+	if err == nil {
+		return filepath.Clean(real), true
+	}
+	if !os.IsNotExist(err) {
+		return "", false // permission error, symlink loop, or another unresolvable state
+	}
+	// A missing final target is only safe to append when the path itself is
+	// not an existing symlink. A symlink to a missing target could be created
+	// outside the scratch root by the write that follows this check.
+	if !hasDotDotComponent(abs) {
+		if _, lerr := os.Lstat(abs); lerr == nil || !os.IsNotExist(lerr) {
+			return "", false
+		}
+	}
+	pos := len(abs)
+	for pos > 0 {
+		i := lastPathSeparator(abs[:pos])
+		if i < 0 {
+			break
+		}
+		prefix, tail := abs[:i], abs[i:]
+		if prefix == "" || (filepath.VolumeName(prefix) == prefix && i < len(abs) && os.IsPathSeparator(abs[i])) {
+			prefix, tail = abs[:i+1], abs[i+1:]
+		}
+		if prefix != "" {
+			real, err := filepath.EvalSymlinks(prefix)
+			if err == nil {
+				if tail == "" {
+					return filepath.Clean(real), true
+				}
+				return filepath.Clean(real + string(os.PathSeparator) + tail), true
+			}
+			if !os.IsNotExist(err) {
+				return "", false
+			}
+			if !hasDotDotComponent(prefix) {
+				if _, lerr := os.Lstat(prefix); lerr == nil || !os.IsNotExist(lerr) {
+					return "", false
+				}
+			}
+		}
+		pos = i
+	}
+	return "", false
+}
+
+// canonicalPath returns an absolute, symlink-resolved path. Failure means the
+// path cannot be classified, and callers treat that as not inside anywhere.
+func canonicalPath(p string) (string, bool) {
+	abs, ok := absoluteNoClean(p)
+	if !ok {
+		return "", false
+	}
+	return resolveExistingPrefix(abs)
+}
+
+// normalizeDrive makes a Windows drive letter upper-case before comparison.
+// The rest of the path is case-folded only when the filesystem is actually
+// case-insensitive; see caseInsensitiveFS.
+func normalizeDrive(p string) string {
+	if len(p) >= 2 && p[1] == ':' {
+		p = strings.ToUpper(p[:1]) + p[1:]
+	}
+	return p
+}
+
+func flipCase(p string) string {
+	dir, base := filepath.Split(p)
+	if base == "" || base == "." || base == ".." {
+		return p
+	}
+	r := []rune(base)
+	for i, c := range r {
+		switch {
+		case c >= 'a' && c <= 'z':
+			r[i] = c - ('a' - 'A')
+			return dir + string(r)
+		case c >= 'A' && c <= 'Z':
+			r[i] = c + ('a' - 'A')
+			return dir + string(r)
+		}
+	}
+	return p
+}
+
+// caseInsensitiveFS probes the nearest existing parent of root. If two names
+// that differ only in case are the same file, comparisons fold case; a
+// case-sensitive filesystem keeps exact comparison.
+func caseInsensitiveFS(root string) bool {
+	probe := root
+	for {
+		alt := flipCase(probe)
+		if alt != probe {
+			if fi, err := os.Stat(probe); err == nil {
+				fi2, err2 := os.Stat(alt)
+				return err2 == nil && os.SameFile(fi, fi2)
+			}
+		}
+		parent := filepath.Dir(probe)
+		if parent == probe {
+			break
+		}
+		probe = parent
+	}
+	return runtime.GOOS == "windows"
+}
+
+// insideDir reports whether the resolved target lies under root. Volume names
+// are normalised, and case is folded only on a case-insensitive filesystem.
 func insideDir(root, target string) bool {
+	root = normalizeDrive(filepath.Clean(root))
+	target = normalizeDrive(filepath.Clean(target))
+	if caseInsensitiveFS(root) {
+		root = strings.ToLower(root)
+		target = strings.ToLower(target)
+	}
 	rel, err := filepath.Rel(root, target)
 	if err != nil {
 		return false
@@ -779,26 +1346,62 @@ func insideDir(root, target string) bool {
 	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
+func isExplicitlyRooted(p string) bool {
+	if strings.HasPrefix(p, "~") || strings.HasPrefix(p, "$") || strings.HasPrefix(p, "%") ||
+		isWindowsDrivePath(p) || filepath.IsAbs(p) {
+		return true
+	}
+	return len(p) > 0 && (p[0] == '/' || p[0] == '\\')
+}
+
+func samePath(a, b string) bool {
+	return insideDir(a, b) && insideDir(b, a)
+}
+
 // inside reports whether one path argument stays inside root. Relative names
 // are interpreted against root, which is how a workspace-rooted MCP server
-// resolves them; symlinks are resolved before the comparison.
+// resolves them; symlinks and ".." are resolved in OS order before comparison.
 func inside(root, target string) bool {
-	r := resolvePath(root)
-	if r == "" {
+	r, ok := canonicalPath(root)
+	if !ok || !samePath(r, root) {
+		// The approved root itself changed identity since it was recorded.
+		return false
+	}
+	if strings.ContainsAny(target, "$%") || strings.ContainsRune(target, 0) ||
+		strings.ContainsAny(target, "\n\r\t") || hasInvisible(target) ||
+		strings.TrimSpace(target) != target {
+		return false
+	}
+	if runtime.GOOS == "windows" && hasWindowsUnsafeSuffix(target) {
 		return false
 	}
 	var t string
-	if filepath.IsAbs(target) {
-		t = resolvePath(target)
+	if isExplicitlyRooted(target) {
+		t, ok = canonicalPath(target)
 	} else {
-		t = resolvePath(filepath.Join(root, target))
+		t, ok = resolveExistingPrefix(r + string(os.PathSeparator) + target)
 	}
-	return t != "" && insideDir(r, t)
+	if !ok || isSensitivePath(t) {
+		return false
+	}
+	return insideDir(r, t)
 }
 
 func allInside(dir string, paths []string) bool {
 	for _, p := range paths {
 		if !inside(dir, p) {
+			return false
+		}
+	}
+	return true
+}
+
+// pathsResolvable is the tool-wide grant check: the grant covers any
+// directory, but a path whose meaning cannot be resolved is still no shortcut.
+func pathsResolvable(paths []string) bool {
+	for _, p := range paths {
+		resolved, ok := canonicalPath(p)
+		if !ok || isSensitivePath(resolved) {
 			return false
 		}
 	}
@@ -811,8 +1414,8 @@ func allInside(dir string, paths []string) bool {
 func scopeDir(paths []string) string {
 	var scope string
 	for _, p := range paths {
-		r := resolvePath(p)
-		if r == "" {
+		r, ok := canonicalPath(p)
+		if !ok {
 			return ""
 		}
 		d := filepath.Dir(r)
@@ -835,16 +1438,17 @@ func scopeDir(paths []string) string {
 }
 
 // addGrant records one time-bounded approval from the dialog or the --grant flag.
-func (g *Guard) addGrant(tool, dir string, ttl time.Duration) {
+func (g *Guard) addGrant(tool, dir string, ttl time.Duration, protected bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	g.grants = append(g.grants, grant{tool: tool, dir: dir, expires: time.Now().Add(ttl)})
+	g.grants = append(g.grants, grant{tool: tool, dir: dir, expires: time.Now().Add(ttl), human: true, protected: protected})
 }
 
 // grantAllows reports whether a live grant covers this call. Expired grants are
 // dropped along the way; a directory-scoped grant only covers calls whose every
-// path argument stays inside that directory.
-func (g *Guard) grantAllows(tool string, paths []string) bool {
+// path argument stays inside that directory. Protected targets ignore --grant
+// seeds and need a human grant recorded for a protected call.
+func (g *Guard) grantAllows(tool string, paths []string, protected bool) bool {
 	now := time.Now()
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -855,10 +1459,14 @@ func (g *Guard) grantAllows(tool string, paths []string) bool {
 			continue
 		}
 		kept = append(kept, gr)
-		if gr.tool != tool {
+		if gr.tool != tool || (protected && (!gr.human || !gr.protected)) {
 			continue
 		}
-		if gr.dir == "" || (len(paths) > 0 && allInside(gr.dir, paths)) {
+		if gr.dir == "" {
+			if pathsResolvable(paths) {
+				allowed = true
+			}
+		} else if len(paths) > 0 && allInside(gr.dir, paths) {
 			allowed = true
 		}
 	}

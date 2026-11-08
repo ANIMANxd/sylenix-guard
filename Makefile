@@ -1,4 +1,4 @@
-.PHONY: build fmt vet selftest summary-test check harness-scripted
+.PHONY: build fmt vet selftest probe-test summary-test check harness-scripted
 
 build:
 	CGO_ENABLED=0 go build -o bin/sylenix-guard ./cmd/sylenix-guard
@@ -12,10 +12,14 @@ vet:
 selftest: build
 	python3 demo/selftest.py
 
-summary-test:
-	python3 scripts/summarize_audit.py --file demo/fixtures/audit_sample.jsonl | diff - demo/fixtures/audit_sample.expected.txt
+probe-test: build
+	python3 tests/probes/test_scratch_grant_bypass.py
+	python3 tests/probes/test_protected_targets.py
 
-check: fmt vet selftest summary-test
+summary-test:
+	python3 scripts/summarize_audit.py --file demo/fixtures/audit_sample.jsonl | tr -d '\r' | diff - demo/fixtures/audit_sample.expected.txt
+
+check: fmt vet selftest probe-test summary-test
 
 harness-scripted: build
 	.venv/bin/python demo/harness.py --agent scripted --runs 3 --out results-scripted
