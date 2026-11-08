@@ -39,6 +39,18 @@
 - Added a "Security model and limits" section to `README.md` linking to
   `SECURITY.md`.
 
+### Installer
+
+- Added `sylenix-guard install` and `sylenix-guard uninstall` for existing
+  Claude Desktop, Claude Code, Cursor and VS Code configs on macOS, Windows and
+  Linux. Stdio entries are wrapped with the Guard executable while preserving
+  the original command, argument order and environment. The commands support
+  `--yes` and `--dry-run`, write timestamped backups, show a diff before
+  writing, and restore from the wrapped entry itself on uninstall.
+- Added `docs/INSTALL.md` with the exact config paths and wrapper format.
+- Added `tests/probes/test_install.py` covering round-trips, dry-run, backups,
+  already-wrapped and remote entries, and broken configs.
+
 ### Tests
 
 - Added `tests/probes/test_scratch_grant_bypass.py`: ten tainted-session probes run

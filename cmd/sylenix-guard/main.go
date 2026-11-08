@@ -40,6 +40,9 @@ const discardBudget = 64 << 20 // most bytes thrown away while skipping one over
 
 const grantTTL = 15 * time.Minute // how long a "Allow Tool for 15m" click stays valid
 
+const guardMetaKey = "_sylenixGuard"
+const guardMetaVersion = 1
+
 type frame map[string]json.RawMessage
 
 type pendingReq struct {
@@ -62,6 +65,14 @@ type grant struct {
 	expires   time.Time
 	human     bool // recorded by the dialog, not by --grant
 	protected bool // the approved call was itself a protected target
+}
+
+// configTarget is one known MCP client configuration file. serverPaths are
+// tried in order and may hold several client-specific server maps.
+type configTarget struct {
+	client      string
+	path        string
+	serverPaths [][]string
 }
 
 // stringList collects a repeatable string flag.
@@ -97,6 +108,14 @@ type Guard struct {
 }
 
 func main() {
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "install":
+			os.Exit(runConfigCommand("install", os.Args[2:]))
+		case "uninstall":
+			os.Exit(runConfigCommand("uninstall", os.Args[2:]))
+		}
+	}
 	name := flag.String("name", "", "label for this server; names the pin and log files (default: command name)")
 	stateDir := flag.String("state-dir", "", "directory for pins and the audit log (default ~/.sylenix-poc)")
 	readonly := flag.String("readonly", "", "comma-separated tools that stay allowed when the session is tainted")
@@ -1993,4 +2012,687 @@ func sortedKeys(m map[string]bool) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// ---------------------------------------------------------------- install / uninstall
+
+func runConfigCommand(action string, args []string) int {
+	fs := flag.NewFlagSet(action, flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	yes := fs.Bool("yes", false, "apply changes without asking for confirmation")
+	dryRun := fs.Bool("dry-run", false, "show the diff but do not write")
+	if err := fs.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintf(os.Stderr, "sylenix-guard %s: unexpected arguments: %s\n", action, strings.Join(fs.Args(), " "))
+		return 2
+	}
+	guardPath, err := os.Executable()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "sylenix-guard:", err)
+		return 2
+	}
+	if abs, err := filepath.Abs(guardPath); err == nil {
+		guardPath = abs
+	}
+
+	found := false
+	failures := 0
+	for _, target := range discoverConfigTargets() {
+		if _, err := os.Stat(target.path); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			fmt.Fprintf(os.Stderr, "%s: cannot inspect %s: %v\n", action, target.path, err)
+			failures++
+			continue
+		}
+		found = true
+		if err := processConfigFile(action, target, guardPath, *yes, *dryRun); err != nil {
+			fmt.Fprintf(os.Stderr, "%s: %s: %v\n", action, target.path, err)
+			failures++
+		}
+	}
+	if !found {
+		fmt.Println("No supported MCP config files found.")
+	}
+	if failures > 0 {
+		return 1
+	}
+	return 0
+}
+
+func discoverConfigTargets() []configTarget {
+	var targets []configTarget
+	home, _ := os.UserHomeDir()
+	configDir, _ := os.UserConfigDir()
+	cwd, _ := os.Getwd()
+
+	add := func(client, path string, paths ...[]string) {
+		if path == "" {
+			return
+		}
+		abs, err := filepath.Abs(path)
+		if err != nil {
+			return
+		}
+		targets = append(targets, configTarget{client: client, path: abs, serverPaths: paths})
+	}
+	mcpServers := func() []string { return []string{"mcpServers"} }
+	servers := func() []string { return []string{"servers"} }
+	vscodeSettings := func() []string { return []string{"mcp", "servers"} }
+
+	if configDir != "" {
+		add("Claude Desktop", filepath.Join(configDir, "Claude", "claude_desktop_config.json"), mcpServers())
+		add("VS Code settings", filepath.Join(configDir, "Code", "User", "settings.json"), vscodeSettings(), mcpServers())
+		add("VS Code user MCP", filepath.Join(configDir, "Code", "User", "mcp.json"), servers(), mcpServers())
+	}
+	if home != "" {
+		add("Claude Code", filepath.Join(home, ".claude.json"), mcpServers())
+		add("Cursor", filepath.Join(home, ".cursor", "mcp.json"), mcpServers())
+	}
+	if cwd != "" {
+		add("Claude Code project", filepath.Join(cwd, ".mcp.json"), mcpServers())
+		add("Cursor project", filepath.Join(cwd, ".cursor", "mcp.json"), mcpServers())
+		add("VS Code workspace", filepath.Join(cwd, ".vscode", "mcp.json"), servers(), mcpServers())
+	}
+
+	seen := map[string]bool{}
+	out := targets[:0]
+	for _, target := range targets {
+		key := target.path
+		if runtime.GOOS == "windows" {
+			key = strings.ToLower(key)
+		}
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, target)
+	}
+	return out
+}
+
+func processConfigFile(action string, target configTarget, guardPath string, yes, dryRun bool) error {
+	info, err := os.Stat(target.path)
+	if err != nil {
+		return err
+	}
+	if info.IsDir() {
+		return fmt.Errorf("path is a directory")
+	}
+	oldData, err := os.ReadFile(target.path)
+	if err != nil {
+		return err
+	}
+	if hasDuplicateKeys(oldData) {
+		return fmt.Errorf("refusing to edit a config with duplicate JSON keys")
+	}
+	root, err := parseConfigObject(oldData)
+	if err != nil {
+		return fmt.Errorf("cannot parse config: %w", err)
+	}
+
+	changed := false
+	seenMap := false
+	for _, path := range target.serverPaths {
+		serverMap, exists, err := lookupConfigMap(root, path)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			continue
+		}
+		seenMap = true
+		for _, name := range sortedObjectKeys(serverMap) {
+			value, _ := serverMap.get(name)
+			entry, ok := value.(*configObject)
+			if !ok {
+				fmt.Printf("skip %s [%s] %s: entry is not an object\n", target.client, strings.Join(path, "."), name)
+				continue
+			}
+			if action == "install" {
+				wrapped, report := wrapConfigEntry(entry, guardPath)
+				if wrapped {
+					changed = true
+					fmt.Printf("wrap %s [%s] %s\n", target.client, strings.Join(path, "."), name)
+				} else {
+					fmt.Printf("skip %s [%s] %s: %s\n", target.client, strings.Join(path, "."), name, report)
+				}
+			} else {
+				unwrapped, report := unwrapConfigEntry(entry, guardPath)
+				if unwrapped {
+					changed = true
+					fmt.Printf("unwrap %s [%s] %s\n", target.client, strings.Join(path, "."), name)
+				} else if report != "" {
+					fmt.Printf("skip %s [%s] %s: %s\n", target.client, strings.Join(path, "."), name, report)
+				}
+			}
+		}
+	}
+	if !seenMap {
+		fmt.Printf("%s: no MCP server map found\n", target.path)
+		return nil
+	}
+	if !changed {
+		fmt.Printf("%s: no changes\n", target.path)
+		return nil
+	}
+
+	newData, err := marshalConfigObject(root)
+	if err != nil {
+		return err
+	}
+	if bytes.Equal(oldData, newData) {
+		fmt.Printf("%s: no changes\n", target.path)
+		return nil
+	}
+	printConfigDiff(target.path, oldData, newData)
+	if dryRun {
+		fmt.Printf("dry-run: would write %s\n", target.path)
+		return nil
+	}
+	if !yes {
+		fmt.Printf("Apply changes to %s? [y/N] ", target.path)
+		answer, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+		answer = strings.ToLower(strings.TrimSpace(answer))
+		if answer != "y" && answer != "yes" {
+			fmt.Printf("skipped %s\n", target.path)
+			return nil
+		}
+	}
+	backup, err := writeConfigBackup(target.path, oldData, info.Mode().Perm())
+	if err != nil {
+		return fmt.Errorf("backup failed: %w", err)
+	}
+	if err := writeConfigAtomic(target.path, newData, info.Mode().Perm()); err != nil {
+		return fmt.Errorf("write failed after backup %s: %w", backup, err)
+	}
+	fmt.Printf("wrote %s (backup: %s)\n", target.path, backup)
+	return nil
+}
+
+// configObject preserves the original JSON key order while allowing targeted
+// edits, so an install/uninstall round trip does not reorder unrelated config.
+type configObject struct {
+	keys   []string
+	values map[string]any
+}
+
+func newConfigObject() *configObject {
+	return &configObject{values: map[string]any{}}
+}
+
+func (o *configObject) get(key string) (any, bool) {
+	value, ok := o.values[key]
+	return value, ok
+}
+
+func (o *configObject) set(key string, value any) {
+	if _, exists := o.values[key]; !exists {
+		o.keys = append(o.keys, key)
+	}
+	o.values[key] = value
+}
+
+func (o *configObject) del(key string) {
+	if _, exists := o.values[key]; !exists {
+		return
+	}
+	delete(o.values, key)
+	for i, k := range o.keys {
+		if k == key {
+			o.keys = append(o.keys[:i], o.keys[i+1:]...)
+			break
+		}
+	}
+}
+
+func (o *configObject) MarshalJSON() ([]byte, error) {
+	var buf bytes.Buffer
+	buf.WriteByte('{')
+	for i, key := range o.keys {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		keyJSON, err := marshalJSONNoHTML(key)
+		if err != nil {
+			return nil, err
+		}
+		valueJSON, err := marshalJSONNoHTML(o.values[key])
+		if err != nil {
+			return nil, err
+		}
+		buf.Write(keyJSON)
+		buf.WriteByte(':')
+		buf.Write(valueJSON)
+	}
+	buf.WriteByte('}')
+	return buf.Bytes(), nil
+}
+
+func marshalJSONNoHTML(value any) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(value); err != nil {
+		return nil, err
+	}
+	return bytes.TrimSuffix(buf.Bytes(), []byte("\n")), nil
+}
+
+func decodeConfigValue(dec *json.Decoder) (any, error) {
+	token, err := dec.Token()
+	if err != nil {
+		return nil, err
+	}
+	if delim, ok := token.(json.Delim); ok {
+		switch delim {
+		case '{':
+			object := newConfigObject()
+			for dec.More() {
+				keyToken, err := dec.Token()
+				if err != nil {
+					return nil, err
+				}
+				key, ok := keyToken.(string)
+				if !ok {
+					return nil, fmt.Errorf("object key is not a string")
+				}
+				value, err := decodeConfigValue(dec)
+				if err != nil {
+					return nil, err
+				}
+				object.set(key, value)
+			}
+			if end, err := dec.Token(); err != nil || end != json.Delim('}') {
+				return nil, fmt.Errorf("unterminated object")
+			}
+			return object, nil
+		case '[':
+			array := make([]any, 0)
+			for dec.More() {
+				value, err := decodeConfigValue(dec)
+				if err != nil {
+					return nil, err
+				}
+				array = append(array, value)
+			}
+			if end, err := dec.Token(); err != nil || end != json.Delim(']') {
+				return nil, fmt.Errorf("unterminated array")
+			}
+			return array, nil
+		default:
+			return nil, fmt.Errorf("unexpected JSON delimiter %q", delim)
+		}
+	}
+	return token, nil
+}
+
+func parseConfigObject(data []byte) (*configObject, error) {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	value, err := decodeConfigValue(dec)
+	if err != nil {
+		return nil, err
+	}
+	root, ok := value.(*configObject)
+	if !ok {
+		return nil, fmt.Errorf("top-level JSON value must be an object")
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return nil, fmt.Errorf("trailing data after JSON object")
+		}
+		return nil, err
+	}
+	return root, nil
+}
+
+func marshalConfigObject(root *configObject) ([]byte, error) {
+	compact, err := marshalJSONNoHTML(root)
+	if err != nil {
+		return nil, err
+	}
+	var out bytes.Buffer
+	if err := json.Indent(&out, compact, "", "  "); err != nil {
+		return nil, err
+	}
+	out.WriteByte('\n')
+	return out.Bytes(), nil
+}
+
+func lookupConfigMap(root *configObject, path []string) (*configObject, bool, error) {
+	var current any = root
+	for i, key := range path {
+		obj, ok := current.(*configObject)
+		if !ok {
+			return nil, false, fmt.Errorf("%s is not an object", strings.Join(path[:i], "."))
+		}
+		value, exists := obj.get(key)
+		if !exists {
+			return nil, false, nil
+		}
+		if i == len(path)-1 {
+			serverMap, ok := value.(*configObject)
+			if !ok {
+				return nil, false, fmt.Errorf("%s is not an object", strings.Join(path[:i+1], "."))
+			}
+			return serverMap, true, nil
+		}
+		current = value
+	}
+	return root, true, nil
+}
+
+func sortedObjectKeys(o *configObject) []string {
+	keys := append([]string(nil), o.keys...)
+	sort.Strings(keys)
+	return keys
+}
+
+func remoteConfigEntry(entry *configObject) bool {
+	if _, ok := entry.get("url"); ok {
+		return true
+	}
+	value, ok := entry.get("type")
+	if !ok {
+		return false
+	}
+	typ, ok := value.(string)
+	if !ok {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(typ)) {
+	case "http", "sse", "ws", "websocket", "streamable-http", "streamable_http":
+		return true
+	}
+	return false
+}
+
+func wrapConfigEntry(entry *configObject, guardPath string) (bool, string) {
+	if _, ok := entry.get(guardMetaKey); ok {
+		return false, "already wrapped"
+	}
+	if value, ok := entry.get("command"); ok {
+		if command, ok := value.(string); ok && isGuardCommand(command, guardPath) {
+			return false, "already uses Guard"
+		}
+	}
+	if remoteConfigEntry(entry) {
+		return false, "remote entry (url/type)"
+	}
+	if typ, ok := entry.get("type"); ok {
+		text, ok := typ.(string)
+		if !ok {
+			return false, "type is not a string"
+		}
+		if text != "" && !strings.EqualFold(strings.TrimSpace(text), "stdio") {
+			return false, fmt.Sprintf("unsupported transport %q", text)
+		}
+	}
+	value, ok := entry.get("command")
+	if !ok {
+		return false, "no stdio command"
+	}
+	command, ok := value.(string)
+	if !ok || command == "" {
+		return false, "no stdio command"
+	}
+	hadArgs := false
+	var originalArgs []any
+	if value, ok := entry.get("args"); ok {
+		hadArgs = true
+		args, ok := value.([]any)
+		if !ok {
+			return false, "args is not an array"
+		}
+		for _, arg := range args {
+			if _, ok := arg.(string); !ok {
+				return false, "args contains a non-string value"
+			}
+		}
+		originalArgs = args
+	}
+	hadEnv := false
+	if value, ok := entry.get("env"); ok {
+		hadEnv = true
+		env, ok := value.(*configObject)
+		if !ok {
+			return false, "env is not an object"
+		}
+		for _, key := range env.keys {
+			if _, ok := env.values[key].(string); !ok {
+				return false, "env contains a non-string value"
+			}
+		}
+	}
+
+	wrapperArgs := make([]any, 0, len(originalArgs)+2)
+	wrapperArgs = append(wrapperArgs, "--", command)
+	wrapperArgs = append(wrapperArgs, originalArgs...)
+	entry.set("command", guardPath)
+	entry.set("args", wrapperArgs)
+	meta := newConfigObject()
+	meta.set("version", guardMetaVersion)
+	meta.set("hadArgs", hadArgs)
+	meta.set("hadEnv", hadEnv)
+	entry.set(guardMetaKey, meta)
+	return true, ""
+}
+
+func unwrapConfigEntry(entry *configObject, guardPath string) (bool, string) {
+	command := ""
+	if value, ok := entry.get("command"); ok {
+		command, _ = value.(string)
+	}
+	metaValue, hasMeta := entry.get(guardMetaKey)
+	hadArgs := false
+	hadEnv := false
+	if hasMeta {
+		meta, ok := metaValue.(*configObject)
+		if !ok {
+			return false, "Guard metadata is not an object"
+		}
+		versionValue, _ := meta.get("version")
+		version, ok := jsonIntValue(versionValue)
+		if !ok || version != guardMetaVersion {
+			return false, "unsupported Guard metadata version"
+		}
+		hadArgsValue, _ := meta.get("hadArgs")
+		if hadArgs, ok = hadArgsValue.(bool); !ok {
+			return false, "Guard metadata hadArgs is invalid"
+		}
+		hadEnvValue, _ := meta.get("hadEnv")
+		if hadEnv, ok = hadEnvValue.(bool); !ok {
+			return false, "Guard metadata hadEnv is invalid"
+		}
+	} else if !isGuardCommand(command, guardPath) {
+		return false, ""
+	}
+
+	value, ok := entry.get("args")
+	if !ok {
+		return false, "cannot restore: wrapper args are missing"
+	}
+	args, ok := value.([]any)
+	if !ok || len(args) < 2 {
+		return false, "cannot restore: wrapper args are missing"
+	}
+	if marker, _ := args[0].(string); marker != "--" {
+		return false, "cannot restore: wrapper args do not start with --"
+	}
+	originalCommand, ok := args[1].(string)
+	if !ok || originalCommand == "" {
+		return false, "cannot restore: original command is missing"
+	}
+	originalArgs := args[2:]
+	if hasMeta && hadEnv {
+		if _, ok := entry.get("env"); !ok {
+			return false, "cannot restore: original env is missing"
+		}
+	}
+	if hasMeta {
+		if !hadArgs {
+			entry.del("args")
+		} else {
+			entry.set("args", originalArgs)
+		}
+		if !hadEnv {
+			entry.del("env")
+		}
+	} else if len(originalArgs) > 0 {
+		entry.set("args", originalArgs)
+	} else {
+		entry.del("args")
+	}
+	entry.set("command", originalCommand)
+	entry.del(guardMetaKey)
+	return true, ""
+}
+
+func jsonIntValue(v any) (int, bool) {
+	switch value := v.(type) {
+	case json.Number:
+		n, err := value.Int64()
+		if err != nil {
+			return 0, false
+		}
+		return int(n), true
+	case float64:
+		n := int(value)
+		return n, float64(n) == value
+	case int:
+		return value, true
+	}
+	return 0, false
+}
+
+func isGuardCommand(command, guardPath string) bool {
+	if command == "" {
+		return false
+	}
+	if sameCommandPath(command, guardPath) {
+		return true
+	}
+	base := strings.ToLower(filepath.Base(command))
+	return base == "sylenix-guard" || base == "sylenix-guard.exe"
+}
+
+func sameCommandPath(a, b string) bool {
+	aa, err := filepath.Abs(a)
+	if err != nil {
+		aa = filepath.Clean(a)
+	}
+	bb, err := filepath.Abs(b)
+	if err != nil {
+		bb = filepath.Clean(b)
+	}
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(filepath.Clean(aa), filepath.Clean(bb))
+	}
+	return filepath.Clean(aa) == filepath.Clean(bb)
+}
+
+func writeConfigBackup(path string, data []byte, mode os.FileMode) (string, error) {
+	stamp := time.Now().UTC().Format("20060102-150405.000000000")
+	base := path + ".sylenix-backup-" + stamp
+	for i := 0; i < 100; i++ {
+		candidate := base
+		if i > 0 {
+			candidate = fmt.Sprintf("%s-%d", base, i)
+		}
+		if _, err := os.Stat(candidate); os.IsNotExist(err) {
+			if err := os.WriteFile(candidate, data, mode); err != nil {
+				return "", err
+			}
+			return candidate, nil
+		} else if err != nil {
+			return "", err
+		}
+	}
+	return "", fmt.Errorf("could not choose a backup name")
+}
+
+func writeConfigAtomic(path string, data []byte, mode os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".sylenix-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(mode); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
+}
+
+func printConfigDiff(path string, oldData, newData []byte) {
+	fmt.Printf("--- %s (current)\n+++ %s (proposed)\n", path, path)
+	for _, line := range configLineDiff(string(oldData), string(newData)) {
+		fmt.Println(line)
+	}
+}
+
+func configLineDiff(oldText, newText string) []string {
+	oldLines := splitConfigLines(oldText)
+	newLines := splitConfigLines(newText)
+	prefix := 0
+	for prefix < len(oldLines) && prefix < len(newLines) && oldLines[prefix] == newLines[prefix] {
+		prefix++
+	}
+	suffix := 0
+	for suffix < len(oldLines)-prefix && suffix < len(newLines)-prefix &&
+		oldLines[len(oldLines)-1-suffix] == newLines[len(newLines)-1-suffix] {
+		suffix++
+	}
+	var out []string
+	contextStart := prefix - 2
+	if contextStart < 0 {
+		contextStart = 0
+	}
+	for i := contextStart; i < prefix; i++ {
+		out = append(out, " "+oldLines[i])
+	}
+	for i := prefix; i < len(oldLines)-suffix; i++ {
+		out = append(out, "-"+oldLines[i])
+	}
+	for i := prefix; i < len(newLines)-suffix; i++ {
+		out = append(out, "+"+newLines[i])
+	}
+	contextEnd := len(oldLines) - suffix + 2
+	if contextEnd > len(oldLines) {
+		contextEnd = len(oldLines)
+	}
+	for i := len(oldLines) - suffix; i < contextEnd; i++ {
+		out = append(out, " "+oldLines[i])
+	}
+	return out
+}
+
+func splitConfigLines(text string) []string {
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = strings.TrimSuffix(text, "\n")
+	if text == "" {
+		return nil
+	}
+	return strings.Split(text, "\n")
 }

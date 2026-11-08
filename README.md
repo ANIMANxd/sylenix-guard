@@ -64,6 +64,7 @@ wraps one MCP server per process over stdio.
 **Implemented today**
 
 - Transparent stdio proxy for one MCP server, no handshake changes
+- `install`/`uninstall` wrappers for Claude Desktop, Claude Code, Cursor and VS Code configs, with backups, diffs, confirmation and dry-run
 - Tool-definition pinning (trust on first use) with quarantine on change or hidden characters
 - Result datamarking and invisible-character stripping, including `structuredContent`
 - Session taint tracking with default-deny flow control
@@ -246,5 +247,6 @@ POC_SPIKE.md                scope, behavior reference, decision gates
 - [`docs/SPEC_FULL.md`](docs/SPEC_FULL.md) — the full product architecture
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — build, checks and pull-request rules
 - [`SECURITY.md`](SECURITY.md) — private bypass reporting and safe harbour
+- [`docs/INSTALL.md`](docs/INSTALL.md) — wrapping installed MCP clients
 - `python demo/harness.py --help`, `python demo/sweep.py --help` — reproducing the
   measurements (any OpenAI-compatible endpoint works; see the harness docstring)

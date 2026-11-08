@@ -15,6 +15,7 @@ selftest: build
 probe-test: build
 	python3 tests/probes/test_scratch_grant_bypass.py
 	python3 tests/probes/test_protected_targets.py
+	python3 tests/probes/test_install.py
 
 summary-test:
 	python3 scripts/summarize_audit.py --file demo/fixtures/audit_sample.jsonl | tr -d '\r' | diff - demo/fixtures/audit_sample.expected.txt
