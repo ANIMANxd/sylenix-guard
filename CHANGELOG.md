@@ -51,6 +51,17 @@
 - Added `tests/probes/test_install.py` covering round-trips, dry-run, backups,
   already-wrapped and remote entries, and broken configs.
 
+### Releases
+
+- Added GoReleaser configuration and a tag-only GitHub Actions workflow.
+  Builds cover darwin/linux amd64+arm64 and windows amd64, with SHA-256
+  checksums, Cosign keyless signature bundles, Syft SBOMs, a Homebrew formula
+  and a Scoop manifest.
+- The release job runs `make check` and the protocol self-test first. Formula
+  and manifest publishing use optional tap/bucket tokens; without them the
+  generated files remain local/release artifacts.
+- Added release verification steps to `docs/INSTALL.md`.
+
 ### Tests
 
 - Added `tests/probes/test_scratch_grant_bypass.py`: ten tainted-session probes run

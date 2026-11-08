@@ -76,3 +76,101 @@ the original entry from the wrapped entry itself; it does not depend on the
 backup being present.
 
 Restart the client after installing or uninstalling so it reloads the config.
+
+## Release artifacts and verification
+
+Releases are built by GitHub Actions with GoReleaser only for tags matching
+`vX.Y.Z`. The workflow runs `make check` and the protocol self-test before the
+release job starts.
+
+The release contains:
+
+- `sylenix-guard_<version>_<os>_<arch>.tar.gz` (macOS/Linux)
+- `sylenix-guard_<version>_windows_amd64.zip`
+- `checksums.txt`
+- `checksums.txt.sigstore.json` (Cosign keyless signature bundle)
+- `*.sbom.json` (Syft SBOMs)
+- the generated Homebrew formula and Scoop manifest
+
+Download the artifacts, checksums, and signature bundle into one directory.
+
+### Verify checksums
+
+Linux:
+
+```bash
+sha256sum --check --ignore-missing checksums.txt
+```
+
+macOS:
+
+```bash
+shasum -a 256 --check --ignore-missing checksums.txt
+```
+
+### Verify the Cosign keyless signature
+
+Replace the owner, repository, and tag with the release you are verifying. The
+identity must match the workflow that produced the release, and the issuer must
+be GitHub Actions:
+
+```bash
+cosign verify-blob \
+  --bundle checksums.txt.sigstore.json \
+  --certificate-identity "https://github.com/ANIMANxd/sylenix-guard/.github/workflows/release.yml@refs/tags/vX.Y.Z" \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+  checksums.txt
+```
+
+Only after that succeeds, verify the downloaded archives with the checksum
+command above.
+
+### SBOM
+
+The `*.sbom.json` files are CycloneDX/SPDX documents from Syft. Inspect one with:
+
+```bash
+jq '.components | length' sylenix-guard_<version>_linux_amd64.tar.gz.sbom.json
+```
+
+### Homebrew
+
+GoReleaser marks its formula generator as deprecated in favour of casks; this
+project keeps the formula because a formula is the requested Homebrew artifact.
+
+When a `HOMEBREW_TAP_TOKEN` is configured for the repository, GoReleaser
+publishes the formula to `ANIMANxd/homebrew-tap`:
+
+```bash
+brew tap ANIMANxd/tap
+brew install ANIMANxd/tap/sylenix-guard
+```
+
+Without that token (for example on a fork test tag), the formula is still
+generated as `dist/homebrew/Formula/sylenix-guard.rb` and attached to the
+GitHub release. Install it directly from a local checkout or download:
+
+```bash
+brew install --formula ./dist/homebrew/Formula/sylenix-guard.rb
+```
+
+### Scoop
+
+When a `SCOOP_BUCKET_TOKEN` is configured, GoReleaser publishes the manifest to
+`ANIMANxd/scoop-bucket`:
+
+```powershell
+scoop bucket add sylenix https://github.com/ANIMANxd/scoop-bucket
+scoop install sylenix/sylenix-guard
+```
+
+Without the token, the generated manifest is in `dist/scoop/sylenix-guard.json`
+and is attached to the GitHub release. Install it from the downloaded file:
+
+```powershell
+scoop install .\sylenix-guard.json
+```
+
+The `HOMEBREW_TAP_TOKEN` and `SCOOP_BUCKET_TOKEN` secrets need write access to
+the respective tap/bucket repository. If they are absent, the release still
+succeeds and the generated manifests remain available as local/release files.

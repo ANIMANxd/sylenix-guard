@@ -161,6 +161,8 @@ sends nothing anywhere. Summaries with prompts-per-active-hour metrics:
 
 - Protocol self-test: 101 checks, `python demo/selftest.py` (100 run on Windows; the
   dialog test needs a real dialog and skips there).
+- Releases: tag `vX.Y.Z`; checksum, Cosign, SBOM, Homebrew and Scoop verification
+  steps are in [`docs/INSTALL.md`](docs/INSTALL.md).
 - Adversarial audits of the proxy itself: [`docs/AUDIT_1.md`](docs/AUDIT_1.md) and
   [`docs/AUDIT_2.md`](docs/AUDIT_2.md) — ten findings. Eight are fixed with regression
   tests (the most recent is the null-pin startup bug, AUD-10). AUD-09 is mitigated for

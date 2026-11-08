@@ -1,0 +1,103 @@
+version: 2
+
+project_name: sylenix-guard
+
+builds:
+  - id: sylenix-guard
+    main: ./cmd/sylenix-guard
+    binary: sylenix-guard
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goos: windows
+        goarch: arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - id: default
+    ids:
+      - sylenix-guard
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    wrap_in_directory: false
+    files:
+      - LICENSE
+      - README.md
+      - SECURITY.md
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+signs:
+  - cmd: cosign
+    signature: "${artifact}.sigstore.json"
+    args:
+      - sign-blob
+      - "--bundle=${signature}"
+      - "${artifact}"
+      - "--yes"
+    artifacts: checksum
+    output: true
+
+sboms:
+  - artifacts: archive
+
+release:
+  extra_files:
+    - glob: dist/homebrew/Formula/*.rb
+    - glob: dist/scoop/*.json
+
+# brews is deprecated in GoReleaser v2.10 in favour of casks, but a cask is not
+# a Homebrew formula. Keep the formula generator until a maintained equivalent
+# exists, or accept the deprecation warning in `goreleaser check`.
+brews:
+  - name: sylenix-guard
+    repository:
+      owner: '{{ $owner := index .Env "HOMEBREW_TAP_OWNER" }}{{ if $owner }}{{ $owner }}{{ else }}ANIMANxd{{ end }}'
+      name: '{{ $name := index .Env "HOMEBREW_TAP_NAME" }}{{ if $name }}{{ $name }}{{ else }}homebrew-tap{{ end }}'
+      token: '{{ index .Env "HOMEBREW_TAP_TOKEN" }}'
+    directory: Formula
+    homepage: https://github.com/ANIMANxd/sylenix-guard
+    description: "Deterministic MCP security gateway for one stdio server"
+    license: Apache-2.0
+    install: |
+      bin.install "sylenix-guard"
+    test: |
+      assert_predicate bin/"sylenix-guard", :executable?
+    skip_upload: '{{ if index .Env "HOMEBREW_TAP_TOKEN" }}false{{ else }}true{{ end }}'
+
+scoops:
+  - name: sylenix-guard
+    repository:
+      owner: '{{ $owner := index .Env "SCOOP_BUCKET_OWNER" }}{{ if $owner }}{{ $owner }}{{ else }}ANIMANxd{{ end }}'
+      name: '{{ $name := index .Env "SCOOP_BUCKET_NAME" }}{{ if $name }}{{ $name }}{{ else }}scoop-bucket{{ end }}'
+      token: '{{ index .Env "SCOOP_BUCKET_TOKEN" }}'
+    homepage: https://github.com/ANIMANxd/sylenix-guard
+    description: "Deterministic MCP security gateway for one stdio server"
+    license: Apache-2.0
+    skip_upload: '{{ if index .Env "SCOOP_BUCKET_TOKEN" }}false{{ else }}true{{ end }}'
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
