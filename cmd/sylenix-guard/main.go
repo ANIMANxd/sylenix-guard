@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // Sylenix Guard POC: a transparent stdio wrapper for one MCP server.
 //
 //	sylenix-guard [flags] -- <server command> [args...]

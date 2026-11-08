@@ -24,6 +24,17 @@
   These are `SENSITIVE_TARGET` after taint, never use a grant or scratch
   shortcut, and can only proceed through `--approve dialog`.
 
+### Repository
+
+- Added the Apache License 2.0 `LICENSE` (Copyright 2026 Sylenix Labs) and the
+  SPDX header to the Go source.
+- Added `SECURITY.md` for private bypass reporting, response expectations and
+  safe harbour.
+- Added `CONTRIBUTING.md` with build/check commands, the no-weakening rule for
+  tests and probes, and the pull-request checklist.
+- Added a "Security model and limits" section to `README.md` linking to
+  `SECURITY.md`.
+
 ### Tests
 
 - Added `tests/probes/test_scratch_grant_bypass.py`: ten tainted-session probes run

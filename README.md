@@ -181,6 +181,29 @@ One measured case is worth reading before drawing conclusions: in
 in a file after the network call was blocked. The policy contains channels and locations;
 it does not control what a model writes or says.
 
+## Security model and limits
+
+Sylenix Guard is a deterministic policy boundary on one MCP stdio connection. It
+does not make the model trustworthy, sandbox the server or cover traffic that
+never passes through its process. In particular, it does not:
+
+- see host built-in tools, attachments or text pasted directly into the agent;
+- protect a second MCP server or a different transport;
+- stop an action inside a live 15-minute grant or inside a `--readonly` tool;
+- control what a permitted write contains, or provide an OS-level filesystem
+  sandbox;
+- make pin files, audit logs or approvals tamper-evident;
+- replace a biometric approval or a human review process;
+- clear taint automatically, or infer intent from the model's text.
+
+Path and destination classification is a heuristic, and a misconfigured
+`--readonly`, `--trust` or `--grant` is a trust decision. The detailed
+limitations are in the section below and in `POC_SPIKE.md` section 7.
+
+Report a suspected bypass privately, not in a public issue. See
+[`SECURITY.md`](SECURITY.md) for the reporting channels, what counts as a
+bypass, response expectations and safe harbour.
+
 ## Known limitations
 
 - Coverage is one MCP server per process. Host built-in tools, attachments and pasted
@@ -221,5 +244,7 @@ POC_SPIKE.md                scope, behavior reference, decision gates
 - [`docs/TESTER_GUIDE.md`](docs/TESTER_GUIDE.md) — installing it on a real host
 - [`docs/SOAK_CHECKLIST.md`](docs/SOAK_CHECKLIST.md) — evaluating it over a working day
 - [`docs/SPEC_FULL.md`](docs/SPEC_FULL.md) — the full product architecture
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) — build, checks and pull-request rules
+- [`SECURITY.md`](SECURITY.md) — private bypass reporting and safe harbour
 - `python demo/harness.py --help`, `python demo/sweep.py --help` — reproducing the
   measurements (any OpenAI-compatible endpoint works; see the harness docstring)
