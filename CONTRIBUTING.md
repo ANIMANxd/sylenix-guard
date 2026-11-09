@@ -28,10 +28,10 @@ Run the full gate before opening a pull request:
 make check
 ```
 
-`make check` runs gofmt, `go vet`, the protocol self-test, the stdio and
-Streamable HTTP probe suites, the profile/replay/doctor/clear-taint/stats probes
-and the audit summarizer fixture. On Windows, `make check` needs a POSIX shell
-(Git Bash or WSL), as described in `README.md`.
+`make check` runs gofmt, `go vet`, the protocol self-test, the stdio, Streamable
+HTTP and signing probe suites, the profile/replay/doctor/clear-taint/stats
+probes and the audit summarizer fixture. On Windows, `make check` needs a POSIX
+shell (Git Bash or WSL), as described in `README.md`.
 
 You can also run the main pieces directly:
 
@@ -40,6 +40,7 @@ gofmt -l cmd
 CGO_ENABLED=0 go vet ./...
 python demo/selftest.py
 python tests/probes/test_http_proxy.py
+python tests/probes/test_signing.py
 python tests/probes/test_scratch_grant_bypass.py
 python tests/probes/test_protected_targets.py
 ```

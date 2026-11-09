@@ -16,8 +16,118 @@ present, the built-in defaults apply. `--name` selects the server entry. When
 `servers` is non-empty and `--name` is not set, a file with exactly one server
 entry uses that entry; otherwise the requested name must exist in `servers`.
 
-The file is read once at startup and is not watched or signed. Treat it as
-trusted local configuration.
+The file is read once at startup and is not watched. It can be signed with an
+Ed25519 detached signature; see [Signing policy and pins](#signing-policy-and-pins).
+
+## Signing policy and pins
+
+Signing protects against an agent or local process changing `policy.yaml` or
+`pins-<name>.json` while Guard is not looking. It is a file-integrity control,
+not a sandbox: malware that can read the signing private key can produce a valid
+signature.
+
+### Create a keypair
+
+```bash
+sylenix-guard keys init
+# private key: ~/.sylenix-keys/policy-signing.key
+# public key:  ~/.sylenix-keys/policy-signing.key.pub
+
+sylenix-guard keys init --out /secure/guard-keys
+sylenix-guard keys init --key /secure/guard-keys/team.key --force
+```
+
+`--out DIR` creates `DIR/policy-signing.key` and `DIR/policy-signing.key.pub`;
+`--key PATH` names the private key file explicitly. The private key is written
+with mode `0600` outside the state directory (the default state directory is
+`~/.sylenix-poc`). `keys init` refuses to place it inside the state directory and
+prints a warning: anyone who can read the private key can loosen Guard. Keep it
+off the agent machine or in a protected team store, and never commit it.
+
+The private key is PKCS#8 PEM (`PRIVATE KEY`); the public key is PKIX PEM
+(`PUBLIC KEY`). Raw 32-byte public keys and 32/64-byte private keys are also
+accepted for tooling.
+
+### Sign a policy
+
+```bash
+sylenix-guard policy sign --policy /path/to/policy.yaml --key /secure/guard-keys/policy-signing.key
+sylenix-guard policy verify --policy /path/to/policy.yaml --pubkey /secure/guard-keys/policy-signing.key.pub
+```
+
+`policy sign` validates the policy first, then writes `policy.yaml.sig`: a raw
+64-byte Ed25519 signature over the exact file bytes. `--policy` defaults to
+`<state-dir>/policy.yaml`; `--key` defaults to
+`~/.sylenix-keys/policy-signing.key`.
+
+`install` and `allow` rewrite policy files canonically. They remove any old
+`.sig` because it no longer matches; run `policy sign` again after those
+commands.
+
+### Verify at startup
+
+```bash
+sylenix-guard \
+  --policy /path/to/policy.yaml \
+  --policy-pubkey /secure/guard-keys/policy-signing.key.pub \
+  --name filesystem \
+  -- npx -y @modelcontextprotocol/server-filesystem ~/work
+```
+
+- `--policy-pubkey PATH` verifies the policy and pin-store signatures. It is the
+  team mode: put only the public key on the agent machine.
+- `--policy-key PATH` loads the private key, derives its public key for
+  verification, and signs new pin stores on write.
+- If both are supplied they must match.
+- When either flag is set, signing is enabled. An existing policy file must have
+  a valid `.sig`, and an existing pin file must have a valid `.sig`; a missing,
+  truncated, wrong-key or one-byte-changed signature stops Guard with exit 2
+  before the policy is parsed or a tool is pinned.
+- Built-in defaults need no signature because no policy file exists. A missing
+  pin file still means genuine first sight.
+
+`proxy` mode accepts the same two flags.
+
+### Pins on write
+
+With `--policy-key`, every pin-store write also writes `pins-<name>.json.sig`.
+The pins are read back and verified before the tool list is accepted. With only
+`--policy-pubkey`, Guard can verify an existing signed pin store but cannot sign
+a new one; new pins stay in memory for that session and are not written
+unsigned. To pre-sign or repair an existing store:
+
+```bash
+sylenix-guard pins sign --name filesystem --state-dir ~/.sylenix-poc --key /secure/guard-keys/policy-signing.key
+sylenix-guard pins verify --name filesystem --state-dir ~/.sylenix-poc --pubkey /secure/guard-keys/policy-signing.key.pub
+```
+
+`--reset-pins` removes both the pin file and its signature. With a private key,
+the replacement is signed on the next `tools/list`; without one, it stays
+in-memory only.
+
+`doctor --require-signatures` reports a policy or pin file as `UNSIGNED_POLICY`
+or `UNSIGNED_PINS` when no valid signature can be verified. If the wrapper has
+`--policy-pubkey`, doctor verifies with that key.
+
+### Limits
+
+- The private key is only as safe as its file permissions and the machine
+  account. Same-user malware that can read the key can sign a replacement; an
+  HSM, OS keystore or remote signer is not implemented.
+- Signing detects modification, not rollback. An attacker with file access can
+  restore an older signed policy/pin pair. There is no monotonic counter,
+  transparency log or revocation list.
+- Deleting the signed policy file fails closed when signing is enabled. Deleting
+  both the pin file and its signature is treated as genuine first use (TOFU) and
+  lets the next `tools/list` re-pin; signing does not protect against that
+  delete-to-TOFU path. Keep a backup, and treat a missing pin store as an
+  incident.
+- Signature files can be deleted, which causes a fail-closed startup; that is a
+  denial of service, not a bypass. Keep a backup of the policy, pins, signatures
+  and public key.
+- Rotate by creating a new keypair, re-signing policy and pins, and replacing the
+  public key in the wrapper. The old private key cannot sign for the new public
+  key.
 
 ## Format
 
@@ -235,7 +345,9 @@ Flags that are explicitly set replace the corresponding policy section:
 | `--no-spotlight` | `spotlight: false` |
 
 The guard prints a deprecation note to stderr for each of these flags when it
-is set. `--grant`, `--reset-pins`, `--name` and `--state-dir` remain flag-only.
+is set. `--grant`, `--reset-pins`, `--name`, `--state-dir`, `--policy-pubkey`
+and `--policy-key` remain flag-only; signing keys are deliberately not stored
+inside the policy file.
 
 ## Commands
 
@@ -245,6 +357,13 @@ sylenix-guard policy validate ./policy.yaml
 
 # Print the built-in defaults as a valid policy file.
 sylenix-guard policy print-default > policy.yaml
+
+# Sign, verify, and inspect pin stores.
+sylenix-guard keys init [--out DIR | --key PATH] [--force] [--state-dir DIR]
+sylenix-guard policy sign --policy ./policy.yaml --key ~/.sylenix-keys/policy-signing.key
+sylenix-guard policy verify --policy ./policy.yaml --pubkey ~/.sylenix-keys/policy-signing.key.pub
+sylenix-guard pins sign --name filesystem --state-dir ~/.sylenix-poc --key ~/.sylenix-keys/policy-signing.key
+sylenix-guard pins verify --name filesystem --state-dir ~/.sylenix-poc --pubkey ~/.sylenix-keys/policy-signing.key.pub
 
 # Add the currently configured command for a named server.
 sylenix-guard allow <name> [--policy PATH] [--state-dir DIR] [--yes]

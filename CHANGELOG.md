@@ -2,6 +2,26 @@
 
 ## 2026-11-09
 
+### Policy and pin signing
+
+- Added Ed25519 signing for `policy.yaml` and `pins-<name>.json`. `keys init`
+  creates a PKCS#8/PKIX keypair outside the state directory with a warning that
+  the private key can loosen Guard; `policy sign` writes a raw 64-byte detached
+  `.sig`, and `policy verify`, `pins sign` and `pins verify` are available for
+  pre-signing and diagnostics.
+- Added `--policy-pubkey` for verification/team mode and `--policy-key` for
+  signing pins on write. If both are set they must match. Once signing is
+  enabled, a missing, truncated, wrong-key or one-byte-changed policy or pin
+  signature stops the guard with exit 2 before parsing or pinning.
+- Public-key-only mode never writes an unsigned pin store; new pins stay in
+  memory for that session. `--reset-pins` removes both the pin file and its
+  signature. `install`/`allow` remove a stale policy signature after rewriting.
+- Extended `doctor --require-signatures` to verify with a wrapper
+  `--policy-pubkey` when present, and updated the unsigned-policy/pin findings.
+- Added `tests/probes/test_signing.py` (23 checks) and `make signing-test`,
+  included in `make check`. Updated `docs/POLICY.md`, `README.md`,
+  `docs/ARCHITECTURE.md`, `docs/DOCTOR.md`, `docs/INSTALL.md` and `POC_SPIKE.md`.
+
 ### Streamable HTTP proxy
 
 - Added `sylenix-guard proxy --listen ADDR --upstream URL`, reusing the existing

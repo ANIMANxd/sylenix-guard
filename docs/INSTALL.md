@@ -83,7 +83,8 @@ Restart the client after installing or uninstalling so it reloads the config.
 
 `sylenix-guard doctor` audits the supported client configs and reports wrapped
 and unwrapped servers, allowlist gaps, risky scratch/trust/approval settings,
-unsigned policy/pins (with `--require-signatures`) and outdated Guard binaries:
+unverified policy/pin signatures (with `--require-signatures`) and outdated
+Guard binaries:
 
 ```bash
 sylenix-guard doctor

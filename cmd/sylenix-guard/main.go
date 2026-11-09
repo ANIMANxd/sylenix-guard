@@ -14,11 +14,14 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
 	"debug/buildinfo"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"flag"
 	"fmt"
 	"io"
@@ -45,6 +48,8 @@ import (
 
 const maxFrame = 10 << 20      // longest accepted JSON-RPC line: 10 MiB
 const discardBudget = 64 << 20 // most bytes thrown away while skipping one oversize line
+
+const signatureSuffix = ".sig"
 
 const grantTTL = 15 * time.Minute // how long a "Allow Tool for 15m" click stays valid
 
@@ -193,6 +198,9 @@ type Guard struct {
 
 	logMu sync.Mutex
 	log   *os.File
+
+	verifyKey ed25519.PublicKey  // nil means signature verification is disabled
+	signKey   ed25519.PrivateKey // nil means pin writes cannot be signed
 }
 
 // guardOptions are the settings shared by the stdio proxy and the Streamable
@@ -202,6 +210,8 @@ type guardOptions struct {
 	DefaultName     string
 	StateDir        string
 	PolicyPath      string
+	PolicyPubKey    string
+	PolicyKey       string
 	Readonly        string
 	Trust           string
 	Approve         string
@@ -221,6 +231,10 @@ func main() {
 			os.Exit(runConfigCommand("uninstall", os.Args[2:]))
 		case "policy":
 			os.Exit(runPolicyCommand(os.Args[2:]))
+		case "pins":
+			os.Exit(runPinsCommand(os.Args[2:]))
+		case "keys":
+			os.Exit(runKeysCommand(os.Args[2:]))
 		case "allow":
 			os.Exit(runAllowCommand(os.Args[2:]))
 		case "doctor":
@@ -236,6 +250,8 @@ func main() {
 	name := flag.String("name", "", "label for this server; names the pin and log files (default: command name)")
 	stateDir := flag.String("state-dir", "", "directory for pins and the audit log (default ~/.sylenix-poc)")
 	policyPath := flag.String("policy", "", "path to a versioned policy file (default: <state-dir>/policy.yaml, else built-in defaults)")
+	policyPubKey := flag.String("policy-pubkey", "", "Ed25519 public key used to verify policy and pin signatures")
+	policyKey := flag.String("policy-key", "", "Ed25519 private key used to sign the pin store on write")
 	readonly := flag.String("readonly", "", "comma-separated tools that stay allowed when the session is tainted")
 	trust := flag.String("trust", "", "comma-separated tools whose results do NOT taint the session")
 	approve := flag.String("approve", "deny", "what to do with a blocked call: deny | dialog")
@@ -260,6 +276,8 @@ func main() {
 		DefaultName:     filepath.Base(args[0]),
 		StateDir:        *stateDir,
 		PolicyPath:      *policyPath,
+		PolicyPubKey:    *policyPubKey,
+		PolicyKey:       *policyKey,
 		Readonly:        *readonly,
 		Trust:           *trust,
 		Approve:         *approve,
@@ -283,8 +301,8 @@ func main() {
 		}
 		os.Exit(2)
 	}
-	if !g.loadPins(*resetPins) {
-		fmt.Fprintf(os.Stderr, "[sylenix-guard] pin file %s exists but cannot be read; refusing to start. Inspect it, or restart with --reset-pins to trust every tool as new.\n", g.pinsPath())
+	if err := g.loadPins(*resetPins); err != nil {
+		fmt.Fprintf(os.Stderr, "[sylenix-guard] pin file %s cannot be trusted: %v; refusing to start. Inspect it, or restart with --reset-pins to trust every tool as new.\n", g.pinsPath(), err)
 		os.Exit(2)
 	}
 
@@ -491,6 +509,12 @@ func prepareGuard(opts guardOptions) (*Guard, error) {
 		return nil, err
 	}
 
+	verifyKey, signKey, err := loadGuardSigningKeys(opts.PolicyPubKey, opts.PolicyKey)
+	if err != nil {
+		_ = logf.Close()
+		return nil, err
+	}
+
 	g := &Guard{
 		name:        name,
 		stateDir:    stateDir,
@@ -502,8 +526,10 @@ func prepareGuard(opts guardOptions) (*Guard, error) {
 		grants:      seeded,
 		out:         os.Stdout,
 		log:         logf,
+		verifyKey:   verifyKey,
+		signKey:     signKey,
 	}
-	pf, source, resolvedPath, err := loadPolicyForRun(opts.PolicyPath, visited["policy"], stateDir, name, nameExplicit)
+	pf, source, resolvedPath, err := loadPolicyForRun(opts.PolicyPath, visited["policy"], stateDir, name, nameExplicit, g.verifyKey)
 	if err != nil {
 		g.event("policy_invalid", map[string]any{"source": source, "reason": err.Error()})
 		_ = logf.Close()
@@ -532,6 +558,8 @@ type guardFlagValues struct {
 	Name            string
 	StateDir        string
 	PolicyPath      string
+	PolicyPubKey    string
+	PolicyKey       string
 	Readonly        string
 	Trust           string
 	Approve         string
@@ -545,6 +573,8 @@ func registerGuardFlags(fs *flag.FlagSet, v *guardFlagValues) {
 	fs.StringVar(&v.Name, "name", "", "label for this server; names the pin and log files (default: upstream host)")
 	fs.StringVar(&v.StateDir, "state-dir", "", "directory for pins and the audit log (default ~/.sylenix-poc)")
 	fs.StringVar(&v.PolicyPath, "policy", "", "path to a versioned policy file (default: <state-dir>/policy.yaml, else built-in defaults)")
+	fs.StringVar(&v.PolicyPubKey, "policy-pubkey", "", "Ed25519 public key used to verify policy and pin signatures")
+	fs.StringVar(&v.PolicyKey, "policy-key", "", "Ed25519 private key used to sign the pin store on write")
 	fs.StringVar(&v.Readonly, "readonly", "", "comma-separated tools that stay allowed when the session is tainted")
 	fs.StringVar(&v.Trust, "trust", "", "comma-separated tools whose results do NOT taint the session")
 	fs.StringVar(&v.Approve, "approve", "deny", "what to do with a blocked call: deny | dialog")
@@ -635,6 +665,8 @@ func runProxyCommand(args []string) int {
 		DefaultName:     defaultProxyName(upstream),
 		StateDir:        vals.StateDir,
 		PolicyPath:      vals.PolicyPath,
+		PolicyPubKey:    vals.PolicyPubKey,
+		PolicyKey:       vals.PolicyKey,
 		Readonly:        vals.Readonly,
 		Trust:           vals.Trust,
 		Approve:         vals.Approve,
@@ -650,8 +682,8 @@ func runProxyCommand(args []string) int {
 	}
 	defer func() { _ = g.log.Close() }()
 	g.out = io.Discard
-	if !g.loadPins(vals.ResetPins) {
-		fmt.Fprintf(os.Stderr, "[sylenix-guard] pin file %s exists but cannot be read; refusing to start. Inspect it, or restart with --reset-pins to trust every tool as new.\n", g.pinsPath())
+	if err := g.loadPins(vals.ResetPins); err != nil {
+		fmt.Fprintf(os.Stderr, "[sylenix-guard] pin file %s cannot be trusted: %v; refusing to start. Inspect it, or restart with --reset-pins to trust every tool as new.\n", g.pinsPath(), err)
 		return 2
 	}
 
@@ -1230,12 +1262,324 @@ func (p *proxyHandler) finishPending(w http.ResponseWriter, reqID json.RawMessag
 	_ = writeSSEEvent(w, sseEvent{hasData: true}, b)
 }
 
+// ---------------------------------------------------------------- signing keys
+
+func defaultSigningKeyPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("cannot find home directory; pass --key")
+	}
+	return filepath.Join(home, ".sylenix-keys", "policy-signing.key"), nil
+}
+
+func loadGuardSigningKeys(pubPath, privPath string) (ed25519.PublicKey, ed25519.PrivateKey, error) {
+	var verifyKey ed25519.PublicKey
+	var signKey ed25519.PrivateKey
+	if privPath != "" {
+		key, err := loadPrivateKeyFile(privPath)
+		if err != nil {
+			return nil, nil, fmt.Errorf("cannot load --policy-key: %w", err)
+		}
+		signKey = key
+		verifyKey = key.Public().(ed25519.PublicKey)
+	}
+	if pubPath != "" {
+		key, err := loadPublicKeyFile(pubPath)
+		if err != nil {
+			return nil, nil, fmt.Errorf("cannot load --policy-pubkey: %w", err)
+		}
+		if verifyKey != nil && !bytes.Equal(verifyKey, key) {
+			return nil, nil, fmt.Errorf("--policy-pubkey does not match --policy-key")
+		}
+		verifyKey = key
+	}
+	return verifyKey, signKey, nil
+}
+
+func loadPrivateKeyFile(path string) (ed25519.PrivateKey, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	if block, _ := pem.Decode(data); block != nil {
+		if key, err := x509.ParsePKCS8PrivateKey(block.Bytes); err == nil {
+			if ed, ok := key.(ed25519.PrivateKey); ok {
+				return ed, nil
+			}
+			return nil, fmt.Errorf("key is not Ed25519")
+		}
+		if len(block.Bytes) == ed25519.PrivateKeySize {
+			return ed25519.PrivateKey(append([]byte(nil), block.Bytes...)), nil
+		}
+		if len(block.Bytes) == ed25519.SeedSize {
+			return ed25519.NewKeyFromSeed(block.Bytes), nil
+		}
+		return nil, fmt.Errorf("unsupported private key encoding")
+	}
+	raw := bytes.TrimSpace(data)
+	if len(raw) == ed25519.PrivateKeySize {
+		return ed25519.PrivateKey(append([]byte(nil), raw...)), nil
+	}
+	if len(raw) == ed25519.SeedSize {
+		return ed25519.NewKeyFromSeed(raw), nil
+	}
+	return nil, fmt.Errorf("unsupported private key encoding")
+}
+
+func loadPublicKeyFile(path string) (ed25519.PublicKey, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	if block, _ := pem.Decode(data); block != nil {
+		if key, err := x509.ParsePKIXPublicKey(block.Bytes); err == nil {
+			if ed, ok := key.(ed25519.PublicKey); ok {
+				return ed, nil
+			}
+			return nil, fmt.Errorf("key is not Ed25519")
+		}
+		if len(block.Bytes) == ed25519.PublicKeySize {
+			return ed25519.PublicKey(append([]byte(nil), block.Bytes...)), nil
+		}
+		return nil, fmt.Errorf("unsupported public key encoding")
+	}
+	raw := bytes.TrimSpace(data)
+	if len(raw) != ed25519.PublicKeySize {
+		return nil, fmt.Errorf("unsupported public key encoding")
+	}
+	return ed25519.PublicKey(append([]byte(nil), raw...)), nil
+}
+
+func encodePrivateKeyPEM(key ed25519.PrivateKey) ([]byte, error) {
+	der, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		return nil, err
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}), nil
+}
+
+func encodePublicKeyPEM(key ed25519.PublicKey) ([]byte, error) {
+	der, err := x509.MarshalPKIXPublicKey(key)
+	if err != nil {
+		return nil, err
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der}), nil
+}
+
+func verifyDetachedSignature(path string, data []byte, pub ed25519.PublicKey) error {
+	sig, err := os.ReadFile(path + signatureSuffix)
+	if os.IsNotExist(err) {
+		return fmt.Errorf("signature file %s is missing", path+signatureSuffix)
+	}
+	if err != nil {
+		return fmt.Errorf("cannot read signature file %s: %w", path+signatureSuffix, err)
+	}
+	if len(sig) != ed25519.SignatureSize {
+		return fmt.Errorf("signature file %s has the wrong size", path+signatureSuffix)
+	}
+	if !ed25519.Verify(pub, data, sig) {
+		return fmt.Errorf("signature does not verify (file changed or wrong key)")
+	}
+	return nil
+}
+
+func signFileDetached(path string, key ed25519.PrivateKey) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	sig := ed25519.Sign(key, data)
+	return writeFileAtomic(path+signatureSuffix, sig, 0o600)
+}
+
+func runKeysCommand(args []string) int {
+	if len(args) == 0 || args[0] != "init" {
+		fmt.Fprintln(os.Stderr, "usage: sylenix-guard keys init [--out PATH|--key PATH] [--force] [--state-dir DIR]")
+		return 2
+	}
+	fs := flag.NewFlagSet("keys init", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	out := fs.String("out", "", "directory to hold policy-signing.key and its .pub")
+	keyFlag := fs.String("key", "", "explicit private key file path")
+	force := fs.Bool("force", false, "overwrite an existing keypair")
+	stateDir := fs.String("state-dir", "", "state directory the private key must stay outside of (default ~/.sylenix-poc)")
+	if err := fs.Parse(args[1:]); err != nil {
+		if err == flag.ErrHelp {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(os.Stderr, "sylenix-guard keys init: unexpected arguments")
+		return 2
+	}
+	keyPath := *keyFlag
+	if keyPath == "" {
+		if *out != "" {
+			keyPath = filepath.Join(*out, "policy-signing.key")
+		} else {
+			var err error
+			keyPath, err = defaultSigningKeyPath()
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "sylenix-guard keys init:", err)
+				return 2
+			}
+		}
+	}
+	pubPath := keyPath + ".pub"
+
+	state := *stateDir
+	if state == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "sylenix-guard keys init: cannot find home directory; pass --state-dir")
+			return 2
+		}
+		state = filepath.Join(home, ".sylenix-poc")
+	}
+	stateReal, stateOK := canonicalPath(state)
+	keyReal, keyOK := canonicalPath(keyPath)
+	absState, absStateErr := filepath.Abs(state)
+	absKey, absKeyErr := filepath.Abs(keyPath)
+	if (stateOK && keyOK && insideDir(stateReal, keyReal)) ||
+		(absStateErr == nil && absKeyErr == nil && insideDir(absState, absKey)) {
+		fmt.Fprintln(os.Stderr, "sylenix-guard keys init: refusing to put the private key inside the state directory; choose a path outside it")
+		return 2
+	}
+	if !*force {
+		for _, path := range []string{keyPath, pubPath} {
+			if _, err := os.Stat(path); err == nil {
+				fmt.Fprintf(os.Stderr, "sylenix-guard keys init: %s already exists; use --force to replace it\n", path)
+				return 2
+			}
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(keyPath), 0o700); err != nil {
+		fmt.Fprintln(os.Stderr, "sylenix-guard keys init:", err)
+		return 2
+	}
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "sylenix-guard keys init:", err)
+		return 2
+	}
+	privPEM, err := encodePrivateKeyPEM(priv)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "sylenix-guard keys init:", err)
+		return 2
+	}
+	pubPEM, err := encodePublicKeyPEM(pub)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "sylenix-guard keys init:", err)
+		return 2
+	}
+	if *force {
+		_ = os.Remove(keyPath)
+		_ = os.Remove(pubPath)
+	}
+	if err := writeFileAtomic(keyPath, privPEM, 0o600); err != nil {
+		fmt.Fprintln(os.Stderr, "sylenix-guard keys init: cannot write private key:", err)
+		return 2
+	}
+	if err := writeFileAtomic(pubPath, pubPEM, 0o600); err != nil {
+		_ = os.Remove(keyPath)
+		fmt.Fprintln(os.Stderr, "sylenix-guard keys init: cannot write public key:", err)
+		return 2
+	}
+	fmt.Fprintf(os.Stderr, "WARNING: the private key at %s can sign policy and pin files. Anyone who can read it can loosen Guard. Keep it off the agent machine or in a protected team store; never commit it.\n", keyPath)
+	fmt.Printf("private key: %s\n", keyPath)
+	fmt.Printf("public key:  %s\n", pubPath)
+	fmt.Printf("sign a policy with: sylenix-guard policy sign --policy PATH --key %s\n", keyPath)
+	return 0
+}
+
+func runPinsCommand(args []string) int {
+	if len(args) == 0 || (args[0] != "sign" && args[0] != "verify") {
+		fmt.Fprintln(os.Stderr, "usage: sylenix-guard pins sign|verify --name NAME [--state-dir DIR] [--key PATH|--pubkey PATH]")
+		return 2
+	}
+	action := args[0]
+	fs := flag.NewFlagSet("pins "+action, flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	name := fs.String("name", "", "guard session name used for pins-<name>.json")
+	stateDir := fs.String("state-dir", "", "state directory (default ~/.sylenix-poc)")
+	keyPath := fs.String("key", "", "Ed25519 private key (sign)")
+	pubPath := fs.String("pubkey", "", "Ed25519 public key (verify)")
+	if err := fs.Parse(args[1:]); err != nil {
+		if err == flag.ErrHelp {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(os.Stderr, "sylenix-guard pins:", action, "unexpected arguments")
+		return 2
+	}
+	if strings.TrimSpace(*name) == "" || !validDoctorName(*name) {
+		fmt.Fprintln(os.Stderr, "sylenix-guard pins:", action, "--name is required and must be a simple name")
+		return 2
+	}
+	state := *stateDir
+	if state == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "sylenix-guard pins:", action, "cannot find home directory; pass --state-dir")
+			return 2
+		}
+		state = filepath.Join(home, ".sylenix-poc")
+	}
+	path := filepath.Join(state, "pins-"+*name+".json")
+	if action == "sign" {
+		keyFile := *keyPath
+		if keyFile == "" {
+			var err error
+			keyFile, err = defaultSigningKeyPath()
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "sylenix-guard pins sign:", err)
+				return 2
+			}
+		}
+		key, err := loadPrivateKeyFile(keyFile)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "sylenix-guard pins sign:", err)
+			return 2
+		}
+		if err := signFileDetached(path, key); err != nil {
+			fmt.Fprintln(os.Stderr, "sylenix-guard pins sign:", err)
+			return 2
+		}
+		fmt.Printf("signed %s -> %s\n", path, path+signatureSuffix)
+		return 0
+	}
+	pubFile := *pubPath
+	if pubFile == "" {
+		fmt.Fprintln(os.Stderr, "sylenix-guard pins verify: --pubkey is required")
+		return 2
+	}
+	pub, err := loadPublicKeyFile(pubFile)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "sylenix-guard pins verify:", err)
+		return 2
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "sylenix-guard pins verify:", err)
+		return 2
+	}
+	if err := verifyDetachedSignature(path, data, pub); err != nil {
+		fmt.Fprintln(os.Stderr, "sylenix-guard pins verify:", err)
+		return 1
+	}
+	fmt.Printf("signature valid: %s\n", path)
+	return 0
+}
+
 // ---------------------------------------------------------------- policy file
 
 // loadPolicyForRun resolves --policy, then <state-dir>/policy.yaml, then the
 // built-in defaults. A policy that exists but cannot be read or parsed is a
 // startup error; the guard never silently falls back to a weaker policy.
-func loadPolicyForRun(explicitPath string, explicit bool, stateDir, serverName string, nameExplicit bool) (*policyFile, string, string, error) {
+func loadPolicyForRun(explicitPath string, explicit bool, stateDir, serverName string, nameExplicit bool, verifyKey ed25519.PublicKey) (*policyFile, string, string, error) {
 	var data []byte
 	var pathUsed, source string
 	if explicit {
@@ -1252,12 +1596,20 @@ func loadPolicyForRun(explicitPath string, explicit bool, stateDir, serverName s
 		pathUsed, source = filepath.Join(stateDir, policyFileName), "state-dir"
 		b, err := os.ReadFile(pathUsed)
 		if os.IsNotExist(err) {
+			if verifyKey != nil {
+				return nil, source, pathUsed, fmt.Errorf("signing is enabled but the policy file %s is missing; create and sign it with `sylenix-guard policy sign`", pathUsed)
+			}
 			return defaultPolicyFile(), "builtin", "", nil
 		}
 		if err != nil {
 			return nil, source, pathUsed, fmt.Errorf("cannot read policy %s: %w", pathUsed, err)
 		}
 		data = b
+	}
+	if verifyKey != nil {
+		if err := verifyDetachedSignature(pathUsed, data, verifyKey); err != nil {
+			return nil, source, pathUsed, fmt.Errorf("policy signature verification failed for %s: %w", pathUsed, err)
+		}
 	}
 	pf, err := parsePolicyBytes(data)
 	if err != nil {
@@ -1843,12 +2195,124 @@ func printPolicyDeprecationNotes(visited map[string]bool, explicitPath, source s
 	note("no-spotlight", "spotlight: false")
 }
 
+func runPolicySignCommand(args []string) int {
+	fs := flag.NewFlagSet("policy sign", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	policyPath := fs.String("policy", "", "policy file to sign (default: <state-dir>/policy.yaml)")
+	stateDir := fs.String("state-dir", "", "state directory for the default policy path (default ~/.sylenix-poc)")
+	keyPath := fs.String("key", "", "Ed25519 private key (default ~/.sylenix-keys/policy-signing.key)")
+	if err := fs.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(os.Stderr, "sylenix-guard policy sign: unexpected arguments")
+		return 2
+	}
+	path, err := policySignPath(*policyPath, *stateDir)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "sylenix-guard policy sign:", err)
+		return 2
+	}
+	keyFile := *keyPath
+	if keyFile == "" {
+		keyFile, err = defaultSigningKeyPath()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "sylenix-guard policy sign:", err)
+			return 2
+		}
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "sylenix-guard policy sign:", err)
+		return 2
+	}
+	if _, err := parsePolicyBytes(data); err != nil {
+		fmt.Fprintf(os.Stderr, "sylenix-guard policy sign: %s: %v\n", path, err)
+		return 2
+	}
+	key, err := loadPrivateKeyFile(keyFile)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "sylenix-guard policy sign:", err)
+		return 2
+	}
+	if err := signFileDetached(path, key); err != nil {
+		fmt.Fprintln(os.Stderr, "sylenix-guard policy sign:", err)
+		return 2
+	}
+	fmt.Printf("signed %s -> %s\n", path, path+signatureSuffix)
+	return 0
+}
+
+func runPolicyVerifyCommand(args []string) int {
+	fs := flag.NewFlagSet("policy verify", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	policyPath := fs.String("policy", "", "policy file to verify (default: <state-dir>/policy.yaml)")
+	stateDir := fs.String("state-dir", "", "state directory for the default policy path (default ~/.sylenix-poc)")
+	pubPath := fs.String("pubkey", "", "Ed25519 public key")
+	if err := fs.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(os.Stderr, "sylenix-guard policy verify: unexpected arguments")
+		return 2
+	}
+	if strings.TrimSpace(*pubPath) == "" {
+		fmt.Fprintln(os.Stderr, "sylenix-guard policy verify: --pubkey is required")
+		return 2
+	}
+	path, err := policySignPath(*policyPath, *stateDir)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "sylenix-guard policy verify:", err)
+		return 2
+	}
+	pub, err := loadPublicKeyFile(*pubPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "sylenix-guard policy verify:", err)
+		return 2
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "sylenix-guard policy verify:", err)
+		return 2
+	}
+	if err := verifyDetachedSignature(path, data, pub); err != nil {
+		fmt.Fprintln(os.Stderr, "sylenix-guard policy verify:", err)
+		return 1
+	}
+	fmt.Printf("signature valid: %s\n", path)
+	return 0
+}
+
+func policySignPath(explicit, stateDir string) (string, error) {
+	if explicit != "" {
+		return explicit, nil
+	}
+	if stateDir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("cannot find home directory; pass --state-dir or --policy")
+		}
+		stateDir = filepath.Join(home, ".sylenix-poc")
+	}
+	return filepath.Join(stateDir, policyFileName), nil
+}
+
 func runPolicyCommand(args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: sylenix-guard policy validate <file> | sylenix-guard policy print-default")
+		fmt.Fprintln(os.Stderr, "usage: sylenix-guard policy validate <file> | sign | verify | print-default")
 		return 2
 	}
 	switch args[0] {
+	case "sign":
+		return runPolicySignCommand(args[1:])
+	case "verify":
+		return runPolicyVerifyCommand(args[1:])
 	case "validate":
 		if len(args) != 2 {
 			fmt.Fprintln(os.Stderr, "usage: sylenix-guard policy validate <file>")
@@ -2869,14 +3333,25 @@ func writePolicyFile(path string, pf *policyFile) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	return writeConfigAtomic(path, marshalPolicyYAML(pf), 0o600)
+	if err := writeConfigAtomic(path, marshalPolicyYAML(pf), 0o600); err != nil {
+		return err
+	}
+	// A rewritten policy no longer matches its old detached signature. Remove
+	// it so a signing-enabled start reports a missing signature, not a stale
+	// one that might be mistaken for a valid file.
+	_ = os.Remove(path + signatureSuffix)
+	return nil
 }
 
 func writeDefaultPolicyFile(path string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	return writeConfigAtomic(path, []byte(defaultPolicyYAML()), 0o600)
+	if err := writeConfigAtomic(path, []byte(defaultPolicyYAML()), 0o600); err != nil {
+		return err
+	}
+	_ = os.Remove(path + signatureSuffix)
+	return nil
 }
 
 // ---------------------------------------------------------------- strict YAML subset
@@ -3814,22 +4289,34 @@ func (g *Guard) inspectToolsList(raw json.RawMessage) {
 
 func (g *Guard) pinsPath() string { return filepath.Join(g.stateDir, "pins-"+g.name+".json") }
 
-// loadPins returns false when a pin file exists but cannot be trusted. Trust on
-// first use applies only to genuine first sight, never to a file that is damaged.
-func (g *Guard) loadPins(reset bool) bool {
+// loadPins returns an error when a pin file exists but cannot be trusted.
+// Trust on first use applies only to genuine first sight, never to a file that
+// is damaged or whose signature does not verify.
+func (g *Guard) loadPins(reset bool) error {
 	if reset {
 		_ = os.Remove(g.pinsPath())
+		_ = os.Remove(g.pinsSignaturePath())
 		g.event("pins_reset", nil)
-		return true
+		return nil
 	}
 	b, err := os.ReadFile(g.pinsPath())
 	if os.IsNotExist(err) {
-		return true
+		return nil
+	}
+	if err != nil {
+		g.event("pins_unreadable", nil)
+		return fmt.Errorf("cannot read pin file: %w", err)
+	}
+	if g.verifyKey != nil {
+		if err := verifyDetachedSignature(g.pinsPath(), b, g.verifyKey); err != nil {
+			g.event("pins_signature_invalid", map[string]any{"reason": err.Error()})
+			return fmt.Errorf("pin signature verification failed: %w", err)
+		}
 	}
 	var pins map[string]string
-	if err != nil || json.Unmarshal(b, &pins) != nil || pins == nil {
+	if json.Unmarshal(b, &pins) != nil || pins == nil {
 		g.event("pins_unreadable", nil)
-		return false
+		return fmt.Errorf("pin file is not a JSON object")
 	}
 	// A null or malformed value unmarshals into an empty string without an
 	// error and would brick that tool on the next tools/list. Refuse the whole
@@ -3837,24 +4324,54 @@ func (g *Guard) loadPins(reset bool) bool {
 	for name, h := range pins {
 		if name == "" || len(h) != sha256.Size*2 {
 			g.event("pins_unreadable", nil)
-			return false
+			return fmt.Errorf("pin file contains an empty name or a value that is not a SHA-256 hash")
 		}
 		if _, err := hex.DecodeString(h); err != nil {
 			g.event("pins_unreadable", nil)
-			return false
+			return fmt.Errorf("pin file contains a value that is not a SHA-256 hash")
 		}
 	}
 	g.pins = pins
-	return true
+	return nil
 }
+
+func (g *Guard) pinsSignaturePath() string { return g.pinsPath() + signatureSuffix }
 
 func (g *Guard) savePins() {
 	g.mu.Lock()
 	b, _ := json.MarshalIndent(g.pins, "", "  ")
+	signKey := g.signKey
+	verifyKey := g.verifyKey
 	g.mu.Unlock()
-	tmp := g.pinsPath() + ".tmp"
-	if os.WriteFile(tmp, b, 0o600) == nil {
-		_ = os.Rename(tmp, g.pinsPath())
+
+	path := g.pinsPath()
+	sigPath := g.pinsSignaturePath()
+	if signKey == nil {
+		if verifyKey != nil {
+			// Verification is enabled but this process has no private key.
+			// Keep the pins in memory and never write an unsigned store that
+			// the next start would have to reject.
+			g.event("pins_not_persisted", map[string]any{"reason": "no private signing key"})
+			return
+		}
+		if err := writeFileAtomic(path, b, 0o600); err != nil {
+			g.event("pins_save_failed", map[string]any{"reason": "cannot write pin file"})
+			return
+		}
+		_ = os.Remove(sigPath)
+		return
+	}
+
+	sig := ed25519.Sign(signKey, b)
+	if err := writeFileAtomic(path, b, 0o600); err != nil {
+		g.event("pins_save_failed", map[string]any{"reason": "cannot write pin file"})
+		return
+	}
+	if err := writeFileAtomic(sigPath, sig, 0o600); err != nil {
+		// Do not leave an unsigned pin file behind under a signing key.
+		_ = os.Remove(path)
+		_ = os.Remove(sigPath)
+		g.event("pins_save_failed", map[string]any{"reason": "cannot write pin signature"})
 	}
 }
 
@@ -6209,24 +6726,26 @@ type doctorServerView struct {
 // doctorWrapperFlags is the subset of Guard flags doctor understands. An
 // unknown flag is a finding, never something to ignore.
 type doctorWrapperFlags struct {
-	HasName     bool
-	Name        string
-	HasStateDir bool
-	StateDir    string
-	HasPolicy   bool
-	Policy      string
-	HasReadonly bool
-	Readonly    string
-	HasTrust    bool
-	Trust       string
-	HasApprove  bool
-	Approve     string
-	HasScratch  bool
-	Scratch     []scratchRule
-	NoSpotlight bool
-	ResetPins   bool
-	HasGrant    bool
-	Grants      []string
+	HasName         bool
+	Name            string
+	HasStateDir     bool
+	StateDir        string
+	HasPolicy       bool
+	Policy          string
+	HasPolicyPubKey bool
+	PolicyPubKey    string
+	HasReadonly     bool
+	Readonly        string
+	HasTrust        bool
+	Trust           string
+	HasApprove      bool
+	Approve         string
+	HasScratch      bool
+	Scratch         []scratchRule
+	NoSpotlight     bool
+	ResetPins       bool
+	HasGrant        bool
+	Grants          []string
 }
 
 type doctorServer struct {
@@ -6634,18 +7153,35 @@ func (d *doctorRun) inspectServer(s *doctorServer, view *doctorServerView, expli
 	view.ScratchDirs = d.checkScratch(*s, eff.Scratch, &findings)
 	pinsExists, pinsValid := d.checkPins(*s, &findings)
 	if d.requireSignatures {
-		// Policy and pin signing is not implemented yet (Prompt 13). Until it
-		// is, an unverified file is reported as unsigned; it is never assumed
-		// to be safe.
-		if pol.path != "" {
-			add("UNSIGNED_POLICY", "risk",
-				fmt.Sprintf("policy %q is not verifiably signed by this build", cleanForDialog(pol.path, 160)),
-				"upgrade to a build with policy/pin signing and sign the policy")
+		// Without a configured public key nothing can be verified. With one,
+		// verify the exact bytes on disk; an unsigned or tampered file is a
+		// finding, never assumed safe.
+		var pub ed25519.PublicKey
+		if s.Flags.HasPolicyPubKey {
+			pub, _ = loadPublicKeyFile(s.Flags.PolicyPubKey)
 		}
-		if pinsExists && pinsValid {
+		policyVerified := false
+		if pub != nil && pol.path != "" {
+			if data, err := os.ReadFile(pol.path); err == nil && verifyDetachedSignature(pol.path, data, pub) == nil {
+				policyVerified = true
+			}
+		}
+		pinsVerified := false
+		if pub != nil && pinsExists && pinsValid {
+			path := d.pinsPath(*s)
+			if data, err := os.ReadFile(path); err == nil && verifyDetachedSignature(path, data, pub) == nil {
+				pinsVerified = true
+			}
+		}
+		if pol.path != "" && !policyVerified {
+			add("UNSIGNED_POLICY", "risk",
+				fmt.Sprintf("policy %q has no valid signature for the configured public key", cleanForDialog(pol.path, 160)),
+				"run `sylenix-guard policy sign --policy <file> --key <private-key>`; add --policy-pubkey to the wrapper")
+		}
+		if pinsExists && pinsValid && !pinsVerified {
 			add("UNSIGNED_PINS", "risk",
-				fmt.Sprintf("pin file %q is not verifiably signed by this build", cleanForDialog(d.pinsPath(*s), 160)),
-				"upgrade to a build with policy/pin signing and sign the pin file")
+				fmt.Sprintf("pin file %q has no valid signature for the configured public key", cleanForDialog(d.pinsPath(*s), 160)),
+				"run the guard with --policy-key so it signs new pins, or sign the file with `sylenix-guard pins sign`")
 		}
 	}
 	return findings
@@ -6991,8 +7527,8 @@ func sortDoctorFindings(findings []doctorFinding) {
 
 func findDoctorSeparator(args []string) int {
 	valueFlags := map[string]bool{
-		"name": true, "state-dir": true, "policy": true, "readonly": true,
-		"trust": true, "approve": true, "allow-write-under": true, "grant": true,
+		"name": true, "state-dir": true, "policy": true, "policy-pubkey": true, "policy-key": true,
+		"readonly": true, "trust": true, "approve": true, "allow-write-under": true, "grant": true,
 	}
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
@@ -7072,6 +7608,23 @@ func parseDoctorWrapperFlags(args []string) (doctorWrapperFlags, string) {
 				return f, "policy is empty or contains surrounding spaces/control characters"
 			}
 			f.HasPolicy, f.Policy = true, v
+		case "policy-pubkey":
+			v, detail := value()
+			if detail != "" {
+				return f, detail
+			}
+			if v == "" || strings.TrimSpace(v) != v || hasUnsafePolicyChars(v) {
+				return f, "policy-pubkey is empty or contains surrounding spaces/control characters"
+			}
+			f.HasPolicyPubKey, f.PolicyPubKey = true, v
+		case "policy-key":
+			v, detail := value()
+			if detail != "" {
+				return f, detail
+			}
+			if v == "" || strings.TrimSpace(v) != v || hasUnsafePolicyChars(v) {
+				return f, "policy-key is empty or contains surrounding spaces/control characters"
+			}
 		case "readonly":
 			v, detail := value()
 			if detail != "" {

@@ -69,6 +69,8 @@ wraps one MCP server per process over stdio or Streamable HTTP.
   without logging or persisting tokens
 - `install`/`uninstall` wrappers for Claude Desktop, Claude Code, Cursor and VS Code configs, with backups, diffs, confirmation and dry-run
 - Tool-definition pinning (trust on first use) with quarantine on change or hidden characters
+- Ed25519 signing for `policy.yaml` and the pin store, with `keys init`, `policy sign`,
+  `pins sign`, and fail-closed startup on an unsigned or modified file
 - Result datamarking and invisible-character stripping, including `structuredContent`
 - Session taint tracking with default-deny flow control
 - Hard blocks for network targets and sensitive paths
@@ -83,7 +85,7 @@ wraps one MCP server per process over stdio or Streamable HTTP.
   pre-population
 - `sylenix-guard doctor` audit of supported MCP client configs: wrapped vs
   unwrapped servers, allowlist gaps, risky scratch/trust/approval settings,
-  unsigned policy/pins (opt-in until signing lands) and outdated Guard binaries
+  unsigned policy/pins and outdated Guard binaries
 - Human-approved `clear-taint` for a running session, with an OS dialog and a
   `CLEAR_TAINT` audit event
 - `stats` audit summary with approval prompts per active hour
@@ -94,7 +96,7 @@ wraps one MCP server per process over stdio or Streamable HTTP.
 - Fail-closed handling of malformed, duplicate, batched and oversize frames
 
 **Not in this build** — OS sandboxing, credential brokering, a confidentiality latch,
-signed pin files, remote or biometric approval, evidence ledgers, multi-server sessions,
+HSM/remote signing, remote or biometric approval, evidence ledgers, multi-server sessions,
 OAuth token storage/refresh, and the legacy HTTP+SSE transport from 2024-11-05. The full
 product architecture is specified in [`docs/SPEC_FULL.md`](docs/SPEC_FULL.md); those
 layers are deliberately left out of the current build. Scope and behavior are governed
@@ -113,9 +115,9 @@ CGO_ENABLED=0 go build -o bin/sylenix-guard ./cmd/sylenix-guard
 CGO_ENABLED=0 go build -o bin/sylenix-guard.exe ./cmd/sylenix-guard
 ```
 
-`make check` runs gofmt, go vet, the protocol self-test, the stdio and Streamable HTTP
-probe suites, the built-in profile tests, the prompt-cost replay, the audit summarizer
-fixture, the doctor probes, the clear-taint probes and the stats probes.
+`make check` runs gofmt, go vet, the protocol self-test, the stdio, Streamable HTTP and
+signing probe suites, the built-in profile tests, the prompt-cost replay, the audit
+summarizer fixture, the doctor probes, the clear-taint probes and the stats probes.
 On Windows, `make check` needs a POSIX shell (Git Bash or WSL). Without one, run the
 same steps directly: `gofmt -l cmd`, `go vet ./...`, `python demo/selftest.py`.
 
@@ -185,6 +187,35 @@ logs header values, never writes tokens or session IDs to disk, and does not
 follow redirects. It checks `Origin` and rejects non-loopback browser origins.
 The server-command allowlist remains a stdio launch control; it is not applied to
 `--upstream`.
+
+### Sign policy and pins
+
+Create a signing keypair, sign the policy, and give Guard the public key:
+
+```bash
+sylenix-guard keys init
+# private key: ~/.sylenix-keys/policy-signing.key
+# public key:  ~/.sylenix-keys/policy-signing.key.pub
+
+sylenix-guard policy sign --policy ~/.sylenix-poc/policy.yaml \
+  --key ~/.sylenix-keys/policy-signing.key
+
+bin/sylenix-guard --policy ~/.sylenix-poc/policy.yaml \
+  --policy-pubkey ~/.sylenix-keys/policy-signing.key.pub \
+  --policy-key ~/.sylenix-keys/policy-signing.key \
+  --name filesystem -- npx -y @modelcontextprotocol/server-filesystem ~/work
+```
+
+`--policy-pubkey` verifies policy and pin signatures. `--policy-key` also signs
+the pin store whenever Guard writes it; if both are set they must match. Once
+either is set, an existing unsigned or modified policy/pin file stops Guard
+with exit 2; there is no fallback. `keys init` refuses to put the private key in
+the state directory and warns that anyone who can read it can loosen Guard.
+Keep it off the agent machine or in a protected team store. `install` and
+`allow` rewrite the policy and remove its old signature, so run `policy sign`
+again after either command. See
+[`docs/POLICY.md`](docs/POLICY.md#signing-policy-and-pins) for the file formats,
+`pins sign`, rotation and the rollback limitation.
 
 ### Check the installation
 
@@ -256,6 +287,8 @@ that default; it is never widened automatically.
 | `--name` | Label for this server; names the pin and audit files. Default: the command's name, or the upstream host in `proxy` mode. |
 | `--state-dir` | Where pins and the audit log live. Default `~/.sylenix-poc`. |
 | `--policy PATH` | Versioned policy file. Default: `<state-dir>/policy.yaml` if present, else built-in defaults. |
+| `--policy-pubkey PATH` | Ed25519 public key for verifying policy and pin signatures. Enables fail-closed signature checking. |
+| `--policy-key PATH` | Ed25519 private key for signing new pin stores on write. Also verifies the policy; must match `--policy-pubkey` if both are set. |
 | `--readonly a,b` | Tools allowed even when the session is tainted. Replaces all policy `class: read` entries. |
 | `--trust a,b` | Tools whose results do not taint the session. Overrides policy trust entries. |
 | `--approve deny\|dialog` | What happens to a blocked call. Default `deny`. Overrides policy `approval`. |
@@ -329,6 +362,9 @@ auth headers. Summaries with prompts-per-active-hour metrics:
   block sequence through stdio and HTTP, covers POST/GET SSE, server
   notifications, sessions, auth-header pass-through and token
   non-persistence, and checks pin quarantine over HTTP.
+- Signing: `python tests/probes/test_signing.py` covers key generation, policy
+  and pin signing, one-byte tamper detection, unsigned-file rejection and the
+  public-key-only team mode.
 - Built-in profiles: `python tests/probes/test_profiles.py` exercises all ten
   profiles, one allowed read and one blocked write/egress each.
 - Server allowlist: `python tests/probes/test_allowlist.py` checks refusal,
@@ -430,8 +466,9 @@ bypass, response expectations and safe harbour.
 - Approvals are held in memory, expire after 15 minutes, and an agent acting inside a
   live approval is not stopped.
 - The built-in sensitive-name floor is short. `sensitive_paths` can extend it but
-  cannot remove it. Policy files are local, unsigned and read once at startup; the
-  loader accepts only a strict YAML subset.
+  cannot remove it. Policy files are local and read once at startup; the loader
+  accepts only a strict YAML subset. Use `policy sign` and `--policy-pubkey` when
+  file integrity matters.
 - Built-in profiles are defaults matched by command/package token. A renamed
   package, wrapper or custom server can miss the profile; review the profile in
   the audit log and override tool classes in the policy file.
@@ -446,13 +483,19 @@ bypass, response expectations and safe harbour.
   known fields survive, but comments and original formatting do not.
 - Egress host matching is textual on the argument value. It does not resolve DNS,
   follow redirects, inspect the actual connection or pin the resolved IP.
-- Manifest pinning is trust on first use; pin files are not signed.
+- Manifest pinning is trust on first use. When signing is enabled, pin files are
+  signed on write and verified on load; signing detects modification, not a
+  rollback to an older signed pair or deletion of both the pin file and its
+  signature (which is treated as first use). Deleting a signed policy file fails
+  closed. The private key is only as safe as its file permissions and the
+  machine account; HSM/remote signing is not implemented.
 - `doctor` only reads the config paths it knows. It recognizes hand-written
   wrappers by the `sylenix-guard` executable name (or the `_sylenixGuard`
   metadata), resolves relative wrapper paths against its own working directory,
-  and cannot verify policy or pin signatures until signing lands; with
-  `--require-signatures` it reports an unverified file as unsigned rather than
-  assuming it is safe. It never executes the configured server or Guard binary.
+  and verifies policy/pin signatures with the wrapper's `--policy-pubkey` when
+  present; without a key, `--require-signatures` reports the file as unsigned
+  rather than assuming it is safe. It never executes the configured server or
+  Guard binary.
 - Datamarking breaks some emoji sequences and some Persian and Indic text.
 - The dialog is not biometric: long or confusable arguments can mislead, and while it is
   open the host's other requests wait. The Windows dialog was exercised in the 7-day

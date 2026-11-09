@@ -33,7 +33,7 @@ the report, not a crash.
 | `--json` | Machine-readable report. |
 | `--policy PATH` | Check this policy for every server instead of the wrapper's `--policy`, the wrapper's `<state-dir>/policy.yaml`, or the default. |
 | `--state-dir DIR` | State directory used when a wrapper does not pin one. Default `~/.sylenix-poc`. |
-| `--require-signatures` | Report policy and pin files that this build cannot verify as signed. Until policy/pin signing lands, every such file is reported as unsigned; doctor never assumes an unverified file is safe. |
+| `--require-signatures` | Report policy and pin files that cannot be verified. Doctor uses the wrapper's `--policy-pubkey` when present; without a key, a signed or unsigned file is reported as unsigned and never assumed safe. |
 
 ## Configs it reads
 
@@ -126,8 +126,8 @@ cannot be used and `risk` for a configuration weakness.
 | `RISKY_SCRATCH` | `--allow-write-under` or policy `allow_paths` covers the home directory, the repository root, an ancestor of either, a filesystem root, or a path that cannot be resolved. | Narrow it to a project subdirectory, for example `<repo>/out`. |
 | `TRUST_ON_EGRESS` | A trusted tool is configured on a server that has at least one egress-class tool. Results from trusted tools do not latch taint. | Remove `--trust` / `trust: true` for that server. |
 | `APPROVALS_OFF` | Effective approval mode is `deny`, so the OS dialog is disabled and tainted sinks are hard-blocked rather than reviewed. | Set `--approve dialog` in the wrapper or `approval: dialog` in the policy. |
-| `UNSIGNED_POLICY` | `--require-signatures` was set and the policy is not verifiably signed by this build. | Upgrade to a build with policy/pin signing and sign the policy. |
-| `UNSIGNED_PINS` | `--require-signatures` was set and the pin file is not verifiably signed by this build. | Upgrade to a build with policy/pin signing and sign the pin file. |
+| `UNSIGNED_POLICY` | `--require-signatures` was set and the policy has no valid signature for the configured public key. | Sign with `policy sign` and add `--policy-pubkey` to the wrapper. |
+| `UNSIGNED_PINS` | `--require-signatures` was set and the pin file has no valid signature for the configured public key. | Sign with `pins sign` or run with `--policy-key` so new pins are signed. |
 | `OUTDATED_GUARD` | The wrapper metadata version is older than this build, or the Guard binary in the wrapper is older than the running doctor. | Upgrade Guard and re-run `sylenix-guard install`. |
 | `GUARD_NOT_FOUND` | The wrapper points at a Guard command that does not exist or is not on `PATH`. | Install Guard there or re-run `sylenix-guard install`. |
 | `GUARD_VERSION_UNKNOWN` | The Guard binary is not a readable Go binary, is not a Sylenix Guard binary, has no embedded version, or reports a version that cannot be compared. | Point the config at the Guard binary or reinstall from a release. |
@@ -152,12 +152,12 @@ parsed.
 
 ## Unsigned policy and pins
 
-Policy and pin signing is not implemented in this build. `--require-signatures`
-therefore reports an unverified policy or pin file as `UNSIGNED_POLICY` /
-`UNSIGNED_PINS`; it never treats the absence of a signature as safe. Without the
-flag, unsigned files are not findings, so current setups can still be clean.
-When signing lands, the same flag will verify the signatures instead of
-reporting them as unverified.
+`--require-signatures` verifies a policy or pin file when the wrapper carries a
+`--policy-pubkey`. A missing, truncated, wrong-key or one-byte-changed signature
+is reported as `UNSIGNED_POLICY` / `UNSIGNED_PINS`; doctor never treats the
+absence of a signature as safe. Without a public key it reports the file as
+unsigned because it cannot verify it. Without the flag, unsigned files are not
+findings, so existing setups can remain clean.
 
 ## What it does not do
 

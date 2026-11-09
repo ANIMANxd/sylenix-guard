@@ -6,6 +6,7 @@ results-*/
 __pycache__/
 *.pyc
 .sylenix-poc/
+.sylenix-keys/
 sweep-*/
 video/
 # Local secrets written by `elevenlabs onboard`
