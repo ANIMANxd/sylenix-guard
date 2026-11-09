@@ -1,0 +1,13 @@
+{"approve":"deny","event":"policy_loaded","profile":"","profile_source":"","server":"demo","source":"builtin","ts":"2026-11-09T16:44:53.4326211Z","version":1}
+{"allow_write_under":[],"approve":"deny","command":"<HOME>\\AppData\\Local\\Programs\\Python\\Python312\\python.exe","event":"start","grants":[],"policy_source":"builtin","policy_version":1,"profile":"","profile_source":"","readonly":["read_file","read_ticket"],"server":"demo","trust":[],"ts":"2026-11-09T16:44:53.4400413Z"}
+{"event":"tool_pinned","server":"demo","tool":"read_ticket","ts":"2026-11-09T16:44:54.7041908Z"}
+{"event":"tool_pinned","server":"demo","tool":"read_file","ts":"2026-11-09T16:44:54.7041908Z"}
+{"event":"tool_pinned","server":"demo","tool":"write_file","ts":"2026-11-09T16:44:54.7041908Z"}
+{"event":"tool_pinned","server":"demo","tool":"http_post","ts":"2026-11-09T16:44:54.7041908Z"}
+{"arg_keys":["ticket_id"],"class":"read","event":"allow","server":"demo","tainted":false,"tool":"read_ticket","ts":"2026-11-09T16:44:59.7113284Z"}
+{"event":"taint_latched","origin":"read_ticket","server":"demo","ts":"2026-11-09T16:44:59.7171557Z"}
+{"arg_keys":["path"],"class":"read","event":"allow","server":"demo","tainted":true,"tool":"read_file","ts":"2026-11-09T16:45:07.3647737Z"}
+{"arg_keys":["body","url"],"class":"exec","event":"block","origin":"read_ticket","rule":"EGRESS_TARGET","server":"demo","tool":"http_post","ts":"2026-11-09T16:45:17.9703441Z"}
+{"arg_keys":["content","path"],"class":"exec","event":"block","origin":"read_ticket","rule":"TAINT_SINK","server":"demo","tool":"write_file","ts":"2026-11-09T16:45:31.7139652Z"}
+{"event":"server_stream_closed","server":"demo","ts":"2026-11-09T16:45:45.9155255Z"}
+{"code":0,"event":"exit","server":"demo","ts":"2026-11-09T16:45:45.9219828Z"}

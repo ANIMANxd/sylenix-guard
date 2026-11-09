@@ -1,0 +1,3 @@
+7305895c9f2026baf93eec9bf82309927143ef63
+go version go1.27.2 windows/amd64
+HTTP proxy commit: 063ab03

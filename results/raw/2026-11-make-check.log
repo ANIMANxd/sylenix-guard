@@ -1,0 +1,1072 @@
+CGO_ENABLED=0 go vet ./...
+CGO_ENABLED=0 go build -o bin/sylenix-guard ./cmd/sylenix-guard
+CGO_ENABLED=0 go build -o bin/sylenix-guard.exe ./cmd/sylenix-guard
+python3 demo/selftest.py
+mode: flags
+taint latch, default deny, read-only allowlist, datamarking
+  ok   clean session: write_file allowed
+  ok   read_ticket result is datamarked
+  ok   closing tag in payload is neutralized
+  ok   zero-width characters stripped from payload
+  ok   tainted session: write_file blocked with -32000
+  ok   blocked call echoes the request id
+  ok   unmapped tool is blocked when tainted
+  ok   read-only tool still allowed when tainted
+  ok   blocked calls never reached the server
+  ok   clean exit when the host closes stdin
+manifest pinning across restarts
+  ok   pin file written
+  ok   changed definition is quarantined (-32001)
+  ok   audit log records the quarantine
+  ok   audit log holds no argument values
+hidden characters in a tool definition
+  ok   U+200B in a definition quarantines the tool
+  ok   U+00AD in a definition quarantines the tool
+  ok   U+034F in a definition quarantines the tool
+  ok   U+061C in a definition quarantines the tool
+  ok   U+115F in a definition quarantines the tool
+  ok   U+1160 in a definition quarantines the tool
+  ok   U+17B4 in a definition quarantines the tool
+  ok   U+180E in a definition quarantines the tool
+  ok   U+2028 in a definition quarantines the tool
+  ok   U+2029 in a definition quarantines the tool
+  ok   U+202E in a definition quarantines the tool
+  ok   U+2060 in a definition quarantines the tool
+  ok   U+206A in a definition quarantines the tool
+  ok   U+3164 in a definition quarantines the tool
+  ok   U+FEFF in a definition quarantines the tool
+  ok   U+FFA0 in a definition quarantines the tool
+  ok   U+FFF9 in a definition quarantines the tool
+  ok   U+E0041 in a definition quarantines the tool
+  ok   U+E0100 in a definition quarantines the tool
+  ok   ordinary non-ASCII text (accents, CJK, emoji) is not quarantined
+non-JSON output from the server
+  ok   junk line is forwarded unchanged
+  ok   junk on stdout latches taint
+malformed and batch frames from the host
+  ok   garbage line gets -32700 with id null
+  ok   batch frame is refused, not forwarded
+  ok   connection still works afterwards
+large frames
+  ok   3 MB result arrives intact
+stdout stays valid under concurrent blocked calls and forwarded calls
+  ok   all 600 replies parsed as valid JSON
+duplicate JSON keys
+  ok   duplicate key in params is refused (-32600, DUPLICATE_KEYS)
+  ok   refused frame carries id null
+  ok   same key in sibling objects is not a duplicate
+  ok   refused frame never reached the server
+response to an id nobody asked about
+  ok   unmatched response latches taint
+frames at and over the 10 MiB limit
+  ok   a frame of exactly 10 MiB is accepted
+  ok   one byte over is refused with -32600 FRAME_TOO_LARGE and id null
+  ok   the session survives an oversize frame
+  ok   oversize server frame fails the pending request (SERVER_FRAME_TOO_LARGE)
+  ok   oversize server frame latches taint
+server closes its stdout but keeps running
+  ok   pending request fails with SERVER_STREAM_CLOSED
+  ok   later requests fail the same way, not silently
+  ok   guard exits within 10 s with code 1
+a request id that is still pending
+  ok   second use of the id is refused (-32600 DUPLICATE_ID) with id null
+  ok   first request is still answered, with its own identity
+  ok   the refused request never reached the server
+  ok   an id can be reused once its request has been answered
+pin file that exists but cannot be read
+  ok   invalid JSON: guard refuses to start (exit 2, no server launched)
+  ok   null: guard refuses to start (exit 2, no server launched)
+  ok   a list: guard refuses to start (exit 2, no server launched)
+  ok   empty: guard refuses to start (exit 2, no server launched)
+  ok   null value: guard refuses to start (exit 2, no server launched)
+  ok   not a hash: guard refuses to start (exit 2, no server launched)
+  ok   empty name: guard refuses to start (exit 2, no server launched)
+  ok   --reset-pins recovers: the guard starts and works
+  ok   --reset-pins is recorded in the audit log
+structuredContent
+  ok   invisible characters are stripped from structuredContent strings
+  ok   numbers in structuredContent are preserved exactly
+  ok   the text item is still datamarked
+server request content latches taint
+  ok   sampling request is forwarded to the host
+  ok   trusted sample tool result does not taint by itself
+  ok   server request content latches taint: egress is blocked
+  ok   clean exit after server request taint
+  ok   audit records TAINT_SERVER_REQUEST
+  ok   audit does not log sampling content
+--allow-write-under: tainted writes inside a scratch root
+  ok   write inside the scratch root needs no prompt
+  ok   write outside the scratch root is blocked (TAINT_SINK)
+  ok   a .. path out of the scratch root is blocked
+  ok   .env is never scratch-allowed (SENSITIVE_TARGET)
+  ok   .git paths are never scratch-allowed
+  ok   root config names are never scratch-allowed
+  ok   a network target is hard-blocked (EGRESS_TARGET)
+  ok   a URL mentioned in content is not an egress target
+  ok   only the two allowed writes reached the server
+  ok   clean exit
+  ok   SENSITIVE_TARGET applies without --allow-write-under
+  ok   EGRESS_TARGET applies without --allow-write-under
+  ok   other tainted writes still get TAINT_SINK
+  ok   TOOL=DIR allows the named tool inside its root
+  ok   TOOL=DIR does not cover other tools
+time-bounded grants
+  ok   a live grant lets the call through
+  ok   a scoped grant does not cover paths outside its directory
+  ok   an expired grant stops allowing calls
+  ok   a tool-wide grant covers any path
+  ok   a grant never covers a network target
+  ok   a grant never covers a sensitive path
+  ok   bad spec --grant write_file=banana refuses to start (exit 2)
+  ok   bad spec --grant write_file refuses to start (exit 2)
+  ok   bad spec --allow-write-under write_file= refuses to start (exit 2)
+approval dialog unavailable
+  skip (a real dialog would appear on this machine)
+
+100 passed, 0 failed in 13.6s
+python3 demo/selftest.py --policy
+mode: policy file
+taint latch, default deny, read-only allowlist, datamarking
+  ok   clean session: write_file allowed
+  ok   read_ticket result is datamarked
+  ok   closing tag in payload is neutralized
+  ok   zero-width characters stripped from payload
+  ok   tainted session: write_file blocked with -32000
+  ok   blocked call echoes the request id
+  ok   unmapped tool is blocked when tainted
+  ok   read-only tool still allowed when tainted
+  ok   blocked calls never reached the server
+  ok   clean exit when the host closes stdin
+manifest pinning across restarts
+  ok   pin file written
+  ok   changed definition is quarantined (-32001)
+  ok   audit log records the quarantine
+  ok   audit log holds no argument values
+hidden characters in a tool definition
+  ok   U+200B in a definition quarantines the tool
+  ok   U+00AD in a definition quarantines the tool
+  ok   U+034F in a definition quarantines the tool
+  ok   U+061C in a definition quarantines the tool
+  ok   U+115F in a definition quarantines the tool
+  ok   U+1160 in a definition quarantines the tool
+  ok   U+17B4 in a definition quarantines the tool
+  ok   U+180E in a definition quarantines the tool
+  ok   U+2028 in a definition quarantines the tool
+  ok   U+2029 in a definition quarantines the tool
+  ok   U+202E in a definition quarantines the tool
+  ok   U+2060 in a definition quarantines the tool
+  ok   U+206A in a definition quarantines the tool
+  ok   U+3164 in a definition quarantines the tool
+  ok   U+FEFF in a definition quarantines the tool
+  ok   U+FFA0 in a definition quarantines the tool
+  ok   U+FFF9 in a definition quarantines the tool
+  ok   U+E0041 in a definition quarantines the tool
+  ok   U+E0100 in a definition quarantines the tool
+  ok   ordinary non-ASCII text (accents, CJK, emoji) is not quarantined
+non-JSON output from the server
+  ok   junk line is forwarded unchanged
+  ok   junk on stdout latches taint
+malformed and batch frames from the host
+  ok   garbage line gets -32700 with id null
+  ok   batch frame is refused, not forwarded
+  ok   connection still works afterwards
+large frames
+  ok   3 MB result arrives intact
+stdout stays valid under concurrent blocked calls and forwarded calls
+  ok   all 600 replies parsed as valid JSON
+duplicate JSON keys
+  ok   duplicate key in params is refused (-32600, DUPLICATE_KEYS)
+  ok   refused frame carries id null
+  ok   same key in sibling objects is not a duplicate
+  ok   refused frame never reached the server
+response to an id nobody asked about
+  ok   unmatched response latches taint
+frames at and over the 10 MiB limit
+  ok   a frame of exactly 10 MiB is accepted
+  ok   one byte over is refused with -32600 FRAME_TOO_LARGE and id null
+  ok   the session survives an oversize frame
+  ok   oversize server frame fails the pending request (SERVER_FRAME_TOO_LARGE)
+  ok   oversize server frame latches taint
+server closes its stdout but keeps running
+  ok   pending request fails with SERVER_STREAM_CLOSED
+  ok   later requests fail the same way, not silently
+  ok   guard exits within 10 s with code 1
+a request id that is still pending
+  ok   second use of the id is refused (-32600 DUPLICATE_ID) with id null
+  ok   first request is still answered, with its own identity
+  ok   the refused request never reached the server
+  ok   an id can be reused once its request has been answered
+pin file that exists but cannot be read
+  ok   invalid JSON: guard refuses to start (exit 2, no server launched)
+  ok   null: guard refuses to start (exit 2, no server launched)
+  ok   a list: guard refuses to start (exit 2, no server launched)
+  ok   empty: guard refuses to start (exit 2, no server launched)
+  ok   null value: guard refuses to start (exit 2, no server launched)
+  ok   not a hash: guard refuses to start (exit 2, no server launched)
+  ok   empty name: guard refuses to start (exit 2, no server launched)
+  ok   --reset-pins recovers: the guard starts and works
+  ok   --reset-pins is recorded in the audit log
+structuredContent
+  ok   invisible characters are stripped from structuredContent strings
+  ok   numbers in structuredContent are preserved exactly
+  ok   the text item is still datamarked
+server request content latches taint
+  ok   sampling request is forwarded to the host
+  ok   trusted sample tool result does not taint by itself
+  ok   server request content latches taint: egress is blocked
+  ok   clean exit after server request taint
+  ok   audit records TAINT_SERVER_REQUEST
+  ok   audit does not log sampling content
+--allow-write-under: tainted writes inside a scratch root
+  ok   write inside the scratch root needs no prompt
+  ok   write outside the scratch root is blocked (TAINT_SINK)
+  ok   a .. path out of the scratch root is blocked
+  ok   .env is never scratch-allowed (SENSITIVE_TARGET)
+  ok   .git paths are never scratch-allowed
+  ok   root config names are never scratch-allowed
+  ok   a network target is hard-blocked (EGRESS_TARGET)
+  ok   a URL mentioned in content is not an egress target
+  ok   only the two allowed writes reached the server
+  ok   clean exit
+  ok   SENSITIVE_TARGET applies without --allow-write-under
+  ok   EGRESS_TARGET applies without --allow-write-under
+  ok   other tainted writes still get TAINT_SINK
+  ok   TOOL=DIR allows the named tool inside its root
+  ok   TOOL=DIR does not cover other tools
+time-bounded grants
+  ok   a live grant lets the call through
+  ok   a scoped grant does not cover paths outside its directory
+  ok   an expired grant stops allowing calls
+  ok   a tool-wide grant covers any path
+  ok   a grant never covers a network target
+  ok   a grant never covers a sensitive path
+  ok   bad spec --grant write_file=banana refuses to start (exit 2)
+  ok   bad spec --grant write_file refuses to start (exit 2)
+  ok   bad spec --allow-write-under write_file= refuses to start (exit 2)
+approval dialog unavailable
+  skip (a real dialog would appear on this machine)
+
+100 passed, 0 failed in 13.1s
+python3 tests/probes/test_scratch_grant_bypass.py
+--allow-write-under
+  ok   scratch: bare .env under an unknown key is blocked
+  ok   scratch: bare id_rsa under an unknown key is blocked
+  ok   scratch: bare Makefile under an unknown key is blocked
+  ok   scratch: nested .env under an unknown object is blocked
+  ok   scratch: drive-relative path under an unknown key is blocked
+  ok   scratch: home-relative ssh path under an unknown key is blocked
+  ok   scratch: home-relative aws path under an unknown key is blocked
+  ok   scratch: hostname under an unknown key is blocked
+  ok   scratch: host:port under an unknown key is blocked
+  ok   scratch: parent-directory value under an unknown key is blocked
+  ok   scratch: sensitive value under a known path key is blocked
+  ok   scratch: URL under an unknown key is blocked
+  ok   scratch: bare host under a destination key is blocked
+  ok   scratch: non-HTTP URI under an unknown key is blocked
+  ok   scratch: IPv6 destination under an unknown key is blocked
+  ok   scratch: bare host:port under an unknown key is blocked
+  ok   scratch: hidden directory name under an unknown key is blocked
+  ok   scratch: outside path under a known path key is blocked
+  ok   scratch: parent traversal in a path key is blocked
+  ok   scratch: home-relative path key is blocked
+  ok   scratch: environment-expanded path key is blocked
+  ok   scratch: embedded environment path key is blocked
+  ok   scratch: percent-encoded path key is blocked
+  ok   scratch: drive-relative path key is blocked
+  ok   scratch: zero-width hidden sensitive path is blocked
+  ok   scratch: URL mentioned in content stays allowed
+  ok   scratch: every known path key inside the scratch root is allowed
+  ok   scratch: destination is treated as a known path key
+  ok   scratch: output_path is treated as a known path key
+  ok   scratch: a .. that stays inside the scratch root is allowed
+  ok   scratch: case variant of the scratch root is allowed
+  ok   scratch: symlink created during the session cannot escape
+  ok   scratch: .. after a symlink is resolved in OS order
+  ok   scratch: a symlink to a sensitive name is still blocked
+  ok   scratch: clean exit
+--grant (scoped)
+  ok   grant: bare .env under an unknown key is blocked
+  ok   grant: bare id_rsa under an unknown key is blocked
+  ok   grant: bare Makefile under an unknown key is blocked
+  ok   grant: nested .env under an unknown object is blocked
+  ok   grant: drive-relative path under an unknown key is blocked
+  ok   grant: home-relative ssh path under an unknown key is blocked
+  ok   grant: home-relative aws path under an unknown key is blocked
+  ok   grant: hostname under an unknown key is blocked
+  ok   grant: host:port under an unknown key is blocked
+  ok   grant: parent-directory value under an unknown key is blocked
+  ok   grant: sensitive value under a known path key is blocked
+  ok   grant: URL under an unknown key is blocked
+  ok   grant: bare host under a destination key is blocked
+  ok   grant: non-HTTP URI under an unknown key is blocked
+  ok   grant: IPv6 destination under an unknown key is blocked
+  ok   grant: bare host:port under an unknown key is blocked
+  ok   grant: hidden directory name under an unknown key is blocked
+  ok   grant: outside path under a known path key is blocked
+  ok   grant: parent traversal in a path key is blocked
+  ok   grant: home-relative path key is blocked
+  ok   grant: environment-expanded path key is blocked
+  ok   grant: embedded environment path key is blocked
+  ok   grant: percent-encoded path key is blocked
+  ok   grant: drive-relative path key is blocked
+  ok   grant: zero-width hidden sensitive path is blocked
+  ok   grant: URL mentioned in content stays allowed
+  ok   grant: every known path key inside the scratch root is allowed
+  ok   grant: destination is treated as a known path key
+  ok   grant: output_path is treated as a known path key
+  ok   grant: a .. that stays inside the scratch root is allowed
+  ok   grant: case variant of the scratch root is allowed
+  ok   grant: symlink created during the session cannot escape
+  ok   grant: .. after a symlink is resolved in OS order
+  ok   grant: a symlink to a sensitive name is still blocked
+  ok   grant: clean exit
+--grant (tool-wide)
+  ok   tool-wide grant: ordinary call is allowed
+  ok   tool-wide grant: sensitive extra value is blocked
+  ok   tool-wide grant: ambiguous extra value is blocked
+  ok   tool-wide grant: unresolvable path key is blocked
+  ok   tool-wide grant: clean exit
+
+75 passed, 0 failed
+python3 tests/probes/test_protected_targets.py
+  ok   scratch: agent instructions: allowed before taint
+  ok   scratch: agent instructions: allowed before taint
+  ok   scratch: agent instructions: allowed before taint
+  ok   scratch: agent instructions: allowed before taint
+  ok   scratch: agent instructions: allowed before taint
+  ok   scratch: agent instructions: allowed before taint
+  ok   scratch: mcp and editor config: allowed before taint
+  ok   scratch: mcp and editor config: allowed before taint
+  ok   scratch: mcp and editor config: allowed before taint
+  ok   scratch: mcp and editor config: allowed before taint
+  ok   scratch: mcp and editor config: allowed before taint
+  ok   scratch: mcp and editor config: allowed before taint
+  ok   scratch: ci and hooks: allowed before taint
+  ok   scratch: ci and hooks: allowed before taint
+  ok   scratch: ci and hooks: allowed before taint
+  ok   scratch: ci and hooks: allowed before taint
+  ok   scratch: shell startup: allowed before taint
+  ok   scratch: shell startup: allowed before taint
+  ok   scratch: shell startup: allowed before taint
+  ok   scratch: shell startup: allowed before taint
+  ok   scratch: shell startup: allowed before taint
+  ok   scratch: shell startup: allowed before taint
+  ok   scratch: cron: allowed before taint
+  ok   scratch: cron: allowed before taint
+  ok   scratch: cron: allowed before taint
+  ok   scratch: cron: allowed before taint
+  ok   scratch: cron: allowed before taint
+  ok   scratch: launchd: allowed before taint
+  ok   scratch: launchd: allowed before taint
+  ok   scratch: launchd: allowed before taint
+  ok   scratch: systemd user units: allowed before taint
+  ok   scratch: systemd user units: allowed before taint
+  ok   scratch: windows startup: allowed before taint
+  ok   scratch: windows startup: allowed before taint
+  ok   scratch: agent instructions: blocked after taint
+  ok   scratch: agent instructions: blocked after taint
+  ok   scratch: agent instructions: blocked after taint
+  ok   scratch: agent instructions: blocked after taint
+  ok   scratch: agent instructions: blocked after taint
+  ok   scratch: agent instructions: blocked after taint
+  ok   scratch: mcp and editor config: blocked after taint
+  ok   scratch: mcp and editor config: blocked after taint
+  ok   scratch: mcp and editor config: blocked after taint
+  ok   scratch: mcp and editor config: blocked after taint
+  ok   scratch: mcp and editor config: blocked after taint
+  ok   scratch: mcp and editor config: blocked after taint
+  ok   scratch: ci and hooks: blocked after taint
+  ok   scratch: ci and hooks: blocked after taint
+  ok   scratch: ci and hooks: blocked after taint
+  ok   scratch: ci and hooks: blocked after taint
+  ok   scratch: shell startup: blocked after taint
+  ok   scratch: shell startup: blocked after taint
+  ok   scratch: shell startup: blocked after taint
+  ok   scratch: shell startup: blocked after taint
+  ok   scratch: shell startup: blocked after taint
+  ok   scratch: shell startup: blocked after taint
+  ok   scratch: cron: blocked after taint
+  ok   scratch: cron: blocked after taint
+  ok   scratch: cron: blocked after taint
+  ok   scratch: cron: blocked after taint
+  ok   scratch: cron: blocked after taint
+  ok   scratch: launchd: blocked after taint
+  ok   scratch: launchd: blocked after taint
+  ok   scratch: launchd: blocked after taint
+  ok   scratch: systemd user units: blocked after taint
+  ok   scratch: systemd user units: blocked after taint
+  ok   scratch: windows startup: blocked after taint
+  ok   scratch: windows startup: blocked after taint
+  ok   scratch: env-expanded protected path is blocked
+  ok   scratch: clean exit
+  ok   grant: agent instructions: allowed before taint
+  ok   grant: agent instructions: allowed before taint
+  ok   grant: agent instructions: allowed before taint
+  ok   grant: agent instructions: allowed before taint
+  ok   grant: agent instructions: allowed before taint
+  ok   grant: agent instructions: allowed before taint
+  ok   grant: mcp and editor config: allowed before taint
+  ok   grant: mcp and editor config: allowed before taint
+  ok   grant: mcp and editor config: allowed before taint
+  ok   grant: mcp and editor config: allowed before taint
+  ok   grant: mcp and editor config: allowed before taint
+  ok   grant: mcp and editor config: allowed before taint
+  ok   grant: ci and hooks: allowed before taint
+  ok   grant: ci and hooks: allowed before taint
+  ok   grant: ci and hooks: allowed before taint
+  ok   grant: ci and hooks: allowed before taint
+  ok   grant: shell startup: allowed before taint
+  ok   grant: shell startup: allowed before taint
+  ok   grant: shell startup: allowed before taint
+  ok   grant: shell startup: allowed before taint
+  ok   grant: shell startup: allowed before taint
+  ok   grant: shell startup: allowed before taint
+  ok   grant: cron: allowed before taint
+  ok   grant: cron: allowed before taint
+  ok   grant: cron: allowed before taint
+  ok   grant: cron: allowed before taint
+  ok   grant: cron: allowed before taint
+  ok   grant: launchd: allowed before taint
+  ok   grant: launchd: allowed before taint
+  ok   grant: launchd: allowed before taint
+  ok   grant: systemd user units: allowed before taint
+  ok   grant: systemd user units: allowed before taint
+  ok   grant: windows startup: allowed before taint
+  ok   grant: windows startup: allowed before taint
+  ok   grant: agent instructions: blocked after taint
+  ok   grant: agent instructions: blocked after taint
+  ok   grant: agent instructions: blocked after taint
+  ok   grant: agent instructions: blocked after taint
+  ok   grant: agent instructions: blocked after taint
+  ok   grant: agent instructions: blocked after taint
+  ok   grant: mcp and editor config: blocked after taint
+  ok   grant: mcp and editor config: blocked after taint
+  ok   grant: mcp and editor config: blocked after taint
+  ok   grant: mcp and editor config: blocked after taint
+  ok   grant: mcp and editor config: blocked after taint
+  ok   grant: mcp and editor config: blocked after taint
+  ok   grant: ci and hooks: blocked after taint
+  ok   grant: ci and hooks: blocked after taint
+  ok   grant: ci and hooks: blocked after taint
+  ok   grant: ci and hooks: blocked after taint
+  ok   grant: shell startup: blocked after taint
+  ok   grant: shell startup: blocked after taint
+  ok   grant: shell startup: blocked after taint
+  ok   grant: shell startup: blocked after taint
+  ok   grant: shell startup: blocked after taint
+  ok   grant: shell startup: blocked after taint
+  ok   grant: cron: blocked after taint
+  ok   grant: cron: blocked after taint
+  ok   grant: cron: blocked after taint
+  ok   grant: cron: blocked after taint
+  ok   grant: cron: blocked after taint
+  ok   grant: launchd: blocked after taint
+  ok   grant: launchd: blocked after taint
+  ok   grant: launchd: blocked after taint
+  ok   grant: systemd user units: blocked after taint
+  ok   grant: systemd user units: blocked after taint
+  ok   grant: windows startup: blocked after taint
+  ok   grant: windows startup: blocked after taint
+  ok   grant: env-expanded protected path is blocked
+  ok   grant: clean exit
+  skip dialog approval: fake zenity is Linux-only
+
+140 passed, 0 failed
+python3 tests/probes/test_policy.py
+policy validate and print-default
+  ok   valid policy exits 0
+  ok   valid policy summary is printed
+  ok   direct server->tool shape validates
+  ok   allowlist policy validates
+  ok   print-default exits 0
+  ok   print-default output validates
+  ok   empty file is rejected
+  ok   missing version is rejected
+  ok   wrong version is rejected
+  ok   unknown top-level field is rejected
+  ok   validation error does not echo the value
+  ok   duplicate key is rejected
+  ok   unknown server field is rejected
+  ok   unknown field beside tools is rejected
+  ok   unknown tool field is rejected
+  ok   bad class is rejected
+  ok   bad approval is rejected
+  ok   unknown profile is rejected
+  ok   allowlist missing args is rejected
+  ok   allowlist bad sha256 is rejected
+  ok   allowlist lockfile without sha is rejected
+  ok   allowlist unknown field is rejected
+  ok   allowlist empty command is rejected
+  ok   allowlist args not a list is rejected
+  ok   allow_paths on exec is rejected
+  ok   bad sensitive glob is rejected
+  ok   bad egress host is rejected
+  ok   top-level list is rejected
+  ok   unsupported block scalar is rejected
+  ok   unsupported YAML alias is rejected
+  ok   missing policy file is rejected
+per-tool classes, allow_paths, path_keys and unknown tools
+  ok   read class stays allowed after taint
+  ok   write class uses allow_paths
+  ok   policy path_keys are treated as paths
+  ok   write outside allow_paths is blocked
+  ok   policy sensitive_paths addition is blocked
+  ok   built-in .env remains blocked
+  ok   exec class needs approval, not an allow path
+  ok   unknown tool defaults to exec
+  ok   policy session exits cleanly
+  ok   audit records policy_loaded
+  ok   audit holds no argument values
+egress allow/deny hosts
+  ok   allow-listed egress host is allowed
+  ok   wildcard allow host is allowed
+  ok   allow host with a port is matched by host
+  ok   IPv6 allow host is matched
+  ok   deny-listed egress host is blocked
+  ok   unknown egress host is blocked
+  ok   egress with no host is blocked
+  ok   egress session exits cleanly
+  ok   audit records EGRESS_ALLOW
+  ok   audit never stores hosts or bodies
+explicit flags override the policy file
+  ok   --no-spotlight overrides policy spotlight
+  ok   --readonly replaces policy class read
+  ok   --allow-write-under replaces policy allow_paths
+  ok   old policy allow_paths no longer applies
+  ok   override session exits cleanly
+  ok   deprecation note for --readonly
+  ok   deprecation note for --approve
+  ok   deprecation note for --allow-write-under
+  ok   deprecation note for --trust
+  ok   deprecation note for --no-spotlight
+  ok   deprecation note points at the policy file
+  ok   deprecation note does not echo flag values
+state-dir auto-load, explicit path precedence and missing config
+  ok   state-dir policy.yaml is auto-loaded
+  ok   auto-loaded policy still denies unknown tools
+  ok   auto-load session exits cleanly
+  ok   --policy wins over state-dir policy.yaml
+  ok   explicit policy session exits cleanly
+  ok   sole server entry is used when --name is omitted
+  ok   sole-server session exits cleanly
+  ok   direct server->tool policy is applied
+  ok   direct-shape unknown tool is denied
+  ok   direct-shape session exits cleanly
+  ok   missing server entry refuses to start (exit 2)
+  ok   missing server entry is recorded
+  ok   missing server entry never starts the server
+  ok   missing --policy file refuses to start (exit 2)
+  ok   invalid auto-loaded policy refuses to start (exit 2)
+  ok   invalid auto-loaded policy is recorded
+  ok   invalid auto-loaded policy never starts the server
+policy trust and spotlight
+  ok   policy spotlight: false disables datamarking
+  ok   policy trust: true keeps the session clean
+  ok   taint still applies after a trusted read
+  ok   trust/spotlight session exits cleanly
+
+85 passed, 0 failed
+python3 tests/probes/test_allowlist.py
+unapproved server is refused before launch
+  ok   unapproved server exits 2
+  ok   refusal names SERVER_NOT_ALLOWED
+  ok   refusal explains how to approve
+  ok   audit records SERVER_NOT_ALLOWED
+  ok   unapproved server never starts
+allow command writes an exact entry and the approved server starts
+  ok   allow decline exits successfully
+  ok   allow decline writes no policy
+  ok   allow exits successfully
+  ok   allow shows the configured command
+  ok   allow writes the policy file
+  ok   allow enables enforcement
+  ok   allow records a SHA-256
+  ok   allow records the exact args
+  ok   allow preserves existing policy fields
+  ok   allow output still validates
+  ok   approved server starts and answers tools/list
+  ok   approved session exits cleanly
+the allowlist matches the argument list, with optional wildcards
+  ok   exact args are allowed
+  ok   extra args are refused
+  ok   extra args refusal names SERVER_NOT_ALLOWED
+  ok   wildcard arg pattern is allowed
+allow does not drop an existing hash when the command cannot be resolved
+  ok   allow with a missing command exits successfully
+  ok   allow keeps the existing SHA-256
+changed binary hash is refused
+  ok   changed binary exits 2
+  ok   changed binary refusal names SERVER_NOT_ALLOWED
+  ok   changed binary refusal mentions SHA-256
+  ok   changed binary is recorded
+  ok   changed binary never starts
+changed package-lock hash is refused
+  ok   changed lockfile exits 2
+  ok   changed lockfile refusal names SERVER_NOT_ALLOWED
+install pre-populates the allowlist
+  ok   install exits successfully
+  ok   install writes the default policy
+  ok   install enables allowlist enforcement
+  ok   install records the installed server
+  ok   allow reads an already wrapped config
+  ok   allow unwraps the Guard command
+  ok   pre-populated server starts
+  ok   install allowlist session exits cleanly
+install pins custom policy and state paths in the wrapper
+  ok   custom install exits successfully
+  ok   custom install writes the custom policy
+  ok   custom install pins --policy
+  ok   custom install pins --state-dir
+  ok   custom wrapper starts the approved server
+  ok   custom wrapper enforces the custom policy
+  ok   custom uninstall exits successfully
+  ok   custom uninstall restores the original command
+  ok   custom uninstall drops the wrapper flags
+
+47 passed, 0 failed
+python3 tests/probes/test_install.py
+  ok   dry-run exits successfully
+  ok   dry-run leaves every config unchanged
+  ok   dry-run creates no backups
+  ok   dry-run shows a diff
+  ok   install exits successfully
+  ok   claude_desktop_config.json/desk: command is Guard
+  ok   claude_desktop_config.json/desk: wrapper starts with --
+  ok   claude_desktop_config.json/desk: Guard metadata present
+  ok   claude_desktop_config.json/remote: remote entry untouched
+  ok   claude_desktop_config.json: backup exists
+  ok   .claude.json/code_user: command is Guard
+  ok   .claude.json/code_user: wrapper starts with --
+  ok   .claude.json/code_user: Guard metadata present
+  ok   .claude.json: backup exists
+  ok   .mcp.json/code_project: command is Guard
+  ok   .mcp.json/code_project: wrapper starts with --
+  ok   .mcp.json/code_project: Guard metadata present
+  ok   .mcp.json: backup exists
+  ok   mcp.json/cursor_user: command is Guard
+  ok   mcp.json/cursor_user: wrapper starts with --
+  ok   mcp.json/cursor_user: Guard metadata present
+  ok   mcp.json: backup exists
+  ok   mcp.json/cursor_project: command is Guard
+  ok   mcp.json/cursor_project: wrapper starts with --
+  ok   mcp.json/cursor_project: Guard metadata present
+  ok   mcp.json: backup exists
+  ok   settings.json/vscode_settings: command is Guard
+  ok   settings.json/vscode_settings: wrapper starts with --
+  ok   settings.json/vscode_settings: Guard metadata present
+  ok   settings.json: backup exists
+  ok   mcp.json/vscode_user: command is Guard
+  ok   mcp.json/vscode_user: wrapper starts with --
+  ok   mcp.json/vscode_user: Guard metadata present
+  ok   mcp.json: backup exists
+  ok   mcp.json/vscode_workspace: command is Guard
+  ok   mcp.json/vscode_workspace: wrapper starts with --
+  ok   mcp.json/vscode_workspace: Guard metadata present
+  ok   mcp.json: backup exists
+  ok   uninstall exits successfully
+  ok   claude_desktop_config.json: round-trip restored
+  ok   claude_desktop_config.json: round-trip byte-identical ignoring whitespace
+  ok   .claude.json: round-trip restored
+  ok   .claude.json: round-trip byte-identical ignoring whitespace
+  ok   .mcp.json: round-trip restored
+  ok   .mcp.json: round-trip byte-identical ignoring whitespace
+  ok   mcp.json: round-trip restored
+  ok   mcp.json: round-trip byte-identical ignoring whitespace
+  ok   mcp.json: round-trip restored
+  ok   mcp.json: round-trip byte-identical ignoring whitespace
+  ok   settings.json: round-trip restored
+  ok   settings.json: round-trip byte-identical ignoring whitespace
+  ok   mcp.json: round-trip restored
+  ok   mcp.json: round-trip byte-identical ignoring whitespace
+  ok   mcp.json: round-trip restored
+  ok   mcp.json: round-trip byte-identical ignoring whitespace
+  ok   already-wrapped config exits successfully
+  ok   already-wrapped entry is skipped and unchanged
+  ok   confirmation decline exits successfully
+  ok   confirmation decline leaves config unchanged
+  ok   confirmation decline creates no backup
+  ok   confirmation decline shows the prompt
+  ok   confirmation accept writes the config
+  ok   confirmation accept wraps the entry
+  ok   confirmation accept creates a backup
+  ok   broken config makes install fail
+  ok   broken config is left byte-for-byte untouched
+  ok   broken config error is clear
+
+67 passed, 0 failed
+python3 tests/probes/test_http_proxy.py
+HTTP proxy parity, sessions, auth pass-through, token non-persistence
+  ok   initialize returns 200
+  ok   initialize result is present
+  ok   upstream session id reaches the client
+  ok   initialized notification returns 202
+  ok   tools/list returns 200
+  ok   auth header reached upstream
+  ok   HTTP proxy blocks the expected calls
+  ok   DELETE terminates the upstream session
+  ok   auth token is not in state files
+  ok   upstream URL query token is not in state files
+  ok   stdio proxy produces the same blocks as HTTP
+POST SSE responses and server notifications
+  ok   SSE response status is 200
+  ok   SSE response content type is event-stream
+  ok   SSE response is parsed
+  ok   SSE response text arrived
+  ok   SSE notification response is parsed
+  ok   content notification over SSE taints the session
+GET SSE stream
+  ok   GET SSE returns 200
+  ok   GET SSE carries the server notification
+  ok   content notification over GET SSE taints the session
+pin persistence and quarantine over HTTP
+  ok   first definition is allowed
+  ok   changed definition is quarantined
+
+22 passed, 0 failed in 4.3s
+python3 tests/probes/test_signing.py
+key generation
+  ok   keys init exits 0
+  ok   private key exists
+  ok   public key exists
+  ok   keys init warns about the private key
+  ok   keys init prints the public path
+  ok   keys init refuses a key inside the state dir
+policy signatures
+  ok   unsigned policy is rejected when signing is enabled
+  ok   policy sign exits 0
+  ok   policy signature exists
+  ok   policy signature is 64 bytes
+  ok   policy verify accepts the signature
+  ok   one-byte policy tamper is rejected
+  ok   deleting the auto-loaded policy fails closed
+  ok   signed policy starts and tools/list works
+  ok   public-key-only mode does not write an unsigned pin file
+pin signatures
+  ok   private-key mode starts and tools/list works
+  ok   pin file exists after tools/list
+  ok   pin signature exists after tools/list
+  ok   pins verify accepts the signature
+  ok   one-byte pin tamper is rejected
+  ok   unsigned pin file is rejected
+  ok   pins sign restores the signature
+  ok   pins verify accepts the restored signature
+
+23 passed, 0 failed
+python3 tests/probes/test_profiles.py
+profile filesystem
+  ok   filesystem: tainting read succeeds
+  ok   filesystem: read stays allowed after taint
+  ok   filesystem: write_file is blocked after taint
+  ok   filesystem: clean exit
+  ok   filesystem: blocked call never reached the server
+profile git
+  ok   git: tainting read succeeds
+  ok   git: read stays allowed after taint
+  ok   git: git_commit is blocked after taint
+  ok   git: clean exit
+  ok   git: blocked call never reached the server
+profile github
+  ok   github: tainting read succeeds
+  ok   github: read stays allowed after taint
+  ok   github: create_or_update_file is blocked after taint
+  ok   github: clean exit
+  ok   github: blocked call never reached the server
+profile fetch
+  ok   fetch: tainting read succeeds
+  ok   fetch: read stays allowed after taint
+  ok   fetch: fetch is blocked after taint
+  ok   fetch: clean exit
+  ok   fetch: blocked call never reached the server
+profile shell
+  ok   shell: tainting read succeeds
+  ok   shell: read stays allowed after taint
+  ok   shell: run_command is blocked after taint
+  ok   shell: clean exit
+  ok   shell: blocked call never reached the server
+profile slack
+  ok   slack: tainting read succeeds
+  ok   slack: read stays allowed after taint
+  ok   slack: slack_post_message is blocked after taint
+  ok   slack: clean exit
+  ok   slack: blocked call never reached the server
+profile postgres
+  ok   postgres: tainting read succeeds
+  ok   postgres: read stays allowed after taint
+  ok   postgres: execute_sql is blocked after taint
+  ok   postgres: clean exit
+  ok   postgres: blocked call never reached the server
+profile browser
+  ok   browser: tainting read succeeds
+  ok   browser: read stays allowed after taint
+  ok   browser: browser_navigate is blocked after taint
+  ok   browser: clean exit
+  ok   browser: blocked call never reached the server
+profile notion
+  ok   notion: tainting read succeeds
+  ok   notion: read stays allowed after taint
+  ok   notion: post-page is blocked after taint
+  ok   notion: clean exit
+  ok   notion: blocked call never reached the server
+profile jira
+  ok   jira: tainting read succeeds
+  ok   jira: read stays allowed after taint
+  ok   jira: create_issue is blocked after taint
+  ok   jira: clean exit
+  ok   jira: blocked call never reached the server
+policy override and explicit profile selection
+  ok   policy class overrides the profile class
+  ok   override session exits cleanly
+  ok   policy read class overrides a profile write class
+  ok   read override session exits cleanly
+  ok   profile: none disables auto-selection
+  ok   profile none session exits cleanly
+  ok   explicit profile: read stays allowed
+  ok   explicit profile: write is blocked
+  ok   explicit profile session exits cleanly
+  ok   --name fallback selects a profile
+  ok   --name fallback profile still blocks writes
+  ok   name fallback session exits cleanly
+
+62 passed, 0 failed
+python3 scripts/replay_profile_session.py
+session: <HOME>\Documents\dev\sylenix-guard\demo\fixtures\normal_session.json
+profile: filesystem (npm @modelcontextprotocol/server-filesystem 2.2.0)
+calls replayed: 39 over 1.00 active hour(s)
+approval prompts needed: 1 (1.00/hour)
+hard blocks: 0; errors: 0
+budget: < 10/hour -> PASS
+python3 scripts/summarize_audit.py --file demo/fixtures/audit_sample.jsonl | tr -d '\r' | diff - demo/fixtures/audit_sample.expected.txt
+python3 tests/probes/test_doctor.py
+clean setup
+  ok   clean: exit 0
+  ok   clean: valid JSON
+  ok   clean: clean is true
+  ok   clean: no findings
+  ok   clean: one config
+  ok   clean: server wrapped
+  ok   clean: server allowlisted
+  ok   clean: approval dialog
+  ok   clean: no args/env in JSON
+  ok   clean: version present
+  ok   clean: human exit 0
+  ok   clean: human says no findings
+  ok   clean: human shows wrapped
+  ok   clean: human shows allowlisted
+unwrapped stdio server
+  ok   unwrapped: exit 1
+  ok   unwrapped: NOT_WRAPPED
+  ok   unwrapped: server not wrapped
+  ok   unwrapped: server allowlisted
+remote server is not covered
+  ok   remote: exit 1
+  ok   remote: REMOTE_NOT_COVERED
+  ok   remote: transport remote
+  ok   remote: URL is not printed
+server not on the allowlist
+  ok   allowlist: exit 1
+  ok   allowlist: NOT_ALLOWLISTED
+  ok   allowlist: not allowlisted
+  ok   allowlist: enforcement is on
+allowlist enforcement is off
+  ok   enforcement: exit 1
+  ok   enforcement: ALLOWLIST_NOT_ENFORCED
+  ok   enforcement: allowlisted
+  ok   enforcement: no NOT_ALLOWLISTED
+allowlist SHA-256 mismatch
+  ok   hash: exit 1
+  ok   hash: ALLOWLIST_HASH_MISMATCH
+  ok   hash: allowlisted
+  ok   hash: no NOT_ALLOWLISTED
+scratch root at home
+  ok   scratch home: exit 1
+  ok   scratch home: RISKY_SCRATCH
+  ok   scratch home: names home
+  ok   scratch home: has one fix
+scratch root at the repository root
+  ok   scratch repo: exit 1
+  ok   scratch repo: RISKY_SCRATCH
+  ok   scratch repo: names repository
+scratch root under the project is not risky
+  ok   safe scratch: exit 0
+  ok   safe scratch: no RISKY_SCRATCH
+  ok   safe scratch: clean
+--trust on an egress-capable server
+  ok   trust: exit 1
+  ok   trust: TRUST_ON_EGRESS
+  ok   trust: names the trusted tool
+--trust on a server without egress tools is not flagged
+  ok   trust safe: exit 0
+  ok   trust safe: no TRUST_ON_EGRESS
+approvals off
+  ok   approvals: exit 1
+  ok   approvals: APPROVALS_OFF
+  ok   approvals: approval deny
+  ok   approvals: wrapper dialog overrides policy
+  ok   approvals: no APPROVALS_OFF after override
+unreadable pin file
+  ok   pins: exit 1
+  ok   pins: PINS_UNREADABLE
+  ok   pins: --reset-pins suppresses the finding
+  ok   pins: no PINS_UNREADABLE with reset
+unsigned policy and pins with --require-signatures
+  ok   unsigned: exit 1
+  ok   unsigned: UNSIGNED_POLICY
+  ok   unsigned: UNSIGNED_PINS
+  ok   unsigned: clean without the flag
+  ok   unsigned: no unsigned findings without the flag
+outdated Guard wrapper metadata
+  ok   metadata: exit 1
+  ok   metadata: OUTDATED_GUARD
+  ok   metadata: detail mentions metadata
+outdated Guard binary
+  ok   old binary: exit 1
+  ok   old binary: OUTDATED_GUARD
+  ok   old binary: detail mentions 0.0.0
+Guard binary is missing
+  ok   missing guard: exit 1
+  ok   missing guard: GUARD_NOT_FOUND
+Guard binary version cannot be read
+  ok   version unknown: exit 1
+  ok   version unknown: GUARD_VERSION_UNKNOWN
+malformed Guard wrapper
+  ok   wrapper: exit 1
+  ok   wrapper: WRAPPER_INVALID
+invalid policy
+  ok   policy invalid: exit 1
+  ok   policy invalid: POLICY_INVALID
+broken config
+  ok   broken config: exit 1
+  ok   broken config: CONFIG_UNREADABLE
+  ok   broken config: JSON output is still valid
+malformed server entry
+  ok   server invalid: exit 1
+  ok   server invalid: SERVER_INVALID
+doctor output never contains argument or env values
+  ok   no leak: secret arg absent from JSON
+  ok   no leak: secret env absent from JSON
+  ok   no leak: no args/env fields in JSON
+  ok   no leak: secret arg absent from human output
+  ok   no leak: secret env absent from human output
+doctor does not modify configs, policy or pins
+  ok   read-only: findings still reported
+  ok   read-only: config unchanged
+  ok   read-only: policy unchanged
+  ok   read-only: pins unchanged
+  ok   read-only: no audit log created
+  ok   read-only: state listing unchanged
+usage errors
+  ok   usage: unexpected argument exits 2
+  ok   usage: empty policy exits 2
+no supported configs found
+  ok   no configs: exit 0
+  ok   no configs: clean true
+  ok   no configs: empty configs
+  ok   no configs: human message
+
+99 passed, 0 failed
+python3 tests/probes/test_clear_taint.py
+human approves clearing taint
+  ok   clear allow: tainted sink is blocked
+  ok   clear allow: CLI exits 0
+  ok   clear allow: CLI reports cleared
+  ok   clear allow: sink is allowed after clear
+  ok   clear allow: guard exits cleanly
+  ok   clear allow: audit has CLEAR_TAINT
+  ok   clear allow: CLEAR_TAINT has who
+  ok   clear allow: CLEAR_TAINT has ts
+  ok   clear allow: CLEAR_TAINT has request id
+  ok   clear allow: CLEAR_TAINT granted
+  ok   clear allow: audit never contains the nonce
+  ok   clear allow: control files cleaned up
+human denies clearing taint
+  ok   clear deny: CLI exits 1
+  ok   clear deny: CLI reports denied
+  ok   clear deny: sink stays blocked
+  ok   clear deny: guard exits cleanly
+  ok   clear deny: audit has CLEAR_TAINT_DENIED
+  ok   clear deny: denied event has who
+  ok   clear deny: denied event has ts
+  ok   clear deny: denied event not granted
+  ok   clear deny: no CLEAR_TAINT
+clear-taint on a clean session does not open a dialog
+  ok   clear clean: CLI exits 0
+  ok   clear clean: CLI says not tainted
+  ok   clear clean: no dialog was opened
+  ok   clear clean: guard exits cleanly
+  ok   clear clean: audit has CLEAR_TAINT_NOT_NEEDED
+  ok   clear clean: no CLEAR_TAINT
+an MCP tool call named clear-taint cannot clear taint
+  ok   mcp tool: clear-taint call is blocked
+  ok   mcp tool: taint is still latched
+  ok   mcp tool: guard exits cleanly
+  ok   mcp tool: no CLEAR_TAINT
+a host JSON-RPC method named clear-taint cannot clear taint
+  ok   host method: method is forwarded, not acted on
+  ok   host method: taint is still latched
+  ok   host method: guard exits cleanly
+  ok   host method: no CLEAR_TAINT
+server clear-taint requests and notifications cannot clear taint
+  ok   server message: request was forwarded
+  ok   server message: notification was forwarded
+  ok   server message: taint is still latched
+  ok   server message: guard exits cleanly
+  ok   server message: server request is audited
+  ok   server message: no CLEAR_TAINT
+an environment variable cannot clear taint
+  ok   env var: taint is still latched
+  ok   env var: no dialog was opened
+  ok   env var: guard exits cleanly
+  ok   env var: no CLEAR_TAINT
+  ok   env var: no CLEAR_TAINT_DENIED
+a failed dialog fails closed
+  ok   dialog failure: CLI exits 1
+  ok   dialog failure: taint stays latched
+  ok   dialog failure: guard exits cleanly
+  ok   dialog failure: no CLEAR_TAINT
+read-only profile tools never prompt in dialog mode
+  ok   profile read: first read taints and is allowed
+  ok   profile read: second read is allowed without a dialog
+  ok   profile read: no dialog opened for reads
+  ok   profile write: write still prompts and is denied
+  ok   profile write: dialog was opened for the write
+  ok   profile write: write never reached the server
+  ok   profile read: guard exits cleanly
+  ok   profile read: no approval event for reads
+  ok   profile write: one approval event for the write
+clear-taint usage and stale control files
+  ok   usage: missing --name exits 2
+  ok   usage: no running session exits 2
+  ok   usage: control characters in --name exit 2
+  ok   usage: stale control file exits 2
+  ok   usage: stale control file is explained
+
+64 passed, 0 failed
+python3 tests/probes/test_stats.py
+stats matches the audit fixture
+  ok   fixture: exit 0
+  ok   fixture: output matches the summarizer fixture
+stats --name reads the guard audit log
+  ok   named: exit 0
+  ok   named: reads the expected file
+  ok   named: one tainted session
+  ok   named: prompts per active hour is 12.0
+  ok   named: approval counts
+  ok   named: approval by tool
+  ok   named: no blocks
+stats reports n/a below the minimum active time
+  ok   short: exit 0
+  ok   short: prompts per hour is n/a
+stats does not count clear-taint dialogs as approval prompts
+  ok   clear events: exit 0
+  ok   clear events: events counted
+  ok   clear events: only approval prompts count
+  ok   clear events: prompts per active hour is 12.0
+stats usage errors
+  ok   usage: no selector exits 2
+  ok   usage: both selectors exit 2
+  ok   usage: missing file exits 2
+  ok   usage: empty log exits 2
+  ok   usage: invalid JSON exits 2
+  ok   usage: --state-dir with --file exits 2
+
+21 passed, 0 failed

@@ -1,0 +1,1 @@
+Ticket 42 reports an account verification problem where the customer's team is unable to log in since the last system update. The support request from support-desk@customer-example.com asks for assistance with this login issue, and requires completing an account verification step before providing a response to the user.

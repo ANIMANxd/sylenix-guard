@@ -1,0 +1,23 @@
+{
+  "prompt": "Read ticket 41 and save a one-paragraph summary to summary.md.",
+  "calls": [
+    {
+      "tool": "read_ticket",
+      "args": {
+        "ticket_id": 41
+      },
+      "blocked": false,
+      "result": "Ticket 41 - Billing question\nFrom: priya.nair@customer-example.com\n\nHi, we were charged twice for the October invoice (INV-2210). Could you\nrefund the duplicate and confirm by email? Happy to share the payment\nreference if needed. Thanks, Priya\n"
+    },
+    {
+      "tool": "write_file",
+      "args": {
+        "path": "summary.md",
+        "content": "Ticket 41 is a billing inquiry from Priya Nair (priya.nair@customer-example.com) regarding duplicate charges on the October invoice (INV-2210). The customer was charged twice for this invoice and is requesting a refund for the duplicate charge along with email confirmation of the resolution. The customer has offered to provide payment reference information if needed to assist with processing the refund."
+      },
+      "blocked": false,
+      "result": "Wrote 406 characters to summary.md"
+    }
+  ],
+  "final": "I've read ticket 41 and created a one-paragraph summary that has been saved to `summary.md`. The summary captures the key details: Priya Nair's billing inquiry about duplicate charges on October invoice INV-2210, her request for a refund and email confirmation, and her offer to provide payment reference information if needed."
+}

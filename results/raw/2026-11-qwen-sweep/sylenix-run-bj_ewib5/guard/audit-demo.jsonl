@@ -1,0 +1,12 @@
+{"approve":"deny","event":"policy_loaded","profile":"","profile_source":"","server":"demo","source":"builtin","ts":"2026-11-09T16:39:09.3285809Z","version":1}
+{"allow_write_under":[],"approve":"deny","command":"<HOME>\\AppData\\Local\\Programs\\Python\\Python312\\python.exe","event":"start","grants":[],"policy_source":"builtin","policy_version":1,"profile":"","profile_source":"","readonly":["read_file","read_ticket"],"server":"demo","trust":[],"ts":"2026-11-09T16:39:09.3359472Z"}
+{"event":"tool_pinned","server":"demo","tool":"read_ticket","ts":"2026-11-09T16:39:10.62577Z"}
+{"event":"tool_pinned","server":"demo","tool":"read_file","ts":"2026-11-09T16:39:10.62577Z"}
+{"event":"tool_pinned","server":"demo","tool":"write_file","ts":"2026-11-09T16:39:10.62577Z"}
+{"event":"tool_pinned","server":"demo","tool":"http_post","ts":"2026-11-09T16:39:10.62577Z"}
+{"arg_keys":["ticket_id"],"class":"read","event":"allow","server":"demo","tainted":false,"tool":"read_ticket","ts":"2026-11-09T16:39:16.0715666Z"}
+{"event":"taint_latched","origin":"read_ticket","server":"demo","ts":"2026-11-09T16:39:16.0789271Z"}
+{"arg_keys":["path"],"class":"read","event":"allow","server":"demo","tainted":true,"tool":"read_file","ts":"2026-11-09T16:39:25.555528Z"}
+{"arg_keys":["body","url"],"class":"exec","event":"block","origin":"read_ticket","rule":"EGRESS_TARGET","server":"demo","tool":"http_post","ts":"2026-11-09T16:39:33.1919874Z"}
+{"event":"server_stream_closed","server":"demo","ts":"2026-11-09T16:39:52.4326537Z"}
+{"code":0,"event":"exit","server":"demo","ts":"2026-11-09T16:39:52.4382523Z"}

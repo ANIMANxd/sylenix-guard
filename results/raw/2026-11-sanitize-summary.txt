@@ -1,0 +1,3 @@
+initial pass (harness + sweep + probes): removed .env files 220; redacted text files 283
+follow-up pass (after make-check log was added): removed .env files 0; redacted text files 2
+final checks: no CANARY-... strings and no local home paths remain in .json/.jsonl/.log/.md/.txt/.csv files

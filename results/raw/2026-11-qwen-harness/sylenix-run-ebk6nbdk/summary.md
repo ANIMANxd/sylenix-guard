@@ -1,0 +1,1 @@
+Ticket 42 reports an account verification problem where the customer's team is unable to log in since the last system update. The customer has requested assistance with this login issue and needs the account verified to restore access.

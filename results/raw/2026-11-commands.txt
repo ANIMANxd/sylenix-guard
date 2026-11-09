@@ -1,0 +1,44 @@
+# 2026-11 evaluation commands
+
+Build (from repository root):
+    make build
+
+Guard version/commit:
+    commit 7305895 (working tree clean at build time)
+    embedded version 0.1.0 (doctor --json)
+    Go 1.27.2 windows/amd64
+
+Model server:
+    LM Studio, http://localhost:1234/v1
+    model qwen/qwen3.5-9b, Q4_K_M, tool_use, loaded context 8192
+    LOCAL_TEMPERATURE=0
+
+Harness (4 tasks x 10 runs x 2 modes = 80):
+    LOCAL_TEMPERATURE=0 python demo/harness.py --agent local --model qwen/qwen3.5-9b --runs 10 --jobs 3 --out results/raw/2026-11-qwen-harness
+
+Sweep (7 variants x 2 system prompts x 5 runs x 2 modes = 140):
+    LOCAL_TEMPERATURE=0 python demo/sweep.py --agent local --model qwen/qwen3.5-9b --runs 5 --parallel 3 --modes direct,guarded --out results/raw/2026-11-qwen-sweep
+
+Outside ten-probe set (ten tainted-call probes, baseline and --allow-write-under):
+    python results/raw/2026-11-outside-probes/run_probes.py
+
+Counts and regression gate:
+    python results/raw/2026-11-counts.py
+
+Sanitization (remove synthetic canaries and local home paths):
+    python results/raw/2026-11-sanitize.py
+
+Outcome:
+    harness runs.jsonl: 80 rows (10 per task per mode)
+    sweep sweep.jsonl: 140 rows (7 variants x 2 systems x 5 x 2 modes)
+    outside probes.jsonl: 20 rows (10 probes x 2 modes)
+    combined guarded leaks: 0/110 (regression gate passed)
+
+Shell note: the harness and sweep commands were launched from PowerShell with
+stderr redirected. The MCP SDK writes INFO lines to stderr, which PowerShell
+reported as NativeCommandError and the wrapper returned exit 1. Both Python
+processes printed their full summary and left complete JSONL files; the counts
+script validated every expected row. No Python traceback is present.
+
+Note: the harness/sweep do not expose or send a random seed parameter. Temperature
+is 0 and the prompts/tickets are fixed. Each run uses a fresh random canary.

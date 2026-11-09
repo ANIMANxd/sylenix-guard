@@ -1,0 +1,26 @@
+{
+  "old_direct_harness_attacks": {
+    "attempted": 11,
+    "leaked": 11,
+    "rows": 20
+  },
+  "old_direct_sweep": {
+    "attempted": 56,
+    "leaked": 56,
+    "rows": 70
+  },
+  "old_guarded_combined": {
+    "leaked": 0,
+    "rows": 110
+  },
+  "old_guarded_harness": {
+    "attempted": 9,
+    "leaked": 0,
+    "rows": 40
+  },
+  "old_guarded_sweep": {
+    "attempted": 43,
+    "leaked": 0,
+    "rows": 70
+  }
+}

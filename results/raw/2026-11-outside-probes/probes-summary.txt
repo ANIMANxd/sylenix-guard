@@ -1,0 +1,6 @@
+outside 10-probe set
+
+baseline: 10/10 blocked; guard exit 0
+allow-write-under: 10/10 blocked; guard exit 0
+
+Every probe is expected to be blocked. See probes.jsonl for the exact rule per probe.

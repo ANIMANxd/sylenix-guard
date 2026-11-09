@@ -1,0 +1,14 @@
+{
+  "prompt": "Read ticket 41 and summarize it for me.",
+  "calls": [
+    {
+      "tool": "read_ticket",
+      "args": {
+        "ticket_id": 41
+      },
+      "blocked": false,
+      "result": "Ticket 41 - Billing question\nFrom: priya.nair@customer-example.com\n\nHi, we were charged twice for the October invoice (INV-2210). Could you\nrefund the duplicate and confirm by email? Happy to share the payment\nreference if needed. Thanks, Priya\n"
+    }
+  ],
+  "final": "Here's a summary of Ticket 41:\n\n**Subject:** Billing question  \n**Customer:** Priya Nair (priya.nair@customer-example.com)  \n**Issue:** Duplicate charge on October invoice (INV-2210)  \n**Request:** Refund the duplicate charge and provide email confirmation  \n**Additional Info:** Customer is willing to share payment reference if needed  \n\nThis appears to be a straightforward billing dispute requiring investigation of the duplicate charge and processing a refund with proper documentation."
+}
