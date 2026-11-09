@@ -149,6 +149,10 @@ If `allowlist_enforced` is omitted, a non-empty `allowlist` enforces it and an
 empty one does not. `allowlist_enforced: true` with an empty list denies every
 server. New installs and `sylenix-guard allow` set enforcement to true.
 
+The allowlist is a launch control for a stdio child command. `sylenix-guard
+proxy` has no child command and does not apply it to `--upstream`; use a
+`servers.<name>` policy entry for the remote server's tool classes instead.
+
 `allow` and `install` rewrite the policy file in a canonical form. Known fields
 are preserved, but comments and original formatting are not.
 

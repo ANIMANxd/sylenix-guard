@@ -44,7 +44,7 @@ Sylenix Guard sits in-line between an agent runtime (Cursor, Claude Desktop, Lan
 It runs in two topologies:
 
 - **Mode 1, stdio interceptor:** sits between a host application and a spawned child MCP server, mediating the stdio JSON-RPC stream.
-- **Mode 2, Layer-7 reverse proxy:** mediates HTTP/mTLS, SSE, multi round-trip requests, and provider-native `/v1/chat/completions` and `/v1/messages` tool calls.
+- **Mode 2, Layer-7 reverse proxy:** mediates HTTP/mTLS, SSE, multi round-trip requests, and provider-native `/v1/chat/completions` and `/v1/messages` tool calls. The current build implements the Streamable HTTP MCP part (one remote server, MCP 2025-11-25, with 2026-07-28 tolerance); provider-native endpoints, multi-server routing, and credential brokering remain future work.
 
 **What it is not:** it does not see anything that does not pass through it (see section 3.4), and it does not secure the model's own replies to the user. It reduces and contains risk; it does not make an agent "safe" in general.
 

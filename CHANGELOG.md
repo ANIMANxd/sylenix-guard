@@ -2,6 +2,28 @@
 
 ## 2026-11-09
 
+### Streamable HTTP proxy
+
+- Added `sylenix-guard proxy --listen ADDR --upstream URL`, reusing the existing
+  `Guard` taint, pin, quarantine, hard-block, grant and approval core instead of
+  forking it. The listener defaults to `127.0.0.1:8080`; empty/`localhost` hosts
+  normalize to loopback.
+- Added Streamable HTTP transport handling for MCP 2025-11-25: POST JSON-RPC,
+  optional POST SSE and GET SSE, DELETE session termination, `Mcp-Session-Id`
+  pass-through, `MCP-Protocol-Version`, Origin validation, and the stateless
+  2026-07-28 shape. The legacy 2024-11-05 HTTP+SSE transport is not implemented.
+- Client auth headers (`Authorization`, `Cookie`, custom auth keys) are copied
+  to the configured upstream but never logged or persisted. Redirects are not
+  followed, and the audit `start` event redacts the upstream query string.
+- Added `tests/probes/test_http_proxy.py` plus `tests/probes/http_fake_server.py`:
+  the stdio and HTTP transports produce the same block sequence; POST/GET SSE,
+  server notifications, session IDs, auth pass-through, token non-persistence,
+  pin persistence and quarantine are covered. Added `make proxy-test` and
+  included it in `make check`.
+- Updated `README.md`, `docs/ARCHITECTURE.md`, `POC_SPIKE.md` (post-POC scope
+  note) and the build/test docs. Manual initialize/tools-list against
+  `https://mcp.deepwiki.com/mcp` succeeds over SSE.
+
 ### Doctor
 
 - Added `sylenix-guard doctor [--json] [--policy PATH] [--state-dir DIR]

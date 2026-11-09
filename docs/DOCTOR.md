@@ -119,7 +119,7 @@ cannot be used and `risk` for a configuration weakness.
 | Code | Meaning | Suggested fix |
 |---|---|---|
 | `NOT_WRAPPED` | A stdio server is not wrapped by Guard. | Run `sylenix-guard install` or wrap the entry manually. |
-| `REMOTE_NOT_COVERED` | The server uses HTTP/SSE/WebSocket transport, which this stdio build cannot mediate. | Use a local stdio server if you need Guard coverage. |
+| `REMOTE_NOT_COVERED` | The server uses HTTP/SSE/WebSocket transport, which `install` cannot wrap automatically. | Configure `sylenix-guard proxy --upstream <url>` manually, or use a local stdio server. |
 | `NOT_ALLOWLISTED` | The server command and arguments do not match any policy allowlist entry. | Run `sylenix-guard allow <name>` (or `install`). |
 | `ALLOWLIST_NOT_ENFORCED` | The policy has an allowlist but `allowlist_enforced` is false. | Set `allowlist_enforced: true` and keep exact entries. |
 | `ALLOWLIST_HASH_MISMATCH` | A matching allowlist entry has a `sha256` that does not match the resolved command or lockfile, or the hash target cannot be read. With the allowlist enforced, the guard would refuse to launch. | Re-run `sylenix-guard allow <name>` to refresh the hash. |

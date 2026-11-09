@@ -1,4 +1,4 @@
-.PHONY: build fmt vet selftest probe-test profile-test replay-test summary-test doctor-test clear-taint-test stats-test check harness-scripted
+.PHONY: build fmt vet selftest probe-test proxy-test profile-test replay-test summary-test doctor-test clear-taint-test stats-test check harness-scripted
 
 build:
 	CGO_ENABLED=0 go build -o bin/sylenix-guard ./cmd/sylenix-guard
@@ -23,6 +23,9 @@ probe-test: build
 	python3 tests/probes/test_allowlist.py
 	python3 tests/probes/test_install.py
 
+proxy-test: build
+	python3 tests/probes/test_http_proxy.py
+
 profile-test: build
 	python3 tests/probes/test_profiles.py
 
@@ -41,7 +44,7 @@ clear-taint-test: build
 stats-test: build
 	python3 tests/probes/test_stats.py
 
-check: fmt vet selftest probe-test profile-test replay-test summary-test doctor-test clear-taint-test stats-test
+check: fmt vet selftest probe-test proxy-test profile-test replay-test summary-test doctor-test clear-taint-test stats-test
 
 harness-scripted: build
 	.venv/bin/python demo/harness.py --agent scripted --runs 3 --out results-scripted

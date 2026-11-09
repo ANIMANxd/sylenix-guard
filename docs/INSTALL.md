@@ -19,7 +19,9 @@ is preceded by a timestamped backup next to the config:
 Only existing config files are edited; Guard does not create a config file.
 Remote/HTTP/SSE/WebSocket entries, entries already using Guard, malformed
 entries and unparseable configs are skipped and reported. A broken config is
-left untouched.
+left untouched. `install` cannot wrap a remote entry; configure
+`sylenix-guard proxy --listen ... --upstream ...` manually and point the client
+at the local listener instead.
 
 ## Exact config paths
 

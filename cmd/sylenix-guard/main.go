@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
@@ -194,6 +195,23 @@ type Guard struct {
 	log   *os.File
 }
 
+// guardOptions are the settings shared by the stdio proxy and the Streamable
+// HTTP proxy. The transport-specific code is only the wiring around them.
+type guardOptions struct {
+	Name            string
+	DefaultName     string
+	StateDir        string
+	PolicyPath      string
+	Readonly        string
+	Trust           string
+	Approve         string
+	NoSpotlight     bool
+	AllowWriteUnder []string
+	GrantSpecs      []string
+	Visited         map[string]bool
+	ServerArgs      []string
+}
+
 func main() {
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
@@ -207,6 +225,8 @@ func main() {
 			os.Exit(runAllowCommand(os.Args[2:]))
 		case "doctor":
 			os.Exit(runDoctorCommand(os.Args[2:]))
+		case "proxy":
+			os.Exit(runProxyCommand(os.Args[2:]))
 		case "clear-taint":
 			os.Exit(runClearTaintCommand(os.Args[2:]))
 		case "stats":
@@ -232,107 +252,27 @@ func main() {
 
 	args := flag.Args()
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: sylenix-guard [flags] -- <server command> [args...]")
+		fmt.Fprintln(os.Stderr, "usage: sylenix-guard [flags] -- <server command> [args...]\n       sylenix-guard proxy --listen ADDR --upstream URL [flags]")
 		os.Exit(2)
 	}
-	if visited["approve"] && *approve != "deny" && *approve != "dialog" {
-		fmt.Fprintln(os.Stderr, "sylenix-guard: --approve must be deny or dialog")
-		os.Exit(2)
-	}
-	var flagScratch []scratchRule
-	for _, spec := range allowWriteUnder {
-		tool, dir := "", spec
-		if i := strings.Index(spec, "="); i >= 0 {
-			tool, dir = spec[:i], spec[i+1:]
-		}
-		if dir == "" || strings.ContainsAny(tool, `/\`) {
-			fmt.Fprintln(os.Stderr, "sylenix-guard: --allow-write-under wants DIR or TOOL=DIR")
-			os.Exit(2)
-		}
-		if real, ok := canonicalPath(dir); ok {
-			dir = real
-		}
-		flagScratch = append(flagScratch, scratchRule{tool: tool, dir: dir})
-	}
-	var seeded []grant
-	for _, spec := range grantSpecs {
-		i := strings.LastIndex(spec, "=")
-		if i <= 0 {
-			fmt.Fprintln(os.Stderr, "sylenix-guard: --grant wants TOOL[:DIR]=DURATION, for example write_file=15m")
-			os.Exit(2)
-		}
-		dur, err := time.ParseDuration(spec[i+1:])
-		if err != nil || dur <= 0 {
-			fmt.Fprintln(os.Stderr, "sylenix-guard: --grant duration must be positive, for example write_file=15m")
-			os.Exit(2)
-		}
-		tool, dir := spec[:i], ""
-		if j := strings.Index(tool, ":"); j >= 0 {
-			tool, dir = tool[:j], tool[j+1:]
-		}
-		if tool == "" || strings.ContainsAny(tool, `/\`) {
-			fmt.Fprintln(os.Stderr, "sylenix-guard: --grant wants TOOL[:DIR]=DURATION, for example write_file=15m")
-			os.Exit(2)
-		}
-		if dir != "" {
-			if real, ok := canonicalPath(dir); ok {
-				dir = real
-			}
-		}
-		seeded = append(seeded, grant{tool: tool, dir: dir, expires: time.Now().Add(dur)})
-	}
-	nameExplicit := visited["name"] && *name != ""
-	if *name == "" {
-		*name = filepath.Base(args[0])
-	}
-	if *stateDir == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "sylenix-guard: cannot find home directory; pass --state-dir")
-			os.Exit(2)
-		}
-		*stateDir = filepath.Join(home, ".sylenix-poc")
-	}
-	if err := os.MkdirAll(*stateDir, 0o700); err != nil {
-		fmt.Fprintln(os.Stderr, "sylenix-guard:", err)
-		os.Exit(2)
-	}
-	logf, err := os.OpenFile(filepath.Join(*stateDir, "audit-"+*name+".jsonl"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	g, err := prepareGuard(guardOptions{
+		Name:            *name,
+		DefaultName:     filepath.Base(args[0]),
+		StateDir:        *stateDir,
+		PolicyPath:      *policyPath,
+		Readonly:        *readonly,
+		Trust:           *trust,
+		Approve:         *approve,
+		NoSpotlight:     *noSpot,
+		AllowWriteUnder: allowWriteUnder,
+		GrantSpecs:      grantSpecs,
+		Visited:         visited,
+		ServerArgs:      args,
+	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "sylenix-guard:", err)
 		os.Exit(2)
 	}
-
-	g := &Guard{
-		name:        *name,
-		stateDir:    *stateDir,
-		approve:     "deny",
-		spotlight:   true,
-		pending:     map[string]pendingReq{},
-		pins:        map[string]string{},
-		quarantined: map[string]string{},
-		grants:      seeded,
-		out:         os.Stdout,
-		log:         logf,
-	}
-	pf, source, resolvedPath, err := loadPolicyForRun(*policyPath, visited["policy"], *stateDir, *name, nameExplicit)
-	if err != nil {
-		g.event("policy_invalid", map[string]any{"source": source, "reason": err.Error()})
-		fmt.Fprintln(os.Stderr, "sylenix-guard:", err)
-		os.Exit(2)
-	}
-	g.policySource = source
-	g.policyVersion = pf.Version
-	g.policyPath = resolvedPath
-	profile := selectPolicyProfile(*name, args, pf.Profile)
-	if profile != nil {
-		g.profileName = profile.name
-		g.profileSource = profile.source
-	}
-	g.applyPolicy(pf, profile, visited, *readonly, *trust, *approve, flagScratch, *noSpot)
-	printPolicyDeprecationNotes(visited, *policyPath, source)
-	g.event("policy_loaded", map[string]any{"source": source, "version": pf.Version, "approve": g.approve,
-		"profile": g.profileName, "profile_source": g.profileSource})
 	if allowed, reason := g.checkServerAllowed(args); !allowed {
 		g.event("block", map[string]any{"rule": "SERVER_NOT_ALLOWED", "command": args[0], "detail": reason})
 		fmt.Fprintf(os.Stderr, "[sylenix-guard] SERVER_NOT_ALLOWED: %s\n", reason)
@@ -469,6 +409,825 @@ func main() {
 	control.stop()
 	g.event("exit", map[string]any{"code": code})
 	os.Exit(code)
+}
+
+// prepareGuard builds the shared Guard state used by both transports. It does
+// not launch anything and does not check the server-command allowlist, because
+// that check belongs to the stdio transport that has a child command.
+func prepareGuard(opts guardOptions) (*Guard, error) {
+	visited := opts.Visited
+	if visited == nil {
+		visited = map[string]bool{}
+	}
+	if visited["approve"] && opts.Approve != "deny" && opts.Approve != "dialog" {
+		return nil, fmt.Errorf("--approve must be deny or dialog")
+	}
+
+	var flagScratch []scratchRule
+	for _, spec := range opts.AllowWriteUnder {
+		tool, dir := "", spec
+		if i := strings.Index(spec, "="); i >= 0 {
+			tool, dir = spec[:i], spec[i+1:]
+		}
+		if dir == "" || strings.ContainsAny(tool, `/\`) {
+			return nil, fmt.Errorf("--allow-write-under wants DIR or TOOL=DIR")
+		}
+		if real, ok := canonicalPath(dir); ok {
+			dir = real
+		}
+		flagScratch = append(flagScratch, scratchRule{tool: tool, dir: dir})
+	}
+
+	var seeded []grant
+	for _, spec := range opts.GrantSpecs {
+		i := strings.LastIndex(spec, "=")
+		if i <= 0 {
+			return nil, fmt.Errorf("--grant wants TOOL[:DIR]=DURATION, for example write_file=15m")
+		}
+		dur, err := time.ParseDuration(spec[i+1:])
+		if err != nil || dur <= 0 {
+			return nil, fmt.Errorf("--grant duration must be positive, for example write_file=15m")
+		}
+		tool, dir := spec[:i], ""
+		if j := strings.Index(tool, ":"); j >= 0 {
+			tool, dir = tool[:j], tool[j+1:]
+		}
+		if tool == "" || strings.ContainsAny(tool, `/\`) {
+			return nil, fmt.Errorf("--grant wants TOOL[:DIR]=DURATION, for example write_file=15m")
+		}
+		if dir != "" {
+			if real, ok := canonicalPath(dir); ok {
+				dir = real
+			}
+		}
+		seeded = append(seeded, grant{tool: tool, dir: dir, expires: time.Now().Add(dur)})
+	}
+
+	name := opts.Name
+	nameExplicit := visited["name"] && name != ""
+	if name == "" {
+		name = opts.DefaultName
+	}
+	if name == "" {
+		return nil, fmt.Errorf("--name is required")
+	}
+	if !validDoctorName(name) {
+		return nil, fmt.Errorf("--name must be a simple name without path separators or control characters")
+	}
+
+	stateDir := opts.StateDir
+	if stateDir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return nil, fmt.Errorf("cannot find home directory; pass --state-dir")
+		}
+		stateDir = filepath.Join(home, ".sylenix-poc")
+	}
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		return nil, err
+	}
+	logf, err := os.OpenFile(filepath.Join(stateDir, "audit-"+name+".jsonl"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return nil, err
+	}
+
+	g := &Guard{
+		name:        name,
+		stateDir:    stateDir,
+		approve:     "deny",
+		spotlight:   true,
+		pending:     map[string]pendingReq{},
+		pins:        map[string]string{},
+		quarantined: map[string]string{},
+		grants:      seeded,
+		out:         os.Stdout,
+		log:         logf,
+	}
+	pf, source, resolvedPath, err := loadPolicyForRun(opts.PolicyPath, visited["policy"], stateDir, name, nameExplicit)
+	if err != nil {
+		g.event("policy_invalid", map[string]any{"source": source, "reason": err.Error()})
+		_ = logf.Close()
+		return nil, err
+	}
+	g.policySource = source
+	g.policyVersion = pf.Version
+	g.policyPath = resolvedPath
+	profile := selectPolicyProfile(name, opts.ServerArgs, pf.Profile)
+	if profile != nil {
+		g.profileName = profile.name
+		g.profileSource = profile.source
+	}
+	g.applyPolicy(pf, profile, visited, opts.Readonly, opts.Trust, opts.Approve, flagScratch, opts.NoSpotlight)
+	printPolicyDeprecationNotes(visited, opts.PolicyPath, source)
+	g.event("policy_loaded", map[string]any{"source": source, "version": pf.Version, "approve": g.approve,
+		"profile": g.profileName, "profile_source": g.profileSource})
+	return g, nil
+}
+
+// ---------------------------------------------------------------- streamable HTTP proxy
+
+// guardFlagValues is the common proxy configuration. The stdio path keeps its
+// own flag declarations because it also has a positional server command.
+type guardFlagValues struct {
+	Name            string
+	StateDir        string
+	PolicyPath      string
+	Readonly        string
+	Trust           string
+	Approve         string
+	NoSpotlight     bool
+	ResetPins       bool
+	AllowWriteUnder stringList
+	GrantSpecs      stringList
+}
+
+func registerGuardFlags(fs *flag.FlagSet, v *guardFlagValues) {
+	fs.StringVar(&v.Name, "name", "", "label for this server; names the pin and log files (default: upstream host)")
+	fs.StringVar(&v.StateDir, "state-dir", "", "directory for pins and the audit log (default ~/.sylenix-poc)")
+	fs.StringVar(&v.PolicyPath, "policy", "", "path to a versioned policy file (default: <state-dir>/policy.yaml, else built-in defaults)")
+	fs.StringVar(&v.Readonly, "readonly", "", "comma-separated tools that stay allowed when the session is tainted")
+	fs.StringVar(&v.Trust, "trust", "", "comma-separated tools whose results do NOT taint the session")
+	fs.StringVar(&v.Approve, "approve", "deny", "what to do with a blocked call: deny | dialog")
+	fs.BoolVar(&v.NoSpotlight, "no-spotlight", false, "do not datamark untrusted tool results")
+	fs.BoolVar(&v.ResetPins, "reset-pins", false, "discard existing pins and trust every tool as new on first sight")
+	fs.Var(&v.AllowWriteUnder, "allow-write-under", "tainted calls need no prompt while every path argument stays inside DIR, or TOOL=DIR to scope it to one tool; repeatable")
+	fs.Var(&v.GrantSpecs, "grant", "pre-approved sink calls: TOOL[:DIR]=DURATION (for example write_file=15m); repeatable")
+}
+
+type sseEvent struct {
+	event   string
+	id      string
+	retry   string
+	data    []string
+	hasData bool
+}
+
+func (e *sseEvent) reset() {
+	*e = sseEvent{}
+}
+
+type proxyHandler struct {
+	g        *Guard
+	upstream *url.URL
+	client   *http.Client
+}
+
+var hopHeaders = map[string]bool{
+	"connection":          true,
+	"proxy-connection":    true,
+	"keep-alive":          true,
+	"proxy-authenticate":  true,
+	"proxy-authorization": true,
+	"te":                  true,
+	"trailer":             true,
+	"transfer-encoding":   true,
+	"upgrade":             true,
+}
+
+func isHopHeader(k string) bool {
+	return hopHeaders[strings.ToLower(k)]
+}
+
+func runProxyCommand(args []string) int {
+	fs := flag.NewFlagSet("proxy", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	listen := fs.String("listen", "127.0.0.1:8080", "local address to bind (default 127.0.0.1:8080)")
+	upstreamRaw := fs.String("upstream", "", "upstream Streamable HTTP MCP endpoint, for example https://example.com/mcp")
+	var vals guardFlagValues
+	registerGuardFlags(fs, &vals)
+	if err := fs.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			return 0
+		}
+		return 2
+	}
+	visited := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { visited[f.Name] = true })
+	if fs.NArg() != 0 {
+		fmt.Fprintln(os.Stderr, "sylenix-guard proxy: unexpected arguments")
+		return 2
+	}
+	if strings.TrimSpace(*upstreamRaw) == "" {
+		fmt.Fprintln(os.Stderr, "sylenix-guard proxy: --upstream is required")
+		return 2
+	}
+	upstream, err := url.Parse(strings.TrimSpace(*upstreamRaw))
+	if err != nil || upstream.Scheme == "" || upstream.Host == "" {
+		fmt.Fprintln(os.Stderr, "sylenix-guard proxy: --upstream must be an absolute http(s) URL")
+		return 2
+	}
+	if !strings.EqualFold(upstream.Scheme, "http") && !strings.EqualFold(upstream.Scheme, "https") {
+		fmt.Fprintln(os.Stderr, "sylenix-guard proxy: --upstream must use http or https")
+		return 2
+	}
+	if upstream.Fragment != "" {
+		fmt.Fprintln(os.Stderr, "sylenix-guard proxy: --upstream must not contain a fragment")
+		return 2
+	}
+	listenAddr, err := normalizeListenAddr(*listen)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "sylenix-guard proxy:", err)
+		return 2
+	}
+
+	g, err := prepareGuard(guardOptions{
+		Name:            vals.Name,
+		DefaultName:     defaultProxyName(upstream),
+		StateDir:        vals.StateDir,
+		PolicyPath:      vals.PolicyPath,
+		Readonly:        vals.Readonly,
+		Trust:           vals.Trust,
+		Approve:         vals.Approve,
+		NoSpotlight:     vals.NoSpotlight,
+		AllowWriteUnder: vals.AllowWriteUnder,
+		GrantSpecs:      vals.GrantSpecs,
+		Visited:         visited,
+		ServerArgs:      []string{upstream.Hostname(), upstream.Path},
+	})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "sylenix-guard proxy:", err)
+		return 2
+	}
+	defer func() { _ = g.log.Close() }()
+	g.out = io.Discard
+	if !g.loadPins(vals.ResetPins) {
+		fmt.Fprintf(os.Stderr, "[sylenix-guard] pin file %s exists but cannot be read; refusing to start. Inspect it, or restart with --reset-pins to trust every tool as new.\n", g.pinsPath())
+		return 2
+	}
+
+	ln, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "sylenix-guard proxy: cannot listen:", err)
+		return 1
+	}
+	defer func() { _ = ln.Close() }()
+
+	control, controlErr := startGuardControl(g)
+	if controlErr != nil {
+		g.event("control_unavailable", map[string]any{"reason": "cannot create clear-taint control"})
+		fmt.Fprintln(os.Stderr, "sylenix-guard: clear-taint unavailable:", controlErr)
+	}
+
+	g.event("start", map[string]any{
+		"transport":         "streamable-http",
+		"listen":            ln.Addr().String(),
+		"upstream":          redactURL(upstream),
+		"readonly":          sortedKeys(g.readonly),
+		"trust":             sortedKeys(g.trust),
+		"approve":           g.approve,
+		"policy_source":     g.policySource,
+		"policy_version":    g.policyVersion,
+		"profile":           g.profileName,
+		"profile_source":    g.profileSource,
+		"allow_write_under": []string(vals.AllowWriteUnder),
+		"grants":            []string(vals.GrantSpecs),
+	})
+
+	handler := &proxyHandler{g: g, upstream: upstream, client: newProxyClient()}
+	srv := &http.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.Serve(ln) }()
+
+	fmt.Fprintf(os.Stderr, "[sylenix-guard] proxy listening on http://%s/mcp (upstream %s)\n",
+		ln.Addr().String(), redactURL(upstream))
+
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	select {
+	case <-sig:
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = srv.Shutdown(ctx)
+		cancel()
+		_ = srv.Close()
+		control.stop()
+		g.event("exit", map[string]any{"code": 0})
+		return 0
+	case serveErr := <-errCh:
+		control.stop()
+		code := 0
+		if serveErr != nil && serveErr != http.ErrServerClosed {
+			code = 1
+			fmt.Fprintln(os.Stderr, "sylenix-guard proxy:", serveErr)
+		}
+		g.event("exit", map[string]any{"code": code})
+		return code
+	}
+}
+
+func normalizeListenAddr(s string) (string, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		s = "127.0.0.1:8080"
+	}
+	host, port, err := net.SplitHostPort(s)
+	if err != nil {
+		return "", fmt.Errorf("--listen must be host:port, for example 127.0.0.1:8080: %w", err)
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil || n < 0 || n > 65535 {
+		return "", fmt.Errorf("--listen has an invalid port")
+	}
+	if host == "" || strings.EqualFold(host, "localhost") {
+		host = "127.0.0.1"
+	}
+	if host == "*" {
+		host = "0.0.0.0"
+	}
+	return net.JoinHostPort(host, port), nil
+}
+
+func defaultProxyName(u *url.URL) string {
+	host := u.Hostname()
+	if host == "" {
+		return "proxy"
+	}
+	var b strings.Builder
+	for _, r := range host {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '.' || r == '-' || r == '_' {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('_')
+		}
+	}
+	name := strings.Trim(b.String(), "._-")
+	if name == "" {
+		return "proxy"
+	}
+	return name
+}
+
+func redactURL(u *url.URL) string {
+	if u == nil {
+		return ""
+	}
+	c := *u
+	c.User = nil
+	c.RawQuery = ""
+	c.Fragment = ""
+	return c.String()
+}
+
+func newProxyClient() *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{
+			Proxy:                 http.ProxyFromEnvironment,
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		},
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
+
+func (p *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if !originAllowed(r) {
+		writeMCPError(w, http.StatusForbidden, nil, -32600, "Forbidden", "ORIGIN_FORBIDDEN", r.Header.Get("Mcp-Session-Id"))
+		return
+	}
+	switch r.Method {
+	case http.MethodPost:
+		p.handlePost(w, r)
+	case http.MethodGet:
+		p.handleGet(w, r)
+	case http.MethodDelete:
+		p.handleDelete(w, r)
+	case http.MethodOptions:
+		w.Header().Set("Allow", "POST, GET, DELETE, OPTIONS")
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		w.Header().Set("Allow", "POST, GET, DELETE, OPTIONS")
+		writeMCPError(w, http.StatusMethodNotAllowed, nil, -32600, "Method not allowed", "METHOD_NOT_ALLOWED", r.Header.Get("Mcp-Session-Id"))
+	}
+}
+
+func originAllowed(r *http.Request) bool {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+		return true
+	}
+	return host == strings.ToLower(stripHostPort(r.Host))
+}
+
+func stripHostPort(h string) string {
+	if host, _, err := net.SplitHostPort(h); err == nil {
+		return host
+	}
+	return strings.Trim(h, "[]")
+}
+
+func (p *proxyHandler) handlePost(w http.ResponseWriter, r *http.Request) {
+	body, tooLarge, err := readLimited(r.Body)
+	if err != nil {
+		writeMCPError(w, http.StatusBadRequest, nil, -32700, "Parse error", "UNPARSEABLE", r.Header.Get("Mcp-Session-Id"))
+		return
+	}
+	if tooLarge {
+		writeMCPError(w, http.StatusRequestEntityTooLarge, nil, -32600, "Frame too large", "FRAME_TOO_LARGE", r.Header.Get("Mcp-Session-Id"))
+		return
+	}
+	body = bytes.TrimSpace(body)
+	if len(body) == 0 {
+		writeMCPError(w, http.StatusBadRequest, nil, -32700, "Parse error", "UNPARSEABLE", r.Header.Get("Mcp-Session-Id"))
+		return
+	}
+
+	forward, reply := p.g.fromHost(body)
+	if reply != nil {
+		writeJSONRPC(w, http.StatusOK, reply, r.Header.Get("Mcp-Session-Id"))
+		return
+	}
+	if !forward {
+		w.Header().Set("Mcp-Session-Id", r.Header.Get("Mcp-Session-Id"))
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+
+	resp, ok := p.doUpstream(w, r, http.MethodPost, body)
+	if !ok {
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
+	copyResponseHeaders(w.Header(), resp.Header)
+
+	reqID := idFromBody(body)
+	if isEventStream(resp.Header.Get("Content-Type")) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache, no-transform")
+		w.Header().Set("X-Accel-Buffering", "no")
+		w.Header().Del("Content-Length")
+		w.WriteHeader(resp.StatusCode)
+		p.streamSSE(w, resp.Body, reqID)
+		return
+	}
+
+	data, tooLarge, err := readLimited(resp.Body)
+	if err != nil {
+		p.failHTTPRequest(w, reqID, http.StatusBadGateway, "Upstream read failed", "UPSTREAM_ERROR", r.Header.Get("Mcp-Session-Id"))
+		return
+	}
+	if tooLarge {
+		p.g.latch("oversize_server_frame")
+		p.g.event("server_frame_too_large", map[string]any{"fatal": false})
+		p.failHTTPRequest(w, reqID, http.StatusBadGateway, "Server frame too large", "SERVER_FRAME_TOO_LARGE", r.Header.Get("Mcp-Session-Id"))
+		return
+	}
+	if len(data) > 0 && (isJSONRPC(data) || (resp.StatusCode >= 200 && resp.StatusCode < 300)) {
+		data = p.g.fromServer(data)
+	}
+	if len(reqID) > 0 && p.g.isPending(reqID) {
+		switch {
+		case len(data) == 0 && resp.StatusCode >= 200 && resp.StatusCode < 300:
+			data = p.g.failOne(reqID, -32000, "Server stream closed", "SERVER_STREAM_CLOSED")
+		case isJSONRPC(data):
+			p.g.take(reqID)
+		default:
+			p.g.take(reqID)
+		}
+	}
+	if isJSONRPC(data) {
+		w.Header().Set("Content-Type", "application/json")
+	}
+	w.Header().Del("Content-Length")
+	w.Header().Del("Content-Encoding")
+	if len(data) > 0 && resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotModified {
+		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	}
+	w.WriteHeader(resp.StatusCode)
+	if len(data) > 0 && resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotModified {
+		_, _ = w.Write(data)
+	}
+}
+
+func (p *proxyHandler) handleGet(w http.ResponseWriter, r *http.Request) {
+	resp, ok := p.doUpstream(w, r, http.MethodGet, nil)
+	if !ok {
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
+	copyResponseHeaders(w.Header(), resp.Header)
+	if isEventStream(resp.Header.Get("Content-Type")) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache, no-transform")
+		w.Header().Set("X-Accel-Buffering", "no")
+		w.Header().Del("Content-Length")
+		w.WriteHeader(resp.StatusCode)
+		p.streamSSE(w, resp.Body, nil)
+		return
+	}
+	data, tooLarge, err := readLimited(resp.Body)
+	if err != nil || tooLarge {
+		http.Error(w, "upstream read failed", http.StatusBadGateway)
+		return
+	}
+	w.Header().Del("Content-Length")
+	w.Header().Del("Content-Encoding")
+	if len(data) > 0 && resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotModified {
+		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	}
+	w.WriteHeader(resp.StatusCode)
+	if len(data) > 0 && resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotModified {
+		_, _ = w.Write(data)
+	}
+}
+
+func (p *proxyHandler) handleDelete(w http.ResponseWriter, r *http.Request) {
+	resp, ok := p.doUpstream(w, r, http.MethodDelete, nil)
+	if !ok {
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
+	copyResponseHeaders(w.Header(), resp.Header)
+	data, tooLarge, err := readLimited(resp.Body)
+	if err != nil || tooLarge {
+		http.Error(w, "upstream read failed", http.StatusBadGateway)
+		return
+	}
+	w.Header().Del("Content-Length")
+	w.Header().Del("Content-Encoding")
+	if len(data) > 0 && resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotModified {
+		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	}
+	w.WriteHeader(resp.StatusCode)
+	if len(data) > 0 && resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotModified {
+		_, _ = w.Write(data)
+	}
+}
+
+func (p *proxyHandler) doUpstream(w http.ResponseWriter, r *http.Request, method string, body []byte) (*http.Response, bool) {
+	u := p.resolveUpstream(r)
+	var reader io.Reader
+	if body != nil {
+		reader = bytes.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(r.Context(), method, u.String(), reader)
+	if err != nil {
+		p.failHTTPRequest(w, idFromBody(body), http.StatusBadGateway, "Upstream request failed", "UPSTREAM_ERROR", r.Header.Get("Mcp-Session-Id"))
+		return nil, false
+	}
+	copyRequestHeaders(req.Header, r.Header)
+	if method == http.MethodPost {
+		req.Header.Set("Content-Type", "application/json")
+		if req.Header.Get("Accept") == "" {
+			req.Header.Set("Accept", "application/json, text/event-stream")
+		}
+	} else if method == http.MethodGet {
+		if req.Header.Get("Accept") == "" {
+			req.Header.Set("Accept", "text/event-stream")
+		}
+	}
+	resp, err := p.client.Do(req)
+	if err != nil {
+		p.failHTTPRequest(w, idFromBody(body), http.StatusBadGateway, "Upstream request failed", "UPSTREAM_ERROR", r.Header.Get("Mcp-Session-Id"))
+		return nil, false
+	}
+	return resp, true
+}
+
+func (p *proxyHandler) failHTTPRequest(w http.ResponseWriter, id json.RawMessage, status int, msg, rule, session string) {
+	if len(id) > 0 {
+		if reply := p.g.failOne(id, -32000, msg, rule); reply != nil {
+			writeJSONRPC(w, status, reply, session)
+			return
+		}
+	}
+	http.Error(w, msg, status)
+}
+
+func (p *proxyHandler) resolveUpstream(r *http.Request) *url.URL {
+	u := *p.upstream
+	if u.Path == "" || u.Path == "/" {
+		u.Path = r.URL.Path
+		if u.Path == "" {
+			u.Path = "/"
+		}
+		u.RawPath = ""
+	}
+	if r.URL.RawQuery != "" {
+		if u.RawQuery == "" {
+			u.RawQuery = r.URL.RawQuery
+		} else {
+			u.RawQuery += "&" + r.URL.RawQuery
+		}
+	}
+	return &u
+}
+
+func copyRequestHeaders(dst, src http.Header) {
+	for k, values := range src {
+		if isHopHeader(k) || strings.EqualFold(k, "Host") || strings.EqualFold(k, "Content-Length") ||
+			strings.EqualFold(k, "Accept-Encoding") || strings.EqualFold(k, "Origin") {
+			continue
+		}
+		for _, v := range values {
+			dst.Add(k, v)
+		}
+	}
+}
+
+func copyResponseHeaders(dst, src http.Header) {
+	for k, values := range src {
+		if isHopHeader(k) || strings.EqualFold(k, "Content-Length") || strings.EqualFold(k, "Content-Encoding") {
+			continue
+		}
+		for _, v := range values {
+			dst.Add(k, v)
+		}
+	}
+}
+
+func readLimited(r io.Reader) ([]byte, bool, error) {
+	b, err := io.ReadAll(io.LimitReader(r, int64(maxFrame)+1))
+	if err != nil {
+		return nil, false, err
+	}
+	if len(b) > maxFrame {
+		return nil, true, nil
+	}
+	return b, false, nil
+}
+
+func idFromBody(body []byte) json.RawMessage {
+	var f frame
+	if json.Unmarshal(bytes.TrimSpace(body), &f) != nil {
+		return nil
+	}
+	return f["id"]
+}
+
+func isJSONRPC(b []byte) bool {
+	var f frame
+	if json.Unmarshal(bytes.TrimSpace(b), &f) != nil {
+		return false
+	}
+	_, ok := f["jsonrpc"]
+	return ok
+}
+
+func isEventStream(contentType string) bool {
+	contentType = strings.ToLower(strings.TrimSpace(contentType))
+	return strings.HasPrefix(contentType, "text/event-stream")
+}
+
+func writeJSONRPC(w http.ResponseWriter, status int, body []byte, session string) {
+	w.Header().Set("Content-Type", "application/json")
+	if session != "" {
+		w.Header().Set("Mcp-Session-Id", session)
+	}
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(status)
+	_, _ = w.Write(body)
+}
+
+func writeMCPError(w http.ResponseWriter, status int, id json.RawMessage, code int, msg, rule, session string) {
+	writeJSONRPC(w, status, errorFrame(id, code, msg, rule), session)
+}
+
+func (p *proxyHandler) streamSSE(w http.ResponseWriter, body io.Reader, reqID json.RawMessage) {
+	defer p.finishPending(w, reqID)
+	reader := bufio.NewReaderSize(body, 64*1024)
+	var ev sseEvent
+
+	dispatch := func() error {
+		if !ev.hasData && ev.event == "" && ev.id == "" && ev.retry == "" {
+			ev.reset()
+			return nil
+		}
+		var data []byte
+		if ev.hasData {
+			payload := strings.Join(ev.data, "\n")
+			if strings.TrimSpace(payload) != "" {
+				data = p.g.fromServer([]byte(payload))
+				if data == nil {
+					ev.reset()
+					return nil
+				}
+			}
+		}
+		err := writeSSEEvent(w, ev, data)
+		ev.reset()
+		return err
+	}
+
+	for {
+		line, tooLong, broken, err := readFrame(reader, maxFrame)
+		if tooLong {
+			p.g.latch("oversize_server_frame")
+			p.g.event("server_frame_too_large", map[string]any{"fatal": broken})
+			if b := p.g.failOne(reqID, -32000, "Server frame too large", "SERVER_FRAME_TOO_LARGE"); b != nil {
+				_ = writeSSEEvent(w, sseEvent{hasData: true}, b)
+			}
+			return
+		}
+		if len(line) == 0 {
+			if err != nil {
+				_ = dispatch()
+				return
+			}
+			if err := dispatch(); err != nil {
+				return
+			}
+			continue
+		}
+		s := strings.TrimSuffix(string(line), "\r")
+		if s == "" {
+			if err := dispatch(); err != nil {
+				return
+			}
+			continue
+		}
+		if strings.HasPrefix(s, ":") {
+			if _, err := io.WriteString(w, s+"\n"); err != nil {
+				return
+			}
+			flushResponse(w)
+			continue
+		}
+		field, value := s, ""
+		if i := strings.IndexByte(s, ':'); i >= 0 {
+			field, value = s[:i], s[i+1:]
+			if strings.HasPrefix(value, " ") {
+				value = value[1:]
+			}
+		}
+		switch field {
+		case "event":
+			ev.event = value
+		case "id":
+			ev.id = value
+		case "retry":
+			ev.retry = value
+		case "data":
+			ev.data = append(ev.data, value)
+			ev.hasData = true
+		}
+		if err != nil {
+			_ = dispatch()
+			return
+		}
+	}
+}
+
+func writeSSEEvent(w http.ResponseWriter, ev sseEvent, data []byte) error {
+	var b strings.Builder
+	if ev.event != "" {
+		fmt.Fprintf(&b, "event: %s\n", ev.event)
+	}
+	if ev.id != "" {
+		fmt.Fprintf(&b, "id: %s\n", ev.id)
+	}
+	if ev.retry != "" {
+		fmt.Fprintf(&b, "retry: %s\n", ev.retry)
+	}
+	if ev.hasData {
+		if len(data) == 0 {
+			b.WriteString("data:\n")
+		} else {
+			for _, line := range strings.Split(string(data), "\n") {
+				b.WriteString("data: ")
+				b.WriteString(line)
+				b.WriteByte('\n')
+			}
+		}
+	}
+	b.WriteByte('\n')
+	if _, err := io.WriteString(w, b.String()); err != nil {
+		return err
+	}
+	flushResponse(w)
+	return nil
+}
+
+func flushResponse(w http.ResponseWriter) {
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (p *proxyHandler) finishPending(w http.ResponseWriter, reqID json.RawMessage) {
+	if len(reqID) == 0 {
+		return
+	}
+	if _, ok := p.g.take(reqID); !ok {
+		return
+	}
+	b := errorFrame(reqID, -32000, "Server stream closed", "SERVER_STREAM_CLOSED")
+	_ = writeSSEEvent(w, sseEvent{hasData: true}, b)
 }
 
 // ---------------------------------------------------------------- policy file
@@ -4563,6 +5322,17 @@ func (g *Guard) failPending(code int, msg, rule string) {
 	}
 }
 
+// failOne removes one pending request and returns an error frame for it. It is
+// used by the HTTP transport when an upstream failure means no response will
+// ever arrive.
+func (g *Guard) failOne(id json.RawMessage, code int, msg, rule string) []byte {
+	if len(id) == 0 {
+		return nil
+	}
+	g.take(id)
+	return errorFrame(id, code, msg, rule)
+}
+
 func (g *Guard) take(id json.RawMessage) (pendingReq, bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -5778,8 +6548,8 @@ func (d *doctorRun) inspectServer(s *doctorServer, view *doctorServerView, expli
 	}
 
 	if s.Remote {
-		add("REMOTE_NOT_COVERED", "risk", "remote MCP transport is not covered by Guard",
-			"use a local stdio server if you need Guard coverage")
+		add("REMOTE_NOT_COVERED", "risk", "remote MCP transport is not wrapped by install",
+			"configure `sylenix-guard proxy --upstream <url>` manually, or use a local stdio server")
 		return findings
 	}
 	if !s.Wrapped {

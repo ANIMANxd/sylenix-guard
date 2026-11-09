@@ -5,8 +5,8 @@
 Sylenix Guard is a transparent gateway that sits between an AI agent host and an MCP
 server. It enforces a single premise: content returned by tools is untrusted input, and
 no action with real-world side effects may be taken on the basis of untrusted content
-without explicit authorization. It inspects the JSON-RPC stream on stdio, tracks the
-provenance of every byte the agent sees, and gates each tool call against a deterministic
+without explicit authorization. It inspects the JSON-RPC stream on stdio or Streamable
+HTTP, tracks the provenance of every byte the agent sees, and gates each tool call against a deterministic
 policy — forward, require a human decision, or block. There is no model in the loop: the
 same request produces the same decision every time.
 
@@ -55,15 +55,18 @@ requires authorization that the agent cannot grant itself.
    **Allow Tool for 15m**. A 15-minute approval is scoped to the directory the approved
    call touched and is held in memory for the life of the process.
 
-## Current state: proof of concept
+## Current state
 
 The enforcement core above is implemented, tested and measured. The implementation is a
 single Go binary (`cmd/sylenix-guard/main.go`) using only the standard library, and it
-wraps one MCP server per process over stdio.
+wraps one MCP server per process over stdio or Streamable HTTP.
 
 **Implemented today**
 
 - Transparent stdio proxy for one MCP server, no handshake changes
+- Streamable HTTP proxy for one remote MCP server (`proxy --listen ... --upstream ...`),
+  including POST and GET SSE, `Mcp-Session-Id` pass-through, and auth-header pass-through
+  without logging or persisting tokens
 - `install`/`uninstall` wrappers for Claude Desktop, Claude Code, Cursor and VS Code configs, with backups, diffs, confirmation and dry-run
 - Tool-definition pinning (trust on first use) with quarantine on change or hidden characters
 - Result datamarking and invisible-character stripping, including `structuredContent`
@@ -91,10 +94,11 @@ wraps one MCP server per process over stdio.
 - Fail-closed handling of malformed, duplicate, batched and oversize frames
 
 **Not in this build** — OS sandboxing, credential brokering, a confidentiality latch,
-signed pin files, remote or biometric approval, evidence ledgers, HTTP transport, and
-multi-server sessions. The full product architecture is specified in
-[`docs/SPEC_FULL.md`](docs/SPEC_FULL.md); those layers are deliberately left out of the
-current build. Scope and behavior are governed by [`POC_SPIKE.md`](POC_SPIKE.md).
+signed pin files, remote or biometric approval, evidence ledgers, multi-server sessions,
+OAuth token storage/refresh, and the legacy HTTP+SSE transport from 2024-11-05. The full
+product architecture is specified in [`docs/SPEC_FULL.md`](docs/SPEC_FULL.md); those
+layers are deliberately left out of the current build. Scope and behavior are governed
+by [`POC_SPIKE.md`](POC_SPIKE.md).
 
 ## Getting started
 
@@ -109,7 +113,9 @@ CGO_ENABLED=0 go build -o bin/sylenix-guard ./cmd/sylenix-guard
 CGO_ENABLED=0 go build -o bin/sylenix-guard.exe ./cmd/sylenix-guard
 ```
 
-`make check` runs gofmt, go vet, the protocol self-test, the probe suites, the built-in profile tests, the prompt-cost replay, the audit summarizer fixture and the doctor probes.
+`make check` runs gofmt, go vet, the protocol self-test, the stdio and Streamable HTTP
+probe suites, the built-in profile tests, the prompt-cost replay, the audit summarizer
+fixture, the doctor probes, the clear-taint probes and the stats probes.
 On Windows, `make check` needs a POSIX shell (Git Bash or WSL). Without one, run the
 same steps directly: `gofmt -l cmd`, `go vet ./...`, `python demo/selftest.py`.
 
@@ -146,6 +152,39 @@ bin/sylenix-guard --name filesystem --approve dialog \
 List in `--readonly` only tools that are pure reads. Tools on that list run freely on a
 tainted session, so the list is a trust decision: when in doubt, leave a tool off, and
 unclassifiable traffic is handled by the most restrictive tier.
+
+### Proxy a remote server over Streamable HTTP
+
+Point the client at the local listener and give Guard the upstream MCP endpoint:
+
+```bash
+bin/sylenix-guard proxy \
+  --listen 127.0.0.1:8080 \
+  --upstream https://example.com/mcp \
+  --name remote \
+  --approve deny \
+  --readonly read_only_tool
+```
+
+The listener binds to loopback by default; `--listen :8080` is normalized to
+`127.0.0.1:8080`, while an explicit `0.0.0.0:8080` or a LAN address is accepted
+only when you ask for it. The endpoint path is `/mcp`; if the upstream URL has a
+path it is used as-is, otherwise the client's path is appended. Existing `--name`,
+`--state-dir`, `--policy`, `--readonly`, `--trust`, `--approve`, `--no-spotlight`,
+`--reset-pins`, `--allow-write-under`, and `--grant` flags work the same way.
+
+The transport targets MCP **2025-11-25** Streamable HTTP: one POST per JSON-RPC
+message, optional SSE responses, optional GET SSE, DELETE for session termination,
+and `Mcp-Session-Id` pass-through. It also tolerates the stateless **2026-07-28**
+revision, which removed sessions and GET resumability. The older HTTP+SSE
+transport from 2024-11-05 is not implemented.
+
+Client `Authorization`, `Cookie`, `Mcp-Session-Id`, `MCP-Protocol-Version` and
+`Last-Event-ID` headers are forwarded to the configured upstream. Guard never
+logs header values, never writes tokens or session IDs to disk, and does not
+follow redirects. It checks `Origin` and rejects non-loopback browser origins.
+The server-command allowlist remains a stdio launch control; it is not applied to
+`--upstream`.
 
 ### Check the installation
 
@@ -212,7 +251,9 @@ that default; it is never widened automatically.
 
 | Flag | Meaning |
 |---|---|
-| `--name` | Label for this server; names the pin and audit files. Default: the command's name. |
+| `proxy --listen ADDR` | Local address for Streamable HTTP mode. Default `127.0.0.1:8080`; empty host or `localhost` becomes `127.0.0.1`. |
+| `proxy --upstream URL` | Required remote Streamable HTTP MCP endpoint. Must be `http` or `https`; its query string is redacted from logs. |
+| `--name` | Label for this server; names the pin and audit files. Default: the command's name, or the upstream host in `proxy` mode. |
 | `--state-dir` | Where pins and the audit log live. Default `~/.sylenix-poc`. |
 | `--policy PATH` | Versioned policy file. Default: `<state-dir>/policy.yaml` if present, else built-in defaults. |
 | `--readonly a,b` | Tools allowed even when the session is tainted. Replaces all policy `class: read` entries. |
@@ -275,14 +316,19 @@ examples.
 
 Every decision is recorded as JSON lines on the local machine
 (`~/.sylenix-poc/audit-<name>.jsonl`): tool names, argument key names (never values),
-rule names, taint origins and approvals. Sylenix Guard makes no network connections and
-sends nothing anywhere. Summaries with prompts-per-active-hour metrics:
+rule names, taint origins and approvals. Stdio mode makes no network connections; proxy
+mode connects only to the `--upstream` endpoint you configure and never logs or persists
+auth headers. Summaries with prompts-per-active-hour metrics:
 `python scripts/summarize_audit.py --name <name>`.
 
 ## Verification and evidence
 
 - Protocol self-test: 101 checks, `python demo/selftest.py` (100 run on Windows; the
   dialog test needs a real dialog and skips there).
+- Streamable HTTP proxy: `python tests/probes/test_http_proxy.py` runs the same
+  block sequence through stdio and HTTP, covers POST/GET SSE, server
+  notifications, sessions, auth-header pass-through and token
+  non-persistence, and checks pin quarantine over HTTP.
 - Built-in profiles: `python tests/probes/test_profiles.py` exercises all ten
   profiles, one allowed read and one blocked write/egress each.
 - Server allowlist: `python tests/probes/test_allowlist.py` checks refusal,
@@ -322,12 +368,13 @@ it does not control what a model writes or says.
 
 ## Security model and limits
 
-Sylenix Guard is a deterministic policy boundary on one MCP stdio connection. It
-does not make the model trustworthy, sandbox the server or cover traffic that
-never passes through its process. In particular, it does not:
+Sylenix Guard is a deterministic policy boundary on one MCP connection, over
+stdio or Streamable HTTP. It does not make the model trustworthy, sandbox the
+server or cover traffic that never passes through its process. In particular,
+it does not:
 
 - see host built-in tools, attachments or text pasted directly into the agent;
-- protect a second MCP server or a different transport;
+- protect a second MCP server, route between servers, or broker OAuth tokens;
 - stop an action inside a live 15-minute grant or inside a `--readonly` tool;
 - control what a permitted write contains, or provide an OS-level filesystem
   sandbox;
@@ -347,6 +394,16 @@ bypass, response expectations and safe harbour.
 
 - Coverage is one MCP server per process. Host built-in tools, attachments and pasted
   text never pass through the gateway.
+- Proxy mode covers one Streamable HTTP endpoint. It targets MCP 2025-11-25 and
+  tolerates the stateless 2026-07-28 shape; the legacy HTTP+SSE transport is not
+  implemented. It passes `Mcp-Session-Id` through rather than mapping sessions per
+  client, and does not apply the server-command allowlist to `--upstream`.
+- Proxy auth headers are forwarded to the configured upstream and never logged or
+  persisted. A `--listen` address other than loopback exposes a plain-HTTP endpoint;
+  Origin checking is not authentication.
+- SSE event IDs and `Last-Event-ID` are forwarded, but the proxy keeps no replay
+  buffer or persistent stream state. A dropped stream loses in-flight events unless
+  the upstream can replay them.
 - Taint never clears automatically. A human can clear it with `clear-taint` and an
   OS dialog; a session lasts as long as the guard process.
 - `clear-taint` only works while the guard is running with the same `--name` and

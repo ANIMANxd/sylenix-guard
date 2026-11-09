@@ -52,7 +52,7 @@ Put your original server command back in the config and restart the app.
 
 ## What it records
 
-A log on your own computer at `~/.sylenix-poc/audit-<name>.jsonl`: tool names, the names of arguments (not their values), and what Guard decided. Guard makes no network connections and sends nothing anywhere.
+A log on your own computer at `~/.sylenix-poc/audit-<name>.jsonl`: tool names, the names of arguments (not their values), and what Guard decided. Stdio mode makes no network connections and sends nothing anywhere. Proxy mode connects only to the `--upstream` URL you configure; it forwards auth headers but never logs or stores them.
 
 ## What we need back
 

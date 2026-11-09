@@ -18,10 +18,33 @@ The code in section 8 was compiled, vetted with `go vet`, formatted with `gofmt`
 | Audit-summary probes (`tests/probes/test_stats.py`) | 21 checks, all passing: exact fixture parity, named-log resolution, prompts per active hour, clear-taint events and usage errors. |
 | Prompt replay (`scripts/replay_profile_session.py`) | The recorded normal filesystem session reports 1 approval prompt in 1 active hour, below the 10/hour budget. |
 | Full harness run through the real MCP Python SDK (`mcp` 1.30) with the scripted agent, 3 runs per cell | Plumbing works: unguarded runs leak the canary, guarded runs block it |
+| Streamable HTTP proxy probes (`tests/probes/test_http_proxy.py`) | 22 checks, all passing: stdio/HTTP parity for the block sequence, POST and GET SSE, server notifications, `Mcp-Session-Id`, DELETE, auth-header pass-through, token non-persistence, and pin quarantine. Manual initialize, tools/list and a datamarked tool call against `https://mcp.deepwiki.com/mcp` work over SSE. |
 | Run with a real model | **Run.** qwen/qwen3.5-9b via LM Studio, temperature 0, 10 runs per cell; raw data in `docs/qwen-guarded-data/` and `docs/day2b-data/`. The harness later gained local and Gemini agents. |
 | Approval dialog on macOS | **Not run.** The Linux "no dialog available, so deny" path and the Windows dialog are tested. |
 | Inside Claude Desktop or Cursor | **Not run.** LM Studio was the real host used for the 7-day trial. |
 | Windows | The stdio wrapper builds and runs. A 7-day LM Studio trial used the native Windows dialog: 0 false blocks, 5.6 prompts per active hour (`docs/FEEDBACK_LOG.md`). `demo/manual_dialog_test.py` remains the manual check. |
+
+## Post-POC extension (2026-11-09)
+
+The 72-hour spike and its Gate A/B evaluation are complete. The repository now
+also ships a Streamable HTTP proxy mode:
+
+```bash
+sylenix-guard proxy --listen 127.0.0.1:8080 --upstream https://example.com/mcp
+```
+
+It uses the same taint, pin, quarantine, hard-block and approval core as stdio.
+The HTTP transport targets MCP **2025-11-25** Streamable HTTP (POST, optional GET
+SSE, DELETE, and `Mcp-Session-Id` pass-through) and also tolerates the stateless
+**2026-07-28** revision, which removed sessions and GET resumability. The legacy
+HTTP+SSE transport from 2024-11-05 is not implemented.
+
+The listener binds to loopback by default; `--listen` can change that. Client
+auth headers are forwarded to the configured upstream but are never logged or
+persisted. See `README.md` for usage and `docs/ARCHITECTURE.md` for the request
+path and remaining limits. This extension supersedes the earlier
+"HTTP proxy mode is out of scope" line; the rest of this document remains the
+record of the original spike.
 
 ## What changed from the first version
 
@@ -68,7 +91,7 @@ A 45-second video is a by-product of answering these, not the goal.
 
 **Out of the spike**
 
-Cgo, ONNX and the Laya advisor. Cedar. Biometric or remote approval. Merkle ledger and TPM keys. OS sandboxing. Credential broker. The confidentiality latch. HTTP proxy mode. Sharing one session across several servers.
+Cgo, ONNX and the Laya advisor. Cedar. Biometric or remote approval. Merkle ledger and TPM keys. OS sandboxing. Credential broker. The confidentiality latch. Sharing one session across several servers. (The original spike also excluded HTTP proxy mode; the post-POC extension above now includes it.)
 
 ## 3. Layout
 
@@ -121,6 +144,9 @@ CGO_ENABLED=0 go build -o bin/sylenix-guard.exe ./cmd/sylenix-guard
 # protocol tests (no dependencies)
 python3 demo/selftest.py
 
+# Streamable HTTP proxy integration probes (no dependencies)
+python3 tests/probes/test_http_proxy.py
+
 # harness dependencies. Pin mcp below 2: version 2 renamed FastMCP and changed other APIs.
 python3 -m venv .venv && source .venv/bin/activate
 pip install "mcp<2" anthropic
@@ -155,6 +181,10 @@ sylenix-guard [flags] -- <server command> [args...]
 | `--allow-write-under DIR` | Tainted calls need no prompt while every path argument stays inside `DIR`. `TOOL=DIR` limits the fast path to one tool. Repeatable. |
 | `--grant TOOL[:DIR]=DURATION` | Pre-approve the sink calls a dialog grant covers, without a dialog, for example `write_file=15m` or `write_file:out=15m`. Repeatable. |
 
+`proxy` mode adds `--listen ADDR` (default `127.0.0.1:8080`) and `--upstream URL`
+(required). All other proxy flags above apply unchanged. The server-command
+allowlist is not applied in proxy mode because there is no child command.
+
 | Situation | Result |
 |---|---|
 | Tool call, session clean | Forwarded |
@@ -185,6 +215,9 @@ Error data contains only a rule name. Policy details go to the audit log, not to
 ## 7. Known limitations (say them out loud in any demo)
 
 - **Coverage.** The guard only sees traffic for the server it wraps. The host's built-in tools, attachments and pasted text never pass through it, and taint tracking is blind to them.
+- **Proxy mode is one Streamable HTTP endpoint, not a general gateway.** It targets MCP 2025-11-25 and tolerates the stateless 2026-07-28 shape; the legacy HTTP+SSE transport is not implemented. It does not route multiple servers, broker OAuth, refresh tokens, or apply the server-command allowlist. Session IDs are passed through, not mapped per client.
+- **Proxy auth headers are forwarded, not stored.** Every end-to-end request header (including `Authorization`, `Cookie` and custom auth keys) is copied to the configured upstream. The guard never logs or persists header values, but the upstream sees them. A `--listen` address other than loopback exposes a plain-HTTP endpoint; Origin checking is not authentication.
+- **SSE resumability is the upstream's job.** Event IDs and `Last-Event-ID` are forwarded, but the proxy keeps no replay buffer and does not persist streams. A dropped connection loses in-flight events unless the upstream can replay them.
 - **Your `--readonly` list (or policy `class: read`) is a trust decision.** A "read-only" tool that can reach the network or has side effects defeats the latch. List only tools you are sure are pure reads.
 - **Taint never clears automatically,** and a session lasts as long as the guard process. A human can clear the latch for a running session with `clear-taint` after an OS dialog; the clear is logged as `CLEAR_TAINT` with who/when. It does not revoke grants, quarantines or the server process, and restarting the guard starts a new session. With a real filesystem server almost everything taints after the first read. That is the friction you are measuring; `--trust` lets you test the alternative.
 - **The clear-taint control file is local state.** The guard must be running with the same `--name` and state directory; use a unique name per guard. A same-user process, including the wrapped server, can request a dialog, but only a human **Clear Taint** click clears the latch. The dialog is a local OS dialog, not biometric, and a failed or unavailable dialog denies.
