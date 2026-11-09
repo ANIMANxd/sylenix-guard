@@ -53,6 +53,16 @@ egress:
   deny_hosts:
     - "metadata.example.com"
 
+# Require the server command and arguments to match one of these entries.
+allowlist_enforced: true
+allowlist:
+  - name: "filesystem"
+    command: "npx"
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "/home/me/work"]
+    # Optional: hash the resolved command binary. If lockfile is set, hash
+    # that file instead (for example a package-lock.json).
+    sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+
 servers:
   demo:
     tools:
@@ -119,6 +129,46 @@ continue after taint, list the hosts it may reach in `egress.allow_hosts`;
 otherwise every tainted fetch is `EGRESS_TARGET`. The profile test uses an
 allowlisted host for its read-side call and an unlisted host for the blocked
 call.
+
+## Server command allowlist
+
+The allowlist stops a malicious client configuration from launching an arbitrary
+command as an "MCP server". Each entry matches the configured command exactly
+and the arguments as a list. An argument may use `*` or `?` as a wildcard;
+otherwise it must match exactly. `args` is required: use `args: []` for a
+command with no arguments.
+
+`sha256` is optional. When present, the guard hashes the resolved command
+binary before launch and refuses on a mismatch. If `lockfile` is also present,
+the guard hashes that file instead, which lets you pin a package lock rather
+than the package-runner binary. A missing or unreadable hash target is refused.
+Without `sha256`, an entry matches by command path/name only; a bare command
+name such as `python` trusts whatever `PATH` resolves to at launch.
+
+If `allowlist_enforced` is omitted, a non-empty `allowlist` enforces it and an
+empty one does not. `allowlist_enforced: true` with an empty list denies every
+server. New installs and `sylenix-guard allow` set enforcement to true.
+
+`allow` and `install` rewrite the policy file in a canonical form. Known fields
+are preserved, but comments and original formatting are not.
+
+A refused launch exits 2 before the child process is created, writes
+`SERVER_NOT_ALLOWED` to the audit log, and explains how to approve the command.
+The audit event records the command path and reason, never the argument values.
+
+```bash
+# Read a server from the supported MCP client configs, show it, confirm,
+# and add its exact command/args to the policy allowlist.
+sylenix-guard allow filesystem
+sylenix-guard allow filesystem --policy ./policy.yaml --yes
+
+# New installs write <state-dir>/policy.yaml with enforcement enabled and the
+# servers present at install time, after confirmation. A custom --policy or
+# --state-dir is also pinned in the wrapper written to each client config, so
+# the installed server loads the same policy.
+sylenix-guard install --yes
+sylenix-guard install --policy ./policy.yaml --state-dir ./.state --yes
+```
 
 ## Classes
 
@@ -191,6 +241,12 @@ sylenix-guard policy validate ./policy.yaml
 
 # Print the built-in defaults as a valid policy file.
 sylenix-guard policy print-default > policy.yaml
+
+# Add the currently configured command for a named server.
+sylenix-guard allow <name> [--policy PATH] [--state-dir DIR] [--yes]
+
+# Install wraps MCP client configs and pre-populates the allowlist.
+sylenix-guard install [--policy PATH] [--state-dir DIR] [--yes] [--dry-run]
 ```
 
 ## Checking prompt cost

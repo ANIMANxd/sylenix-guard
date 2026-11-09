@@ -75,6 +75,9 @@ wraps one MCP server per process over stdio.
 - Built-in profiles for filesystem, git, GitHub, fetch, shell, Slack, Postgres,
   browser (Playwright/Puppeteer), Notion and Jira, selected automatically from
   the server command/package name and overridable per tool
+- Server-command allowlist with exact command/args entries and optional SHA-256
+  of the binary or package lock; `sylenix-guard allow <name>` and install
+  pre-population
 - Scratch-directory write policy (`--allow-write-under`)
 - Time-bounded, directory-scoped human approvals (dialog and `--grant`)
 - Native approval dialogs: osascript (macOS), zenity (Linux), PowerShell form (Windows)
@@ -181,6 +184,20 @@ the server command/package name (with `--name` as a fallback), and a policy
 entry for a tool overrides the profile. Use `profile: auto` (default),
 `profile: none`, or `profile: <name>` in the policy file to control it.
 
+The policy file also holds the server-command allowlist. Entries match the
+exact command and argument list, with optional `*`/`?` argument patterns and an
+optional SHA-256 of the resolved binary or a lockfile. A refused launch exits 2
+with `SERVER_NOT_ALLOWED` before the child process is created. `sylenix-guard
+allow <name>` reads a named server from the supported client configs, shows the
+command, confirms, and adds it. `sylenix-guard install --yes` pre-populates the
+allowlist with the servers present at install time. See
+[`docs/POLICY.md`](docs/POLICY.md#server-command-allowlist).
+
+```bash
+sylenix-guard allow <name> [--policy PATH] [--state-dir DIR] [--yes]
+sylenix-guard install [--policy PATH] [--state-dir DIR] [--yes] [--dry-run]
+```
+
 Location order is `--policy PATH`, then `<state-dir>/policy.yaml`, then the
 built-in defaults. The built-in sensitive-name floor cannot be removed by a
 policy file; `sensitive_paths` only adds to it. See
@@ -201,6 +218,8 @@ sends nothing anywhere. Summaries with prompts-per-active-hour metrics:
   dialog test needs a real dialog and skips there).
 - Built-in profiles: `python tests/probes/test_profiles.py` exercises all ten
   profiles, one allowed read and one blocked write/egress each.
+- Server allowlist: `python tests/probes/test_allowlist.py` checks refusal,
+  approval, changed binary/lockfile hashes, `allow` and install pre-population.
 - Prompt cost: `python scripts/replay_profile_session.py` replays a recorded
   normal session and reports approval prompts per active hour.
 - Releases: tag `vX.Y.Z`; checksum, Cosign, SBOM, Homebrew and Scoop verification
@@ -270,6 +289,15 @@ bypass, response expectations and safe harbour.
 - Built-in profiles are defaults matched by command/package token. A renamed
   package, wrapper or custom server can miss the profile; review the profile in
   the audit log and override tool classes in the policy file.
+- The server allowlist is enforced only when `allowlist_enforced: true` or a
+  non-empty `allowlist` is present. Install and `allow` set it; a hand-written
+  policy without an allowlist keeps the old launch behaviour.
+- Allowlist hashes are checked immediately before launch, not pinned through
+  execution. A package-runner binary such as `npx` is hashed, not the package it
+  downloads, unless `lockfile` is set. An entry without `sha256` matches by
+  command path/name only, so a bare name trusts `PATH` at launch.
+- `sylenix-guard allow` and `install` rewrite the policy file canonically;
+  known fields survive, but comments and original formatting do not.
 - Egress host matching is textual on the argument value. It does not resolve DNS,
   follow redirects, inspect the actual connection or pin the resolved IP.
 - Manifest pinning is trust on first use; pin files are not signed.

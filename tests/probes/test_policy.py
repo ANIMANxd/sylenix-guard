@@ -167,6 +167,18 @@ servers:
         p = run_guard(["policy", "validate", direct])
         check("direct server->tool shape validates", p.returncode == 0, p.stderr)
 
+        allow = os.path.join(d, "allow.yaml")
+        write(allow, """version: 1
+allowlist_enforced: true
+allowlist:
+  - name: demo
+    command: python
+    args: ["-m", "demo"]
+    sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+""")
+        p = run_guard(["policy", "validate", allow])
+        check("allowlist policy validates", p.returncode == 0, p.stderr)
+
         p = run_guard(["policy", "print-default"])
         check("print-default exits 0", p.returncode == 0, p.stderr)
         default = os.path.join(d, "default.yaml")
@@ -186,6 +198,12 @@ servers:
             ("bad class", "version: 1\nservers:\n  t:\n    tools:\n      x:\n        class: delete\n"),
             ("bad approval", "version: 1\napproval: allow\n"),
             ("unknown profile", "version: 1\nprofile: nope\n"),
+            ("allowlist missing args", "version: 1\nallowlist:\n  - command: python\n"),
+            ("allowlist bad sha256", "version: 1\nallowlist:\n  - command: python\n    args: []\n    sha256: nothex\n"),
+            ("allowlist lockfile without sha", "version: 1\nallowlist:\n  - command: python\n    args: []\n    lockfile: package-lock.json\n"),
+            ("allowlist unknown field", "version: 1\nallowlist:\n  - command: python\n    args: []\n    bogus: true\n"),
+            ("allowlist empty command", "version: 1\nallowlist:\n  - command: \"\"\n    args: []\n"),
+            ("allowlist args not a list", "version: 1\nallowlist:\n  - command: python\n    args: nope\n"),
             ("allow_paths on exec", "version: 1\nservers:\n  t:\n    tools:\n      x:\n        class: exec\n        allow_paths: [out]\n"),
             ("bad sensitive glob", "version: 1\nsensitive_paths:\n  - '['\n"),
             ("bad egress host", "version: 1\negress:\n  allow_hosts:\n    - http://example.com\n"),

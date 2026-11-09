@@ -50,6 +50,28 @@
   reports 1 approval prompt (1/hour), below the 10/hour budget.
 - Added `make profile-test` and `make replay-test`, both part of `make check`.
 
+### Server command allowlist
+
+- Added `allowlist_enforced` and `allowlist` to the policy file. Each entry
+  matches the exact command and argument list, supports `*`/`?` argument
+  patterns, and may carry a SHA-256 of the resolved binary or of a `lockfile`.
+- The guard checks the allowlist before creating the child process. An
+  unapproved command exits 2, writes `SERVER_NOT_ALLOWED` to the audit log, and
+  prints how to approve it. The audit event records the command path and reason,
+  never the argument values.
+- Added `sylenix-guard allow <name>`, which reads the named server from the
+  supported MCP client configs, shows the exact command and arguments, asks for
+  confirmation, computes a binary hash when possible, and writes the policy
+  entry.
+- `install` now pre-populates `<state-dir>/policy.yaml` with the servers present
+  at install time, enables enforcement, and asks for confirmation unless
+  `--yes`. Added `--policy` and `--state-dir` to install and pinned them in the
+  wrapper it writes, so the installed server loads the same policy.
+- Added `tests/probes/test_allowlist.py`: unapproved refusal, approved launch,
+  changed binary hash, changed lockfile hash, `allow`, and install
+  pre-population. Extended policy validation probes for malformed allowlists.
+- Updated `docs/POLICY.md` with the allowlist schema and commands.
+
 ### Security
 
 - Tightened `--allow-write-under` and `--grant`: only values under known path

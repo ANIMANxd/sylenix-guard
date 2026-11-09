@@ -20,6 +20,7 @@ probe-test: build
 	python3 tests/probes/test_scratch_grant_bypass.py
 	python3 tests/probes/test_protected_targets.py
 	python3 tests/probes/test_policy.py
+	python3 tests/probes/test_allowlist.py
 	python3 tests/probes/test_install.py
 
 profile-test: build

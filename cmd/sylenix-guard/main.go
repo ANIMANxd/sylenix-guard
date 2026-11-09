@@ -53,13 +53,25 @@ const policyFileName = "policy.yaml"
 // policyFile is the on-disk policy schema. It is decoded strictly: any field
 // this struct does not name is an error, never silently ignored.
 type policyFile struct {
-	Version        int                     `json:"version"`
-	Profile        string                  `json:"profile"`
-	Approval       string                  `json:"approval"`
-	Spotlight      *bool                   `json:"spotlight"`
-	SensitivePaths []string                `json:"sensitive_paths"`
-	Egress         *policyEgress           `json:"egress"`
-	Servers        map[string]policyServer `json:"servers"`
+	Version           int                     `json:"version"`
+	Profile           string                  `json:"profile"`
+	Approval          string                  `json:"approval"`
+	Spotlight         *bool                   `json:"spotlight"`
+	SensitivePaths    []string                `json:"sensitive_paths"`
+	Egress            *policyEgress           `json:"egress"`
+	AllowlistEnforced *bool                   `json:"allowlist_enforced"`
+	Allowlist         []policyAllowEntry      `json:"allowlist"`
+	Servers           map[string]policyServer `json:"servers"`
+}
+
+// policyAllowEntry is one exact server command/args approval. Args is a
+// pointer so a missing args key is a validation error rather than "any args".
+type policyAllowEntry struct {
+	Name     string    `json:"name"`
+	Command  string    `json:"command"`
+	Args     *[]string `json:"args"`
+	SHA256   string    `json:"sha256"`
+	Lockfile string    `json:"lockfile"`
 }
 
 type policyEgress struct {
@@ -134,15 +146,18 @@ type Guard struct {
 	spotlight bool
 	scratch   []scratchRule // --allow-write-under or policy allow_paths, fixed after startup
 
-	classes          map[string]string          // policy class for non-read tools
-	toolPathKeys     map[string]map[string]bool // per-tool extra path argument keys
-	egressAllow      map[string]bool            // policy host allowlist
-	egressDeny       map[string]bool            // policy host denylist (wins over allow)
-	policySource     string
-	policyVersion    int
-	profileName      string
-	profileSource    string
-	readonlyOverride bool // --readonly was set, so policy class: read entries are ignored
+	classes           map[string]string          // policy class for non-read tools
+	toolPathKeys      map[string]map[string]bool // per-tool extra path argument keys
+	egressAllow       map[string]bool            // policy host allowlist
+	egressDeny        map[string]bool            // policy host denylist (wins over allow)
+	policySource      string
+	policyVersion     int
+	policyPath        string
+	profileName       string
+	profileSource     string
+	allowlistEnforced bool
+	allowlist         []policyAllowEntry
+	readonlyOverride  bool // --readonly was set, so policy class: read entries are ignored
 
 	mu          sync.Mutex
 	tainted     bool
@@ -170,6 +185,8 @@ func main() {
 			os.Exit(runConfigCommand("uninstall", os.Args[2:]))
 		case "policy":
 			os.Exit(runPolicyCommand(os.Args[2:]))
+		case "allow":
+			os.Exit(runAllowCommand(os.Args[2:]))
 		}
 	}
 	name := flag.String("name", "", "label for this server; names the pin and log files (default: command name)")
@@ -274,7 +291,7 @@ func main() {
 		out:         os.Stdout,
 		log:         logf,
 	}
-	pf, source, _, err := loadPolicyForRun(*policyPath, visited["policy"], *stateDir, *name, nameExplicit)
+	pf, source, resolvedPath, err := loadPolicyForRun(*policyPath, visited["policy"], *stateDir, *name, nameExplicit)
 	if err != nil {
 		g.event("policy_invalid", map[string]any{"source": source, "reason": err.Error()})
 		fmt.Fprintln(os.Stderr, "sylenix-guard:", err)
@@ -282,6 +299,7 @@ func main() {
 	}
 	g.policySource = source
 	g.policyVersion = pf.Version
+	g.policyPath = resolvedPath
 	profile := selectPolicyProfile(*name, args, pf.Profile)
 	if profile != nil {
 		g.profileName = profile.name
@@ -291,6 +309,16 @@ func main() {
 	printPolicyDeprecationNotes(visited, *policyPath, source)
 	g.event("policy_loaded", map[string]any{"source": source, "version": pf.Version, "approve": g.approve,
 		"profile": g.profileName, "profile_source": g.profileSource})
+	if allowed, reason := g.checkServerAllowed(args); !allowed {
+		g.event("block", map[string]any{"rule": "SERVER_NOT_ALLOWED", "command": args[0], "detail": reason})
+		fmt.Fprintf(os.Stderr, "[sylenix-guard] SERVER_NOT_ALLOWED: %s\n", reason)
+		fmt.Fprintf(os.Stderr, "[sylenix-guard] refusing to launch server command %q.\n", args[0])
+		fmt.Fprintf(os.Stderr, "[sylenix-guard] approve it with: sylenix-guard allow %q\n", g.name)
+		if g.policyPath != "" {
+			fmt.Fprintf(os.Stderr, "[sylenix-guard] or add an exact command and args entry to %s\n", g.policyPath)
+		}
+		os.Exit(2)
+	}
 	if !g.loadPins(*resetPins) {
 		fmt.Fprintf(os.Stderr, "[sylenix-guard] pin file %s exists but cannot be read; refusing to start. Inspect it, or restart with --reset-pins to trust every tool as new.\n", g.pinsPath())
 		os.Exit(2)
@@ -582,6 +610,42 @@ func validatePolicy(pf *policyFile) error {
 	if pf.Approval != "" && pf.Approval != "deny" && pf.Approval != "dialog" {
 		return fmt.Errorf("approval must be deny or dialog")
 	}
+	for i, entry := range pf.Allowlist {
+		if entry.Name != "" {
+			if err := validatePolicyName("allowlist", entry.Name); err != nil {
+				return fmt.Errorf("allowlist[%d]: %w", i, err)
+			}
+		}
+		if entry.Command == "" || strings.TrimSpace(entry.Command) != entry.Command || hasUnsafePolicyChars(entry.Command) {
+			return fmt.Errorf("allowlist[%d]: command must be non-empty without surrounding spaces or control/invisible characters", i)
+		}
+		if entry.Args == nil {
+			return fmt.Errorf("allowlist[%d]: args is required; use [] for no arguments", i)
+		}
+		for j, arg := range *entry.Args {
+			if strings.ContainsRune(arg, 0) {
+				return fmt.Errorf("allowlist[%d]: args[%d] contains a NUL byte", i, j)
+			}
+		}
+		if entry.SHA256 != "" {
+			hash := strings.ToLower(strings.TrimSpace(entry.SHA256))
+			if len(hash) != sha256.Size*2 {
+				return fmt.Errorf("allowlist[%d]: sha256 must be 64 hexadecimal characters", i)
+			}
+			if _, err := hex.DecodeString(hash); err != nil {
+				return fmt.Errorf("allowlist[%d]: sha256 must be 64 hexadecimal characters", i)
+			}
+			pf.Allowlist[i].SHA256 = hash
+		}
+		if entry.Lockfile != "" {
+			if entry.SHA256 == "" {
+				return fmt.Errorf("allowlist[%d]: lockfile requires sha256", i)
+			}
+			if strings.TrimSpace(entry.Lockfile) == "" || strings.ContainsRune(entry.Lockfile, 0) || hasUnsafePolicyChars(entry.Lockfile) {
+				return fmt.Errorf("allowlist[%d]: lockfile is empty or contains control/invisible characters", i)
+			}
+		}
+	}
 	for i, p := range pf.SensitivePaths {
 		norm, err := normalizePolicyGlob(p)
 		if err != nil {
@@ -725,6 +789,13 @@ func (g *Guard) applyPolicy(pf *policyFile, profile *policyProfile, visited map[
 		g.egressAllow = policyHostSet(pf.Egress.AllowHosts)
 		g.egressDeny = policyHostSet(pf.Egress.DenyHosts)
 	}
+	g.allowlistEnforced = false
+	if pf.AllowlistEnforced != nil {
+		g.allowlistEnforced = *pf.AllowlistEnforced
+	} else if len(pf.Allowlist) > 0 {
+		g.allowlistEnforced = true
+	}
+	g.allowlist = append([]policyAllowEntry(nil), pf.Allowlist...)
 
 	g.approve = pf.Approval
 	if g.approve == "" {
@@ -809,6 +880,160 @@ func (g *Guard) applyPolicy(pf *policyFile, profile *policyProfile, visited map[
 	}
 }
 
+func boolPtr(v bool) *bool { return &v }
+
+func looksLikeCommandPath(s string) bool {
+	return strings.ContainsAny(s, `/\`) || filepath.IsAbs(s) || isWindowsDrivePath(s)
+}
+
+func matchAllowedCommand(allowed, actual string) bool {
+	if allowed == actual {
+		return true
+	}
+	if runtime.GOOS == "windows" && strings.EqualFold(allowed, actual) {
+		return true
+	}
+	if looksLikeCommandPath(allowed) && looksLikeCommandPath(actual) {
+		return sameCommandPath(allowed, actual)
+	}
+	return false
+}
+
+func matchArgPattern(pattern, value string) bool {
+	if pattern == value {
+		return true
+	}
+	if !strings.ContainsAny(pattern, "*?") {
+		return false
+	}
+	p := []rune(pattern)
+	v := []rune(value)
+	pi, vi := 0, 0
+	star, matched := -1, 0
+	for vi < len(v) {
+		switch {
+		case pi < len(p) && (p[pi] == '?' || p[pi] == v[vi]):
+			pi++
+			vi++
+		case pi < len(p) && p[pi] == '*':
+			star, matched = pi, vi
+			pi++
+		case star >= 0:
+			pi = star + 1
+			matched++
+			vi = matched
+		default:
+			return false
+		}
+	}
+	for pi < len(p) && p[pi] == '*' {
+		pi++
+	}
+	return pi == len(p)
+}
+
+func matchAllowedArgs(pattern, actual []string) bool {
+	if len(pattern) != len(actual) {
+		return false
+	}
+	for i := range pattern {
+		if !matchArgPattern(pattern[i], actual[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func resolveCommandFile(command string) (string, bool) {
+	if command == "" {
+		return "", false
+	}
+	if looksLikeCommandPath(command) {
+		if info, err := os.Stat(command); err == nil && !info.IsDir() {
+			return command, true
+		}
+	}
+	if resolved, err := exec.LookPath(command); err == nil {
+		return resolved, true
+	}
+	return "", false
+}
+
+func hashFileSHA256(path string) (string, bool) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", false
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:]), true
+}
+
+func makePolicyAllowEntry(name, command string, args []string) policyAllowEntry {
+	copied := append([]string(nil), args...)
+	entry := policyAllowEntry{Name: name, Command: command, Args: &copied}
+	if path, ok := resolveCommandFile(command); ok {
+		if sum, ok := hashFileSHA256(path); ok {
+			entry.SHA256 = sum
+		}
+	}
+	return entry
+}
+
+// checkServerAllowed enforces the allowlist before the child process is
+// created. It never prints or returns argument values in the audit event; the
+// caller only logs the command path and a short reason.
+func (g *Guard) checkServerAllowed(args []string) (bool, string) {
+	if !g.allowlistEnforced {
+		return true, ""
+	}
+	if len(args) == 0 {
+		return false, "server command is empty"
+	}
+	command := args[0]
+	serverArgs := args[1:]
+	mismatch := ""
+	for _, entry := range g.allowlist {
+		if !matchAllowedCommand(entry.Command, command) {
+			continue
+		}
+		if entry.Args == nil || !matchAllowedArgs(*entry.Args, serverArgs) {
+			continue
+		}
+		if entry.SHA256 == "" {
+			return true, ""
+		}
+		target := entry.Lockfile
+		if target == "" {
+			resolved, ok := resolveCommandFile(command)
+			if !ok {
+				if mismatch == "" {
+					mismatch = fmt.Sprintf("cannot resolve %q for SHA-256 verification", command)
+				}
+				continue
+			}
+			target = resolved
+		}
+		sum, ok := hashFileSHA256(target)
+		if !ok {
+			if mismatch == "" {
+				mismatch = fmt.Sprintf("cannot read %s for SHA-256 verification", target)
+			}
+			continue
+		}
+		if !strings.EqualFold(sum, entry.SHA256) {
+			if mismatch == "" {
+				mismatch = fmt.Sprintf("allowlisted command or lockfile changed (SHA-256 mismatch for %q)", command)
+			}
+			continue
+		}
+		return true, ""
+	}
+	if mismatch != "" {
+		return false, mismatch
+	}
+	return false, fmt.Sprintf("server command %q with the configured arguments is not allowlisted", command)
+}
+
 func printPolicyDeprecationNotes(visited map[string]bool, explicitPath, source string) {
 	where := "the policy file (--policy PATH or <state-dir>/policy.yaml)"
 	if explicitPath != "" {
@@ -869,6 +1094,293 @@ func runPolicyCommand(args []string) int {
 	}
 }
 
+type allowMatch struct {
+	configPath string
+	command    string
+	args       []string
+}
+
+// guardWrapperCommand returns the wrapped server command and its arguments.
+// Guard flags may appear before the -- separator, so install can pin a custom
+// policy or state directory in the wrapper.
+func guardWrapperCommand(args []string) (string, []string, bool) {
+	for i, arg := range args {
+		if arg != "--" {
+			continue
+		}
+		if i+1 >= len(args) {
+			return "", nil, false
+		}
+		return args[i+1], args[i+2:], true
+	}
+	return "", nil, false
+}
+
+// configuredServerCommand returns the real stdio command for a config entry,
+// unwrapping a Guard wrapper when install already wrapped it. Remote entries
+// and malformed entries return false.
+func configuredServerCommand(entry *configObject) (string, []string, bool) {
+	if entry == nil || remoteConfigEntry(entry) {
+		return "", nil, false
+	}
+	if value, ok := entry.get("type"); ok {
+		text, ok := value.(string)
+		if !ok {
+			return "", nil, false
+		}
+		if text != "" && !strings.EqualFold(strings.TrimSpace(text), "stdio") {
+			return "", nil, false
+		}
+	}
+	value, ok := entry.get("command")
+	if !ok {
+		return "", nil, false
+	}
+	command, ok := value.(string)
+	if !ok || command == "" {
+		return "", nil, false
+	}
+	var args []string
+	if value, ok := entry.get("args"); ok {
+		list, ok := value.([]any)
+		if !ok {
+			return "", nil, false
+		}
+		for _, arg := range list {
+			text, ok := arg.(string)
+			if !ok {
+				return "", nil, false
+			}
+			args = append(args, text)
+		}
+	}
+	if _, wrapped := entry.get(guardMetaKey); wrapped || isGuardCommand(command, "") {
+		return guardWrapperCommand(args)
+	}
+	return command, args, true
+}
+
+func findConfiguredServer(name string) ([]allowMatch, []error) {
+	var matches []allowMatch
+	var errs []error
+	for _, target := range discoverConfigTargets() {
+		info, err := os.Stat(target.path)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				errs = append(errs, fmt.Errorf("%s: %w", target.path, err))
+			}
+			continue
+		}
+		if info.IsDir() {
+			continue
+		}
+		data, err := os.ReadFile(target.path)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", target.path, err))
+			continue
+		}
+		if hasDuplicateKeys(data) {
+			errs = append(errs, fmt.Errorf("%s: duplicate JSON keys", target.path))
+			continue
+		}
+		root, err := parseConfigObject(data)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", target.path, err))
+			continue
+		}
+		for _, serverPath := range target.serverPaths {
+			serverMap, exists, err := lookupConfigMap(root, serverPath)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("%s: %w", target.path, err))
+				continue
+			}
+			if !exists {
+				continue
+			}
+			value, ok := serverMap.get(name)
+			if !ok {
+				continue
+			}
+			entry, ok := value.(*configObject)
+			if !ok {
+				errs = append(errs, fmt.Errorf("%s: server %q is not an object", target.path, name))
+				continue
+			}
+			command, args, ok := configuredServerCommand(entry)
+			if !ok {
+				continue
+			}
+			matches = append(matches, allowMatch{configPath: target.path, command: command, args: args})
+		}
+	}
+	return matches, errs
+}
+
+// collectConfiguredServers reads every supported MCP config and returns one
+// allowlist entry per distinct stdio server command. A server name that maps to
+// different commands in different configs is a conflict: the caller must not
+// guess which one to approve.
+func collectConfiguredServers() ([]policyAllowEntry, []error) {
+	var entries []policyAllowEntry
+	var errs []error
+	seen := map[string]bool{}
+	byName := map[string]policyAllowEntry{}
+	for _, target := range discoverConfigTargets() {
+		info, err := os.Stat(target.path)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				errs = append(errs, fmt.Errorf("%s: %w", target.path, err))
+			}
+			continue
+		}
+		if info.IsDir() {
+			continue
+		}
+		data, err := os.ReadFile(target.path)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", target.path, err))
+			continue
+		}
+		if hasDuplicateKeys(data) {
+			errs = append(errs, fmt.Errorf("%s: refusing to edit a config with duplicate JSON keys", target.path))
+			continue
+		}
+		root, err := parseConfigObject(data)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: cannot parse config: %w", target.path, err))
+			continue
+		}
+		for _, serverPath := range target.serverPaths {
+			serverMap, exists, err := lookupConfigMap(root, serverPath)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("%s: %w", target.path, err))
+				continue
+			}
+			if !exists {
+				continue
+			}
+			for _, name := range sortedObjectKeys(serverMap) {
+				value, _ := serverMap.get(name)
+				entry, ok := value.(*configObject)
+				if !ok {
+					continue
+				}
+				command, args, ok := configuredServerCommand(entry)
+				if !ok {
+					continue
+				}
+				key := name + "\x00" + command + "\x00" + strings.Join(args, "\x00")
+				if seen[key] {
+					continue
+				}
+				seen[key] = true
+				candidate := makePolicyAllowEntry(name, command, args)
+				if candidate.SHA256 == "" {
+					fmt.Fprintf(os.Stderr, "[sylenix-guard] warning: cannot resolve %q for SHA-256 verification; no new hash will be recorded for %q\n", command, name)
+				}
+				if previous, ok := byName[name]; ok && !sameAllowEntry(previous, candidate) {
+					errs = append(errs, fmt.Errorf("server %q has different commands in different configs; edit policy.yaml manually", name))
+					continue
+				}
+				byName[name] = candidate
+				entries = append(entries, candidate)
+			}
+		}
+	}
+	return entries, errs
+}
+
+func runAllowCommand(args []string) int {
+	fs := flag.NewFlagSet("allow", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	policyPath := fs.String("policy", "", "policy file to update (default: <state-dir>/policy.yaml)")
+	stateDir := fs.String("state-dir", "", "state directory for the default policy file (default ~/.sylenix-poc)")
+	yes := fs.Bool("yes", false, "add without asking for confirmation")
+	name := ""
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		name, args = args[0], args[1:]
+	}
+	if err := fs.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			return 0
+		}
+		return 2
+	}
+	if name == "" {
+		if fs.NArg() != 1 {
+			fmt.Fprintln(os.Stderr, "usage: sylenix-guard allow <name> [--policy PATH] [--state-dir DIR] [--yes]")
+			return 2
+		}
+		name = fs.Arg(0)
+	} else if fs.NArg() != 0 {
+		fmt.Fprintln(os.Stderr, "usage: sylenix-guard allow <name> [--policy PATH] [--state-dir DIR] [--yes]")
+		return 2
+	}
+	matches, errs := findConfiguredServer(name)
+	if len(errs) > 0 {
+		for _, err := range errs {
+			fmt.Fprintln(os.Stderr, "sylenix-guard allow:", err)
+		}
+		fmt.Fprintln(os.Stderr, "sylenix-guard allow: refusing to allow while a supported config cannot be read")
+		return 2
+	}
+	if len(matches) == 0 {
+		fmt.Fprintf(os.Stderr, "sylenix-guard allow: no server named %q found in a supported MCP config\n", name)
+		return 2
+	}
+	unique := map[string]bool{}
+	for _, match := range matches {
+		key := match.command + "\x00" + strings.Join(match.args, "\x00")
+		unique[key] = true
+	}
+	if len(unique) != 1 {
+		fmt.Fprintf(os.Stderr, "sylenix-guard allow: server %q has different commands in different configs; edit policy.yaml manually\n", name)
+		for _, match := range matches {
+			argsJSON, _ := json.Marshal(match.args)
+			fmt.Fprintf(os.Stderr, "  %s: %s %s\n", match.configPath, yamlPolicyString(match.command), argsJSON)
+		}
+		return 2
+	}
+	match := matches[0]
+	path, err := policyWritePath(*policyPath, *stateDir)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "sylenix-guard allow:", err)
+		return 2
+	}
+	argsJSON, _ := json.Marshal(match.args)
+	fmt.Printf("Server %q from %s:\n", name, match.configPath)
+	fmt.Printf("  command: %s\n", yamlPolicyString(match.command))
+	fmt.Printf("  args: %s\n", argsJSON)
+	if !*yes {
+		fmt.Printf("Add this exact command and arguments to %s? [y/N] ", path)
+		answer, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+		answer = strings.ToLower(strings.TrimSpace(answer))
+		if answer != "y" && answer != "yes" {
+			fmt.Println("not added")
+			return 0
+		}
+	}
+	pf, err := loadPolicyForUpdate(path)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "sylenix-guard allow:", err)
+		return 2
+	}
+	entry := makePolicyAllowEntry(name, match.command, match.args)
+	if entry.SHA256 == "" {
+		fmt.Fprintf(os.Stderr, "[sylenix-guard] warning: cannot resolve %q for SHA-256 verification; no new hash will be recorded\n", match.command)
+	}
+	if !mergeAllowEntries(pf, []policyAllowEntry{entry}) {
+		fmt.Printf("already allowlisted in %s\n", path)
+		return 0
+	}
+	if err := writePolicyFile(path, pf); err != nil {
+		fmt.Fprintln(os.Stderr, "sylenix-guard allow:", err)
+		return 2
+	}
+	fmt.Printf("allowlisted %q in %s\n", name, path)
+	return 0
+}
+
 func defaultPolicyYAML() string {
 	var b strings.Builder
 	b.WriteString("version: 1\nprofile: auto\napproval: deny\nspotlight: true\nsensitive_paths:\n")
@@ -876,7 +1388,7 @@ func defaultPolicyYAML() string {
 		quoted, _ := json.Marshal(p)
 		fmt.Fprintf(&b, "  - %s\n", quoted)
 	}
-	b.WriteString("egress:\n  allow_hosts: []\n  deny_hosts: []\nservers: {}\n")
+	b.WriteString("egress:\n  allow_hosts: []\n  deny_hosts: []\nallowlist_enforced: false\nallowlist: []\nservers: {}\n")
 	return b.String()
 }
 
@@ -1348,6 +1860,232 @@ func (g *Guard) applyProfile(profile *policyProfile) {
 	}
 }
 
+func yamlPolicyString(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
+}
+
+func writePolicyYAMLList(b *strings.Builder, indent int, key string, values []string) {
+	pad := strings.Repeat(" ", indent)
+	if len(values) == 0 {
+		fmt.Fprintf(b, "%s%s: []\n", pad, key)
+		return
+	}
+	fmt.Fprintf(b, "%s%s:\n", pad, key)
+	for _, value := range values {
+		fmt.Fprintf(b, "%s  - %s\n", pad, yamlPolicyString(value))
+	}
+}
+
+func sortedPolicyServerNames(m map[string]policyServer) []string {
+	names := make([]string, 0, len(m))
+	for name := range m {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func sortedPolicyToolNames(m map[string]policyTool) []string {
+	names := make([]string, 0, len(m))
+	for name := range m {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func marshalPolicyYAML(pf *policyFile) []byte {
+	var b strings.Builder
+	fmt.Fprintf(&b, "version: %d\n", pf.Version)
+	if pf.Profile != "" {
+		fmt.Fprintf(&b, "profile: %s\n", yamlPolicyString(pf.Profile))
+	}
+	if pf.Approval != "" {
+		fmt.Fprintf(&b, "approval: %s\n", yamlPolicyString(pf.Approval))
+	}
+	if pf.Spotlight != nil {
+		fmt.Fprintf(&b, "spotlight: %t\n", *pf.Spotlight)
+	}
+	if len(pf.SensitivePaths) > 0 {
+		writePolicyYAMLList(&b, 0, "sensitive_paths", pf.SensitivePaths)
+	}
+	if pf.Egress != nil {
+		b.WriteString("egress:\n")
+		writePolicyYAMLList(&b, 2, "allow_hosts", pf.Egress.AllowHosts)
+		writePolicyYAMLList(&b, 2, "deny_hosts", pf.Egress.DenyHosts)
+	}
+	enforced := false
+	if pf.AllowlistEnforced != nil {
+		enforced = *pf.AllowlistEnforced
+	} else if len(pf.Allowlist) > 0 {
+		enforced = true
+	}
+	if pf.AllowlistEnforced != nil || len(pf.Allowlist) > 0 {
+		fmt.Fprintf(&b, "allowlist_enforced: %t\n", enforced)
+	}
+	if len(pf.Allowlist) > 0 {
+		b.WriteString("allowlist:\n")
+		for _, entry := range pf.Allowlist {
+			fmt.Fprintf(&b, "  - name: %s\n", yamlPolicyString(entry.Name))
+			fmt.Fprintf(&b, "    command: %s\n", yamlPolicyString(entry.Command))
+			if entry.Args == nil || len(*entry.Args) == 0 {
+				b.WriteString("    args: []\n")
+			} else {
+				b.WriteString("    args:\n")
+				for _, arg := range *entry.Args {
+					fmt.Fprintf(&b, "      - %s\n", yamlPolicyString(arg))
+				}
+			}
+			if entry.SHA256 != "" {
+				fmt.Fprintf(&b, "    sha256: %s\n", yamlPolicyString(entry.SHA256))
+			}
+			if entry.Lockfile != "" {
+				fmt.Fprintf(&b, "    lockfile: %s\n", yamlPolicyString(entry.Lockfile))
+			}
+		}
+	} else if pf.AllowlistEnforced != nil && *pf.AllowlistEnforced {
+		b.WriteString("allowlist: []\n")
+	}
+	if len(pf.Servers) > 0 {
+		b.WriteString("servers:\n")
+		for _, serverName := range sortedPolicyServerNames(pf.Servers) {
+			server := pf.Servers[serverName]
+			fmt.Fprintf(&b, "  %s:\n", yamlPolicyString(serverName))
+			if len(server.Tools) == 0 {
+				b.WriteString("    tools: {}\n")
+				continue
+			}
+			b.WriteString("    tools:\n")
+			for _, toolName := range sortedPolicyToolNames(server.Tools) {
+				tool := server.Tools[toolName]
+				fmt.Fprintf(&b, "      %s:\n", yamlPolicyString(toolName))
+				fmt.Fprintf(&b, "        class: %s\n", yamlPolicyString(tool.Class))
+				if len(tool.PathKeys) > 0 {
+					writePolicyYAMLList(&b, 8, "path_keys", tool.PathKeys)
+				}
+				if len(tool.AllowPaths) > 0 {
+					writePolicyYAMLList(&b, 8, "allow_paths", tool.AllowPaths)
+				}
+				if tool.Trust {
+					b.WriteString("        trust: true\n")
+				}
+			}
+		}
+	}
+	return []byte(b.String())
+}
+
+func policyWritePath(explicit, stateDir string) (string, error) {
+	if explicit != "" {
+		return explicit, nil
+	}
+	if stateDir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("cannot find home directory; pass --state-dir or --policy")
+		}
+		stateDir = filepath.Join(home, ".sylenix-poc")
+	}
+	return filepath.Join(stateDir, policyFileName), nil
+}
+
+func loadPolicyForUpdate(path string) (*policyFile, error) {
+	b, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return &policyFile{
+			Version:           policyVersion,
+			AllowlistEnforced: boolPtr(true),
+			Allowlist:         []policyAllowEntry{},
+		}, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("cannot read policy %s: %w", path, err)
+	}
+	pf, err := parsePolicyBytes(b)
+	if err != nil {
+		return nil, fmt.Errorf("policy %s: %w", path, err)
+	}
+	return pf, nil
+}
+
+func sameAllowArgs(a, b *[]string) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	if len(*a) != len(*b) {
+		return false
+	}
+	for i := range *a {
+		if (*a)[i] != (*b)[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func sameAllowEntry(a, b policyAllowEntry) bool {
+	return a.Name == b.Name && a.Command == b.Command && a.SHA256 == b.SHA256 &&
+		a.Lockfile == b.Lockfile && sameAllowArgs(a.Args, b.Args)
+}
+
+func mergeAllowEntries(pf *policyFile, entries []policyAllowEntry) bool {
+	changed := false
+	if pf.AllowlistEnforced == nil || !*pf.AllowlistEnforced {
+		pf.AllowlistEnforced = boolPtr(true)
+		changed = true
+	}
+	for _, entry := range entries {
+		replaced := false
+		for i := range pf.Allowlist {
+			if entry.Name != "" && pf.Allowlist[i].Name == entry.Name {
+				// Do not drop a hash just because the command cannot be
+				// resolved right now; keep it while command and args agree.
+				if entry.SHA256 == "" && pf.Allowlist[i].SHA256 != "" &&
+					entry.Command == pf.Allowlist[i].Command && sameAllowArgs(entry.Args, pf.Allowlist[i].Args) {
+					entry.SHA256 = pf.Allowlist[i].SHA256
+					entry.Lockfile = pf.Allowlist[i].Lockfile
+				}
+				if !sameAllowEntry(pf.Allowlist[i], entry) {
+					pf.Allowlist[i] = entry
+					changed = true
+				}
+				replaced = true
+				break
+			}
+		}
+		if replaced {
+			continue
+		}
+		duplicate := false
+		for i := range pf.Allowlist {
+			if sameAllowEntry(pf.Allowlist[i], entry) {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate {
+			pf.Allowlist = append(pf.Allowlist, entry)
+			changed = true
+		}
+	}
+	return changed
+}
+
+func writePolicyFile(path string, pf *policyFile) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	return writeConfigAtomic(path, marshalPolicyYAML(pf), 0o600)
+}
+
+func writeDefaultPolicyFile(path string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	return writeConfigAtomic(path, []byte(defaultPolicyYAML()), 0o600)
+}
+
 // ---------------------------------------------------------------- strict YAML subset
 
 // The policy loader intentionally supports only the YAML needed by the schema:
@@ -1510,8 +2248,29 @@ func parseYAMLSequence(lines []yamlLine, pos *int, indent int) ([]any, error) {
 			}
 			continue
 		}
-		if rest[0] != '"' && rest[0] != '\'' && rest[0] != '[' && rest[0] != '{' && strings.Contains(rest, ": ") {
-			return nil, fmt.Errorf("line %d: sequence mappings are not supported", line.number)
+		if rest[0] != '[' && rest[0] != '{' {
+			if _, _, keyErr := splitYAMLKey(rest); keyErr == nil {
+				spaces := 0
+				for i := 1; i < len(line.text) && line.text[i] == ' '; i++ {
+					spaces++
+				}
+				itemIndent := indent + 1 + spaces
+				sub := []yamlLine{{indent: itemIndent, text: rest, number: line.number}}
+				for *pos < len(lines) && lines[*pos].indent > indent {
+					sub = append(sub, lines[*pos])
+					*pos = *pos + 1
+				}
+				local := 0
+				child, err := parseYAMLBlock(sub, &local, itemIndent)
+				if err != nil {
+					return nil, err
+				}
+				if local != len(sub) {
+					return nil, fmt.Errorf("line %d: unexpected indentation in sequence item", sub[local].number)
+				}
+				out = append(out, child)
+				continue
+			}
 		}
 		v, err := parseYAMLValue(rest)
 		if err != nil {
@@ -3780,6 +4539,12 @@ func runConfigCommand(action string, args []string) int {
 	fs.SetOutput(os.Stderr)
 	yes := fs.Bool("yes", false, "apply changes without asking for confirmation")
 	dryRun := fs.Bool("dry-run", false, "show the diff but do not write")
+	policyPath := ""
+	stateDir := ""
+	if action == "install" {
+		fs.StringVar(&policyPath, "policy", "", "policy file to update with the server allowlist (default: <state-dir>/policy.yaml)")
+		fs.StringVar(&stateDir, "state-dir", "", "state directory for the default policy file (default ~/.sylenix-poc)")
+	}
 	if err := fs.Parse(args); err != nil {
 		if err == flag.ErrHelp {
 			return 0
@@ -3799,6 +4564,65 @@ func runConfigCommand(action string, args []string) int {
 		guardPath = abs
 	}
 
+	// Pin custom policy/state paths in the wrapper, otherwise the installed
+	// config would launch the guard with the default paths and never load the
+	// allowlist install just wrote.
+	var wrapperFlags []string
+	if action == "install" {
+		if policyPath != "" {
+			abs, err := filepath.Abs(policyPath)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "sylenix-guard install:", err)
+				return 2
+			}
+			wrapperFlags = append(wrapperFlags, "--policy="+abs)
+		}
+		if stateDir != "" {
+			abs, err := filepath.Abs(stateDir)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "sylenix-guard install:", err)
+				return 2
+			}
+			wrapperFlags = append(wrapperFlags, "--state-dir="+abs)
+		}
+	}
+
+	var entries []policyAllowEntry
+	var pf *policyFile
+	var policyFile string
+	if action == "install" && !*dryRun {
+		policyFile, err = policyWritePath(policyPath, stateDir)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "sylenix-guard install:", err)
+			return 2
+		}
+		var errs []error
+		entries, errs = collectConfiguredServers()
+		if len(errs) > 0 {
+			for _, err := range errs {
+				fmt.Fprintln(os.Stderr, "sylenix-guard install:", err)
+			}
+			fmt.Fprintln(os.Stderr, "sylenix-guard install: refusing to change configs or the allowlist while a supported config cannot be read")
+			return 1
+		}
+		if len(entries) > 0 {
+			// Validate an existing policy before touching any config, and make
+			// sure a custom --policy path exists for the wrapper to load even if
+			// the allowlist prompt is declined.
+			if _, statErr := os.Stat(policyFile); policyPath != "" && os.IsNotExist(statErr) {
+				if err := writeDefaultPolicyFile(policyFile); err != nil {
+					fmt.Fprintln(os.Stderr, "sylenix-guard install:", err)
+					return 1
+				}
+			}
+			pf, err = loadPolicyForUpdate(policyFile)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "sylenix-guard install:", err)
+				return 2
+			}
+		}
+	}
+
 	found := false
 	failures := 0
 	for _, target := range discoverConfigTargets() {
@@ -3811,7 +4635,7 @@ func runConfigCommand(action string, args []string) int {
 			continue
 		}
 		found = true
-		if err := processConfigFile(action, target, guardPath, *yes, *dryRun); err != nil {
+		if err := processConfigFile(action, target, guardPath, wrapperFlags, *yes, *dryRun); err != nil {
 			fmt.Fprintf(os.Stderr, "%s: %s: %v\n", action, target.path, err)
 			failures++
 		}
@@ -3821,6 +4645,31 @@ func runConfigCommand(action string, args []string) int {
 	}
 	if failures > 0 {
 		return 1
+	}
+	if action == "install" && !*dryRun && len(entries) > 0 {
+		if changed := mergeAllowEntries(pf, entries); changed {
+			if !*yes {
+				fmt.Printf("Add these server commands to the allowlist in %s?\n", policyFile)
+				for _, entry := range entries {
+					args, _ := json.Marshal(entry.Args)
+					fmt.Printf("  %s: %s %s\n", entry.Name, yamlPolicyString(entry.Command), args)
+				}
+				fmt.Printf("Approve the allowlist? [y/N] ")
+				answer, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+				answer = strings.ToLower(strings.TrimSpace(answer))
+				if answer != "y" && answer != "yes" {
+					fmt.Println("allowlist not changed; use sylenix-guard allow <name> later")
+					return 0
+				}
+			}
+			if err := writePolicyFile(policyFile, pf); err != nil {
+				fmt.Fprintln(os.Stderr, "sylenix-guard install:", err)
+				return 1
+			}
+			fmt.Printf("wrote allowlist entries to %s\n", policyFile)
+		} else {
+			fmt.Printf("allowlist in %s is already up to date\n", policyFile)
+		}
 	}
 	return 0
 }
@@ -3876,7 +4725,7 @@ func discoverConfigTargets() []configTarget {
 	return out
 }
 
-func processConfigFile(action string, target configTarget, guardPath string, yes, dryRun bool) error {
+func processConfigFile(action string, target configTarget, guardPath string, wrapperFlags []string, yes, dryRun bool) error {
 	info, err := os.Stat(target.path)
 	if err != nil {
 		return err
@@ -3915,7 +4764,7 @@ func processConfigFile(action string, target configTarget, guardPath string, yes
 				continue
 			}
 			if action == "install" {
-				wrapped, report := wrapConfigEntry(entry, guardPath)
+				wrapped, report := wrapConfigEntry(entry, guardPath, wrapperFlags)
 				if wrapped {
 					changed = true
 					fmt.Printf("wrap %s [%s] %s\n", target.client, strings.Join(path, "."), name)
@@ -4174,7 +5023,7 @@ func remoteConfigEntry(entry *configObject) bool {
 	return false
 }
 
-func wrapConfigEntry(entry *configObject, guardPath string) (bool, string) {
+func wrapConfigEntry(entry *configObject, guardPath string, wrapperFlags []string) (bool, string) {
 	if _, ok := entry.get(guardMetaKey); ok {
 		return false, "already wrapped"
 	}
@@ -4232,7 +5081,10 @@ func wrapConfigEntry(entry *configObject, guardPath string) (bool, string) {
 		}
 	}
 
-	wrapperArgs := make([]any, 0, len(originalArgs)+2)
+	wrapperArgs := make([]any, 0, len(originalArgs)+len(wrapperFlags)+2)
+	for _, flag := range wrapperFlags {
+		wrapperArgs = append(wrapperArgs, flag)
+	}
 	wrapperArgs = append(wrapperArgs, "--", command)
 	wrapperArgs = append(wrapperArgs, originalArgs...)
 	entry.set("command", guardPath)
@@ -4283,14 +5135,22 @@ func unwrapConfigEntry(entry *configObject, guardPath string) (bool, string) {
 	if !ok || len(args) < 2 {
 		return false, "cannot restore: wrapper args are missing"
 	}
-	if marker, _ := args[0].(string); marker != "--" {
-		return false, "cannot restore: wrapper args do not start with --"
+	rawArgs := make([]string, 0, len(args))
+	for _, arg := range args {
+		text, ok := arg.(string)
+		if !ok {
+			return false, "cannot restore: wrapper args contain a non-string"
+		}
+		rawArgs = append(rawArgs, text)
 	}
-	originalCommand, ok := args[1].(string)
+	originalCommand, originalStrings, ok := guardWrapperCommand(rawArgs)
 	if !ok || originalCommand == "" {
-		return false, "cannot restore: original command is missing"
+		return false, "cannot restore: wrapper args do not contain -- <command>"
 	}
-	originalArgs := args[2:]
+	originalArgs := make([]any, len(originalStrings))
+	for i, arg := range originalStrings {
+		originalArgs[i] = arg
+	}
 	if hasMeta && hadEnv {
 		if _, ok := entry.get("env"); !ok {
 			return false, "cannot restore: original env is missing"
