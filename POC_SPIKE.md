@@ -13,6 +13,7 @@ The code in section 8 was compiled, vetted with `go vet`, formatted with `gofmt`
 | Protocol self-test (`demo/selftest.py`) | 101 checks, all passing in both flags mode and `--policy` mode (23 original, 5 added in Wave 1A, 40 in Wave 1C, 24 in Wave 6, 3 for the null-pin fix, 6 for server-request taint). On Windows the dialog-fails-closed check skips, so 100 run there. |
 | Built-in profile probes (`tests/probes/test_profiles.py`) | All ten profiles pass: one read allowed after taint, one write/egress blocked, plus override and explicit-profile checks. |
 | Server allowlist probes (`tests/probes/test_allowlist.py`) | Unapproved server refused before launch (`SERVER_NOT_ALLOWED`), approved server starts, changed binary and lockfile hashes refused, `allow` writes the entry, and install pre-populates the policy. |
+| Doctor probes (`tests/probes/test_doctor.py`) | 99 checks, all passing: clean setup, every finding, JSON shape, no argument/env leakage and read-only behavior. |
 | Prompt replay (`scripts/replay_profile_session.py`) | The recorded normal filesystem session reports 1 approval prompt in 1 active hour, below the 10/hour budget. |
 | Full harness run through the real MCP Python SDK (`mcp` 1.30) with the scripted agent, 3 runs per cell | Plumbing works: unguarded runs leak the canary, guarded runs block it |
 | Run with a real model | **Run.** qwen/qwen3.5-9b via LM Studio, temperature 0, 10 runs per cell; raw data in `docs/qwen-guarded-data/` and `docs/day2b-data/`. The harness later gained local and Gemini agents. |
@@ -56,6 +57,7 @@ A 45-second video is a by-product of answering these, not the goal.
 - Versioned policy file (`--policy PATH`, else `<state-dir>/policy.yaml`, else built-in defaults) with per-server/per-tool classes (`read`, `write`, `exec`, `egress`), optional path keys, allow paths and trust, global sensitive-path patterns, egress host allow/deny lists, approval mode and spotlight. Unknown tools default to `exec`; unknown fields are startup errors. Existing flags keep working and override the file.
 - Built-in profiles for filesystem, git, GitHub, fetch, shell, Slack, Postgres, browser (Playwright/Puppeteer), Notion and Jira, selected automatically from the server command/package name and overridable per tool in the policy file. A replay script reports approval prompts per active hour for a recorded normal session.
 - Server-command allowlist in the policy file: exact command and argument patterns, optional SHA-256 of the binary or a lockfile, `sylenix-guard allow <name>` after showing the configured command and confirming, and install pre-population. An unapproved launch is refused before the child process starts with `SERVER_NOT_ALLOWED`.
+- `sylenix-guard doctor` audits the supported MCP client configs: wrapped and unwrapped servers, allowlist gaps, risky scratch/trust/approval settings, unsigned policy/pins with `--require-signatures` until signing lands, and outdated Guard binaries. It is read-only and exits 0 when clean, 1 when findings exist.
 - JSON-RPC errors that never drop the connection: `-32000` blocked, `-32001` quarantined, `-32002` denied.
 - Fail closed on unparseable or batch frames from the host.
 - Audit log (JSON lines) that records tool names and argument key names, never argument values.
@@ -197,6 +199,7 @@ Error data contains only a rule name. Policy details go to the audit log, not to
 - **`--readonly` bypasses every sink check,** including the hard blocks above. Listing a tool there is a trust decision, and a mis-listed tool defeats all of this.
 - **Process cleanup is minimal.** On a signal the guard kills the child it started, not its descendants (for example the node process behind `npx`).
 - **Unbounded bookkeeping.** The map of pending request ids never expires entries for requests that are never answered.
+- **`doctor` audits configuration, not a live session.** It only reads the client config paths it knows, recognizes hand-written wrappers by the `sylenix-guard` executable name or the `_sylenixGuard` metadata, resolves relative wrapper paths against its own working directory, and never executes the server or Guard binary. Policy and pin signing is not implemented yet; `--require-signatures` reports an unverified file as unsigned rather than assuming it is safe.
 - **Not tested** on macOS, or inside Claude Desktop or Cursor. Windows and LM Studio
   were exercised in the 7-day trial (`docs/FEEDBACK_LOG.md`).
 

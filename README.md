@@ -78,6 +78,9 @@ wraps one MCP server per process over stdio.
 - Server-command allowlist with exact command/args entries and optional SHA-256
   of the binary or package lock; `sylenix-guard allow <name>` and install
   pre-population
+- `sylenix-guard doctor` audit of supported MCP client configs: wrapped vs
+  unwrapped servers, allowlist gaps, risky scratch/trust/approval settings,
+  unsigned policy/pins (opt-in until signing lands) and outdated Guard binaries
 - Scratch-directory write policy (`--allow-write-under`)
 - Time-bounded, directory-scoped human approvals (dialog and `--grant`)
 - Native approval dialogs: osascript (macOS), zenity (Linux), PowerShell form (Windows)
@@ -103,7 +106,7 @@ CGO_ENABLED=0 go build -o bin/sylenix-guard ./cmd/sylenix-guard
 CGO_ENABLED=0 go build -o bin/sylenix-guard.exe ./cmd/sylenix-guard
 ```
 
-`make check` runs gofmt, go vet, the protocol self-test, the probe suites, the built-in profile tests, the prompt-cost replay and the audit summarizer fixture.
+`make check` runs gofmt, go vet, the protocol self-test, the probe suites, the built-in profile tests, the prompt-cost replay, the audit summarizer fixture and the doctor probes.
 On Windows, `make check` needs a POSIX shell (Git Bash or WSL). Without one, run the
 same steps directly: `gofmt -l cmd`, `go vet ./...`, `python demo/selftest.py`.
 
@@ -140,6 +143,23 @@ bin/sylenix-guard --name filesystem --approve dialog \
 List in `--readonly` only tools that are pure reads. Tools on that list run freely on a
 tainted session, so the list is a trust decision: when in doubt, leave a tool off, and
 unclassifiable traffic is handled by the most restrictive tier.
+
+### Check the installation
+
+`sylenix-guard doctor` reads the supported MCP client configs and reports what is
+actually protected. It never launches a server, never writes a config, policy or pin
+file, and never prints command arguments or environment values.
+
+```bash
+sylenix-guard doctor                 # human-readable report
+sylenix-guard doctor --json          # stable JSON for scripts
+sylenix-guard doctor --policy ./policy.yaml --state-dir ./.state
+sylenix-guard doctor --require-signatures
+```
+
+Exit code is `0` when there are no findings, `1` when there are findings, and `2` for a
+usage error. Each finding has one suggested fix. The full finding list is in
+[`docs/DOCTOR.md`](docs/DOCTOR.md).
 
 ## Configuration
 
@@ -220,6 +240,8 @@ sends nothing anywhere. Summaries with prompts-per-active-hour metrics:
   profiles, one allowed read and one blocked write/egress each.
 - Server allowlist: `python tests/probes/test_allowlist.py` checks refusal,
   approval, changed binary/lockfile hashes, `allow` and install pre-population.
+- Doctor: `python tests/probes/test_doctor.py` covers a clean setup, every
+  finding, JSON shape, no argument/env leakage and read-only behavior.
 - Prompt cost: `python scripts/replay_profile_session.py` replays a recorded
   normal session and reports approval prompts per active hour.
 - Releases: tag `vX.Y.Z`; checksum, Cosign, SBOM, Homebrew and Scoop verification
@@ -301,6 +323,12 @@ bypass, response expectations and safe harbour.
 - Egress host matching is textual on the argument value. It does not resolve DNS,
   follow redirects, inspect the actual connection or pin the resolved IP.
 - Manifest pinning is trust on first use; pin files are not signed.
+- `doctor` only reads the config paths it knows. It recognizes hand-written
+  wrappers by the `sylenix-guard` executable name (or the `_sylenixGuard`
+  metadata), resolves relative wrapper paths against its own working directory,
+  and cannot verify policy or pin signatures until signing lands; with
+  `--require-signatures` it reports an unverified file as unsigned rather than
+  assuming it is safe. It never executes the configured server or Guard binary.
 - Datamarking breaks some emoji sequences and some Persian and Indic text.
 - The dialog is not biometric: long or confusable arguments can mislead, and while it is
   open the host's other requests wait. The Windows dialog was exercised in the 7-day

@@ -15,6 +15,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"debug/buildinfo"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
@@ -49,6 +50,10 @@ const guardMetaVersion = 1
 
 const policyVersion = 1
 const policyFileName = "policy.yaml"
+
+// version is the Guard build version. Release builds set it with
+// -ldflags "-X main.version=<tag>"; local builds keep this default.
+var version = "0.1.0"
 
 // policyFile is the on-disk policy schema. It is decoded strictly: any field
 // this struct does not name is an error, never silently ignored.
@@ -187,6 +192,8 @@ func main() {
 			os.Exit(runPolicyCommand(os.Args[2:]))
 		case "allow":
 			os.Exit(runAllowCommand(os.Args[2:]))
+		case "doctor":
+			os.Exit(runDoctorCommand(os.Args[2:]))
 		}
 	}
 	name := flag.String("name", "", "label for this server; names the pin and log files (default: command name)")
@@ -4530,6 +4537,1388 @@ func sortedKeys(m map[string]bool) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// ---------------------------------------------------------------- doctor
+
+// doctorFinding is one issue found by `sylenix-guard doctor`. Detail and Fix
+// never contain tool argument values, env values, secrets or file contents.
+type doctorFinding struct {
+	Code     string `json:"code"`
+	Severity string `json:"severity"`
+	Client   string `json:"client,omitempty"`
+	Config   string `json:"config,omitempty"`
+	Server   string `json:"server,omitempty"`
+	Detail   string `json:"detail"`
+	Fix      string `json:"fix"`
+}
+
+type doctorReport struct {
+	Version  string          `json:"version"`
+	Clean    bool            `json:"clean"`
+	Configs  []doctorConfig  `json:"configs"`
+	Findings []doctorFinding `json:"findings"`
+}
+
+type doctorConfig struct {
+	Client  string             `json:"client"`
+	Path    string             `json:"path"`
+	Error   string             `json:"error,omitempty"`
+	Servers []doctorServerView `json:"servers"`
+}
+
+// doctorServerView deliberately has no command, args or env fields: doctor
+// output is not a place for argument values.
+type doctorServerView struct {
+	Name         string   `json:"name"`
+	Map          string   `json:"map"`
+	Transport    string   `json:"transport"`
+	Wrapped      bool     `json:"wrapped"`
+	Allowlisted  bool     `json:"allowlisted"`
+	Approval     string   `json:"approval,omitempty"`
+	TrustedTools []string `json:"trusted_tools,omitempty"`
+	ScratchDirs  []string `json:"scratch_dirs,omitempty"`
+	Policy       string   `json:"policy,omitempty"`
+	Error        string   `json:"error,omitempty"`
+}
+
+// doctorWrapperFlags is the subset of Guard flags doctor understands. An
+// unknown flag is a finding, never something to ignore.
+type doctorWrapperFlags struct {
+	HasName     bool
+	Name        string
+	HasStateDir bool
+	StateDir    string
+	HasPolicy   bool
+	Policy      string
+	HasReadonly bool
+	Readonly    string
+	HasTrust    bool
+	Trust       string
+	HasApprove  bool
+	Approve     string
+	HasScratch  bool
+	Scratch     []scratchRule
+	NoSpotlight bool
+	ResetPins   bool
+	HasGrant    bool
+	Grants      []string
+}
+
+type doctorServer struct {
+	Name         string
+	Client       string
+	ConfigPath   string
+	Remote       bool
+	Wrapped      bool
+	Metadata     bool
+	MetaVersion  int
+	GuardCommand string
+	OriginalCmd  string
+	OriginalArgs []string
+	Flags        doctorWrapperFlags
+}
+
+type doctorPolicy struct {
+	pf   *policyFile
+	path string
+	err  string
+}
+
+type doctorEffective struct {
+	Approve           string
+	Readonly          map[string]bool
+	Trust             map[string]bool
+	Classes           map[string]string
+	Scratch           []scratchRule
+	AllowlistEnforced bool
+}
+
+type doctorRun struct {
+	policyExplicit    bool
+	policyPath        string
+	stateDir          string
+	requireSignatures bool
+	home              string
+	cwd               string
+	repoRoot          string
+	configs           []doctorConfig
+	findings          []doctorFinding
+}
+
+func runDoctorCommand(args []string) int {
+	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	jsonOut := fs.Bool("json", false, "print machine-readable JSON")
+	policyPath := fs.String("policy", "", "check this policy file instead of the wrapper or default policy")
+	stateDir := fs.String("state-dir", "", "state directory used when a wrapper does not pin one (default ~/.sylenix-poc)")
+	requireSignatures := fs.Bool("require-signatures", false, "report policy and pin files whose signature cannot be verified")
+	if err := fs.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			return 0
+		}
+		return 2
+	}
+	visited := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { visited[f.Name] = true })
+	if fs.NArg() != 0 {
+		fmt.Fprintln(os.Stderr, "sylenix-guard doctor: unexpected arguments")
+		return 2
+	}
+	if visited["policy"] && *policyPath == "" {
+		fmt.Fprintln(os.Stderr, "sylenix-guard doctor: --policy needs a file path")
+		return 2
+	}
+	if visited["state-dir"] && *stateDir == "" {
+		fmt.Fprintln(os.Stderr, "sylenix-guard doctor: --state-dir needs a directory")
+		return 2
+	}
+	home, _ := os.UserHomeDir()
+	cwd, _ := os.Getwd()
+	d := &doctorRun{
+		policyExplicit:    visited["policy"],
+		policyPath:        *policyPath,
+		stateDir:          *stateDir,
+		requireSignatures: *requireSignatures,
+		home:              home,
+		cwd:               cwd,
+	}
+	report, code := d.run()
+	if *jsonOut {
+		if writeCode := d.writeJSON(report); writeCode != 0 {
+			return writeCode
+		}
+	} else {
+		d.writeHuman(report)
+	}
+	return code
+}
+
+func (d *doctorRun) run() (doctorReport, int) {
+	if d.home != "" {
+		if canonical, ok := canonicalPath(d.home); ok {
+			d.home = canonical
+		}
+	}
+	d.repoRoot = findDoctorRepoRoot(d.cwd)
+	if d.repoRoot != "" {
+		if canonical, ok := canonicalPath(d.repoRoot); ok {
+			d.repoRoot = canonical
+		}
+	}
+
+	var explicit *doctorPolicy
+	if d.policyExplicit {
+		pol := readDoctorPolicyFile(d.policyPath)
+		if pol.err != "" {
+			d.findings = append(d.findings, newDoctorFinding("POLICY_INVALID", "error", "", "", "",
+				pol.err, "run `sylenix-guard policy validate <file>` and fix the policy, or pass the right --policy"))
+			return d.report(), 1
+		}
+		explicit = &pol
+	}
+
+	for _, target := range discoverConfigTargets() {
+		cfg, findings := d.inspectConfig(target, explicit)
+		if cfg != nil {
+			d.configs = append(d.configs, *cfg)
+		}
+		d.findings = append(d.findings, findings...)
+	}
+	sortDoctorFindings(d.findings)
+	report := d.report()
+	if report.Clean {
+		return report, 0
+	}
+	return report, 1
+}
+
+func (d *doctorRun) inspectConfig(target configTarget, explicit *doctorPolicy) (*doctorConfig, []doctorFinding) {
+	cfg := &doctorConfig{Client: target.client, Path: target.path, Servers: []doctorServerView{}}
+	info, err := os.Stat(target.path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		cfg.Error = "config cannot be inspected"
+		return cfg, []doctorFinding{newDoctorFinding("CONFIG_UNREADABLE", "error", target.client, target.path, "",
+			"config cannot be inspected", "check file permissions or repair the config")}
+	}
+	if info.IsDir() {
+		cfg.Error = "config path is a directory"
+		return cfg, []doctorFinding{newDoctorFinding("CONFIG_UNREADABLE", "error", target.client, target.path, "",
+			"config path is a directory", "remove the directory or fix the client config path")}
+	}
+	data, err := os.ReadFile(target.path)
+	if err != nil {
+		cfg.Error = "config cannot be read"
+		return cfg, []doctorFinding{newDoctorFinding("CONFIG_UNREADABLE", "error", target.client, target.path, "",
+			"config cannot be read", "check file permissions")}
+	}
+	if hasDuplicateKeys(data) {
+		cfg.Error = "config has duplicate JSON keys"
+		return cfg, []doctorFinding{newDoctorFinding("CONFIG_UNREADABLE", "error", target.client, target.path, "",
+			"config has duplicate JSON keys", "remove the duplicate keys; the guard refuses ambiguous configs")}
+	}
+	root, err := parseConfigObject(data)
+	if err != nil {
+		cfg.Error = "config is not valid JSON"
+		return cfg, []doctorFinding{newDoctorFinding("CONFIG_UNREADABLE", "error", target.client, target.path, "",
+			"config is not valid JSON", "repair the JSON or remove the config")}
+	}
+
+	var findings []doctorFinding
+	for _, serverPath := range target.serverPaths {
+		serverMap, exists, err := lookupConfigMap(root, serverPath)
+		mapName := strings.Join(serverPath, ".")
+		if err != nil {
+			cfg.Error = "server map is not an object"
+			findings = append(findings, newDoctorFinding("CONFIG_UNREADABLE", "error", target.client, target.path, "",
+				fmt.Sprintf("server map %q is not an object", mapName), "make the server map a JSON object"))
+			continue
+		}
+		if !exists {
+			continue
+		}
+		for _, name := range sortedObjectKeys(serverMap) {
+			value, _ := serverMap.get(name)
+			entry, ok := value.(*configObject)
+			if !ok {
+				view := doctorServerView{Name: name, Map: mapName, Transport: "stdio", Error: "server entry is not an object"}
+				cfg.Servers = append(cfg.Servers, view)
+				findings = append(findings, newDoctorFinding("SERVER_INVALID", "error", target.client, target.path, name,
+					"server entry is not an object", "make the server entry a JSON object"))
+				continue
+			}
+			if name == "" || hasUnsafePolicyChars(name) {
+				view := doctorServerView{Name: name, Map: mapName, Transport: "stdio", Error: "server name is empty or contains control characters"}
+				cfg.Servers = append(cfg.Servers, view)
+				findings = append(findings, newDoctorFinding("SERVER_INVALID", "error", target.client, target.path, name,
+					"server name is empty or contains control or invisible characters", "give the server a plain non-empty name"))
+				continue
+			}
+			server, code, detail := inspectDoctorServer(entry, name, target.client, target.path)
+			view := doctorServerView{Name: name, Map: mapName, Transport: "stdio", Wrapped: server.Wrapped}
+			if server.Remote {
+				view.Transport = "remote"
+			}
+			if code != "" {
+				view.Error = detail
+				cfg.Servers = append(cfg.Servers, view)
+				findings = append(findings, newDoctorFinding(code, "error", target.client, target.path, name, detail, doctorFixForCode(code)))
+				continue
+			}
+			serverFindings := d.inspectServer(&server, &view, explicit)
+			cfg.Servers = append(cfg.Servers, view)
+			findings = append(findings, serverFindings...)
+		}
+	}
+	return cfg, findings
+}
+
+func inspectDoctorServer(entry *configObject, name, client, configPath string) (doctorServer, string, string) {
+	s := doctorServer{Name: name, Client: client, ConfigPath: configPath}
+	if remoteConfigEntry(entry) {
+		s.Remote = true
+		return s, "", ""
+	}
+	if value, ok := entry.get("type"); ok {
+		text, ok := value.(string)
+		if !ok {
+			return s, "SERVER_INVALID", "server type is not a string"
+		}
+		if text != "" && !strings.EqualFold(strings.TrimSpace(text), "stdio") {
+			return s, "SERVER_INVALID", "server type is not stdio"
+		}
+	}
+	commandValue, ok := entry.get("command")
+	if !ok {
+		return s, "SERVER_INVALID", "server has no command"
+	}
+	command, ok := commandValue.(string)
+	if !ok || command == "" || strings.TrimSpace(command) == "" {
+		return s, "SERVER_INVALID", "server command is not a non-empty string"
+	}
+	if strings.TrimSpace(command) != command {
+		return s, "SERVER_INVALID", "server command has surrounding spaces"
+	}
+	if hasUnsafePolicyChars(command) {
+		return s, "SERVER_INVALID", "server command contains control or invisible characters"
+	}
+	argsValue, ok := entry.get("args")
+	var args []string
+	if ok {
+		list, ok := argsValue.([]any)
+		if !ok {
+			return s, "SERVER_INVALID", "server args is not an array"
+		}
+		for _, item := range list {
+			text, ok := item.(string)
+			if !ok {
+				return s, "SERVER_INVALID", "server args contains a non-string value"
+			}
+			args = append(args, text)
+		}
+	}
+	metaValue, hasMeta := entry.get(guardMetaKey)
+	if hasMeta {
+		meta, ok := metaValue.(*configObject)
+		if !ok {
+			return s, "WRAPPER_INVALID", "Guard metadata is not an object"
+		}
+		versionValue, _ := meta.get("version")
+		metaVersion, ok := jsonIntValue(versionValue)
+		if !ok {
+			return s, "WRAPPER_INVALID", "Guard metadata version is not an integer"
+		}
+		if metaVersion > guardMetaVersion {
+			return s, "WRAPPER_INVALID", "Guard metadata version is newer than this build"
+		}
+		s.Metadata = true
+		s.MetaVersion = metaVersion
+		if metaVersion == guardMetaVersion {
+			hadArgsValue, _ := meta.get("hadArgs")
+			if _, ok := hadArgsValue.(bool); !ok {
+				return s, "WRAPPER_INVALID", "Guard metadata hadArgs is not a boolean"
+			}
+			hadEnvValue, _ := meta.get("hadEnv")
+			if _, ok := hadEnvValue.(bool); !ok {
+				return s, "WRAPPER_INVALID", "Guard metadata hadEnv is not a boolean"
+			}
+		}
+	}
+	s.GuardCommand = command
+	if hasMeta || isGuardCommand(command, "") {
+		s.Wrapped = true
+		sep := findDoctorSeparator(args)
+		if sep < 0 {
+			return s, "WRAPPER_INVALID", "Guard wrapper has no -- separator"
+		}
+		flags, detail := parseDoctorWrapperFlags(args[:sep])
+		if detail != "" {
+			return s, "WRAPPER_INVALID", detail
+		}
+		if sep+1 >= len(args) || args[sep+1] == "" {
+			return s, "WRAPPER_INVALID", "Guard wrapper has no server command after --"
+		}
+		s.Flags = flags
+		s.OriginalCmd = args[sep+1]
+		s.OriginalArgs = append([]string(nil), args[sep+2:]...)
+		if strings.TrimSpace(s.OriginalCmd) == "" || strings.TrimSpace(s.OriginalCmd) != s.OriginalCmd {
+			return s, "WRAPPER_INVALID", "wrapped server command is empty or has surrounding spaces"
+		}
+		if hasUnsafePolicyChars(s.OriginalCmd) {
+			return s, "WRAPPER_INVALID", "wrapped server command contains control or invisible characters"
+		}
+		return s, "", ""
+	}
+	s.OriginalCmd = command
+	s.OriginalArgs = args
+	return s, "", ""
+}
+
+func (d *doctorRun) inspectServer(s *doctorServer, view *doctorServerView, explicit *doctorPolicy) []doctorFinding {
+	var findings []doctorFinding
+	add := func(code, severity, detail, fix string) {
+		findings = append(findings, newDoctorFinding(code, severity, s.Client, s.ConfigPath, s.Name, detail, fix))
+	}
+
+	if s.Remote {
+		add("REMOTE_NOT_COVERED", "risk", "remote MCP transport is not covered by Guard",
+			"use a local stdio server if you need Guard coverage")
+		return findings
+	}
+	if !s.Wrapped {
+		add("NOT_WRAPPED", "risk", "stdio server is not wrapped by Guard",
+			"run `sylenix-guard install` (or wrap the entry manually)")
+	}
+	metadataOutdated := s.Metadata && s.MetaVersion < guardMetaVersion
+	if metadataOutdated {
+		add("OUTDATED_GUARD", "risk",
+			fmt.Sprintf("Guard wrapper metadata version %d is older than %d", s.MetaVersion, guardMetaVersion),
+			"re-run `sylenix-guard install` with this build")
+	}
+	if s.Wrapped {
+		if f := d.checkGuardBinary(*s); f != nil {
+			// The metadata finding already tells the user to re-run install;
+			// keep a missing or unreadable binary finding, but not a duplicate
+			// "outdated" for the same wrapper.
+			if !(metadataOutdated && f.Code == "OUTDATED_GUARD") {
+				findings = append(findings, *f)
+			}
+		}
+	}
+
+	pol := d.resolvePolicy(*s, explicit)
+	view.Policy = pol.path
+	if pol.err != "" {
+		add("POLICY_INVALID", "error", pol.err,
+			"run `sylenix-guard policy validate <file>` and fix the policy, or pass the right --policy")
+		view.Error = pol.err
+		return findings
+	}
+	pf := pol.pf
+
+	srv := policyServer{}
+	if s.Wrapped {
+		var detail string
+		srv, detail = doctorServerPolicy(pf, s.effectiveName(), s.Flags.HasName)
+		if detail != "" {
+			add("POLICY_INVALID", "error", detail, "add the server entry or pass the matching --name")
+			view.Error = detail
+			return findings
+		}
+	}
+	profile := selectPolicyProfile(s.effectiveName(), append([]string{s.OriginalCmd}, s.OriginalArgs...), pf.Profile)
+	eff := computeDoctorEffective(pf, srv, profile, s.Flags)
+
+	allowlisted, hashDetail := doctorAllowlisted(pf, s.OriginalCmd, s.OriginalArgs)
+	view.Allowlisted = allowlisted
+	if !eff.AllowlistEnforced {
+		add("ALLOWLIST_NOT_ENFORCED", "risk", "the policy allowlist is not enforced",
+			"set `allowlist_enforced: true` and add exact server entries")
+	}
+	if !allowlisted {
+		add("NOT_ALLOWLISTED", "risk", "server command and arguments are not in the policy allowlist",
+			fmt.Sprintf("run `sylenix-guard allow %q`", cleanForDialog(s.Name, 80)))
+	}
+	if hashDetail != "" {
+		add("ALLOWLIST_HASH_MISMATCH", "error", hashDetail,
+			"re-run `sylenix-guard allow <name>` to refresh the SHA-256")
+	}
+
+	if !s.Wrapped {
+		return findings
+	}
+
+	view.Approval = eff.Approve
+	if eff.Approve != "dialog" {
+		add("APPROVALS_OFF", "risk",
+			fmt.Sprintf("approval mode is %q; tainted sinks are hard-blocked instead of reviewed", eff.Approve),
+			"set `--approve dialog` in the wrapper or `approval: dialog` in the policy")
+	}
+	trusted := sortedKeys(eff.Trust)
+	if len(trusted) > 0 {
+		view.TrustedTools = trusted
+	}
+	if len(trusted) > 0 && doctorHasEgress(eff) {
+		add("TRUST_ON_EGRESS", "risk",
+			fmt.Sprintf("trusted tools %q on a server with egress-class tools; their results will not latch taint",
+				cleanForDialog(strings.Join(trusted, ","), 120)),
+			"remove `--trust` (or `trust: true`) for this server")
+	}
+	view.ScratchDirs = d.checkScratch(*s, eff.Scratch, &findings)
+	pinsExists, pinsValid := d.checkPins(*s, &findings)
+	if d.requireSignatures {
+		// Policy and pin signing is not implemented yet (Prompt 13). Until it
+		// is, an unverified file is reported as unsigned; it is never assumed
+		// to be safe.
+		if pol.path != "" {
+			add("UNSIGNED_POLICY", "risk",
+				fmt.Sprintf("policy %q is not verifiably signed by this build", cleanForDialog(pol.path, 160)),
+				"upgrade to a build with policy/pin signing and sign the policy")
+		}
+		if pinsExists && pinsValid {
+			add("UNSIGNED_PINS", "risk",
+				fmt.Sprintf("pin file %q is not verifiably signed by this build", cleanForDialog(d.pinsPath(*s), 160)),
+				"upgrade to a build with policy/pin signing and sign the pin file")
+		}
+	}
+	return findings
+}
+
+func (d *doctorRun) checkGuardBinary(s doctorServer) *doctorFinding {
+	path, detail := resolveDoctorGuardCommand(s.GuardCommand)
+	if detail != "" {
+		f := newDoctorFinding("GUARD_NOT_FOUND", "error", s.Client, s.ConfigPath, s.Name,
+			detail, "install Guard at that path or re-run `sylenix-guard install`")
+		return &f
+	}
+	target, known, reason := guardBinaryVersion(path)
+	if !known {
+		f := newDoctorFinding("GUARD_VERSION_UNKNOWN", "risk", s.Client, s.ConfigPath, s.Name,
+			fmt.Sprintf("cannot determine the Guard version at %q: %s", cleanForDialog(path, 160), reason),
+			"point the config at the Guard binary or re-run `sylenix-guard install` with a released build")
+		return &f
+	}
+	if target == version {
+		return nil
+	}
+	current, currentKnown := parseDoctorVersion(version)
+	other, otherKnown := parseDoctorVersion(target)
+	if !otherKnown {
+		f := newDoctorFinding("GUARD_VERSION_UNKNOWN", "risk", s.Client, s.ConfigPath, s.Name,
+			fmt.Sprintf("Guard binary %q reports version %q, which cannot be compared", cleanForDialog(path, 160), cleanForDialog(target, 40)),
+			"reinstall Guard from a released build")
+		return &f
+	}
+	if currentKnown && compareDoctorVersions(other, current) < 0 {
+		f := newDoctorFinding("OUTDATED_GUARD", "risk", s.Client, s.ConfigPath, s.Name,
+			fmt.Sprintf("Guard binary %q is version %s; this doctor is %s", cleanForDialog(path, 160), cleanForDialog(target, 40), cleanForDialog(version, 40)),
+			"upgrade Guard and re-run `sylenix-guard install`")
+		return &f
+	}
+	return nil
+}
+
+func (d *doctorRun) checkScratch(s doctorServer, scratch []scratchRule, findings *[]doctorFinding) []string {
+	var dirs []string
+	seenDirs := map[string]bool{}
+	seenDetail := map[string]bool{}
+	seenUnresolved := false
+	source := "allow_paths"
+	if s.Flags.HasScratch {
+		source = "--allow-write-under"
+	}
+	for _, rule := range scratch {
+		if rule.dir == "" {
+			*findings = append(*findings, newDoctorFinding("WRAPPER_INVALID", "error", s.Client, s.ConfigPath, s.Name,
+				"a scratch rule has an empty directory", "remove the empty scratch entry"))
+			continue
+		}
+		dir, ok := canonicalPath(rule.dir)
+		if !ok {
+			if !seenDirs["<unresolved>"] {
+				seenDirs["<unresolved>"] = true
+				dirs = append(dirs, "<unresolved>")
+			}
+			if !seenUnresolved {
+				seenUnresolved = true
+				*findings = append(*findings, newDoctorFinding("RISKY_SCRATCH", "risk", s.Client, s.ConfigPath, s.Name,
+					"a scratch root cannot be resolved and cannot be proven safe",
+					"use an absolute directory under the project, for example <repo>/out"))
+			}
+			continue
+		}
+		if !seenDirs[dir] {
+			seenDirs[dir] = true
+			dirs = append(dirs, dir)
+		}
+		var reasons []string
+		if d.home != "" {
+			if samePath(dir, d.home) {
+				reasons = append(reasons, "the home directory")
+			} else if insideDir(dir, d.home) {
+				reasons = append(reasons, "an ancestor of the home directory")
+			}
+		}
+		if d.repoRoot != "" {
+			if samePath(dir, d.repoRoot) {
+				reasons = append(reasons, "the repository root")
+			} else if insideDir(dir, d.repoRoot) {
+				reasons = append(reasons, "an ancestor of the repository root")
+			}
+		}
+		if filepath.Dir(dir) == dir {
+			reasons = append(reasons, "a filesystem root")
+		}
+		if len(reasons) == 0 {
+			continue
+		}
+		detail := fmt.Sprintf("%s %q covers %s", source, cleanForDialog(rule.dir, 160), strings.Join(reasons, " and "))
+		if seenDetail[detail] {
+			continue
+		}
+		seenDetail[detail] = true
+		*findings = append(*findings, newDoctorFinding("RISKY_SCRATCH", "risk", s.Client, s.ConfigPath, s.Name,
+			detail, "narrow it to a project subdirectory, for example <repo>/out"))
+	}
+	sort.Strings(dirs)
+	return dirs
+}
+
+func (d *doctorRun) checkPins(s doctorServer, findings *[]doctorFinding) (bool, bool) {
+	if s.Flags.ResetPins {
+		return false, false
+	}
+	path := d.pinsPath(s)
+	if path == "" {
+		return false, false
+	}
+	info, statErr := os.Stat(path)
+	if os.IsNotExist(statErr) {
+		return false, false
+	}
+	if statErr != nil {
+		*findings = append(*findings, newDoctorFinding("PINS_UNREADABLE", "error", s.Client, s.ConfigPath, s.Name,
+			fmt.Sprintf("pin file %q cannot be inspected", cleanForDialog(path, 160)),
+			"inspect the file, or restart with `--reset-pins` to trust every tool as new"))
+		return true, false
+	}
+	if !info.Mode().IsRegular() {
+		*findings = append(*findings, newDoctorFinding("PINS_UNREADABLE", "error", s.Client, s.ConfigPath, s.Name,
+			fmt.Sprintf("pin file %q is not a regular file", cleanForDialog(path, 160)),
+			"replace it with a regular file, or restart with `--reset-pins` to trust every tool as new"))
+		return true, false
+	}
+	if info.Size() > 16<<20 {
+		*findings = append(*findings, newDoctorFinding("PINS_UNREADABLE", "error", s.Client, s.ConfigPath, s.Name,
+			fmt.Sprintf("pin file %q is too large to inspect", cleanForDialog(path, 160)),
+			"inspect the file, or restart with `--reset-pins` to trust every tool as new"))
+		return true, false
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		*findings = append(*findings, newDoctorFinding("PINS_UNREADABLE", "error", s.Client, s.ConfigPath, s.Name,
+			fmt.Sprintf("pin file %q cannot be read", cleanForDialog(path, 160)),
+			"inspect the file, or restart with `--reset-pins` to trust every tool as new"))
+		return true, false
+	}
+	var pins map[string]string
+	if json.Unmarshal(b, &pins) != nil || pins == nil {
+		*findings = append(*findings, newDoctorFinding("PINS_UNREADABLE", "error", s.Client, s.ConfigPath, s.Name,
+			fmt.Sprintf("pin file %q is not a valid JSON hash map", cleanForDialog(path, 160)),
+			"inspect the file, or restart with `--reset-pins` to trust every tool as new"))
+		return true, false
+	}
+	for name, h := range pins {
+		if name == "" || len(h) != sha256.Size*2 {
+			*findings = append(*findings, newDoctorFinding("PINS_UNREADABLE", "error", s.Client, s.ConfigPath, s.Name,
+				fmt.Sprintf("pin file %q contains a value that is not a SHA-256 hash", cleanForDialog(path, 160)),
+				"inspect the file, or restart with `--reset-pins` to trust every tool as new"))
+			return true, false
+		}
+		if _, err := hex.DecodeString(h); err != nil {
+			*findings = append(*findings, newDoctorFinding("PINS_UNREADABLE", "error", s.Client, s.ConfigPath, s.Name,
+				fmt.Sprintf("pin file %q contains a value that is not a SHA-256 hash", cleanForDialog(path, 160)),
+				"inspect the file, or restart with `--reset-pins` to trust every tool as new"))
+			return true, false
+		}
+	}
+	return true, true
+}
+
+func (d *doctorRun) resolvePolicy(s doctorServer, explicit *doctorPolicy) doctorPolicy {
+	if explicit != nil {
+		return *explicit
+	}
+	if s.Flags.HasPolicy {
+		return readDoctorPolicyFile(s.Flags.Policy)
+	}
+	state := d.defaultStateDir()
+	if s.Flags.HasStateDir {
+		state = resolveDoctorPath(s.Flags.StateDir)
+	}
+	if state == "" {
+		return doctorPolicy{err: "cannot determine the state directory; pass --state-dir"}
+	}
+	path := filepath.Join(state, policyFileName)
+	b, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return doctorPolicy{pf: defaultPolicyFile()}
+	}
+	if err != nil {
+		return doctorPolicy{path: path, err: fmt.Sprintf("policy %q cannot be read", cleanForDialog(path, 160))}
+	}
+	pf, err := parsePolicyBytes(b)
+	if err != nil {
+		return doctorPolicy{path: path, err: fmt.Sprintf("policy %q is not valid; run `sylenix-guard policy validate %q`",
+			cleanForDialog(path, 160), cleanForDialog(path, 160))}
+	}
+	return doctorPolicy{pf: pf, path: path}
+}
+
+func (d *doctorRun) defaultStateDir() string {
+	if d.stateDir != "" {
+		return resolveDoctorPath(d.stateDir)
+	}
+	if d.home == "" {
+		return ""
+	}
+	return filepath.Join(d.home, ".sylenix-poc")
+}
+
+func (d *doctorRun) pinsPath(s doctorServer) string {
+	state := d.defaultStateDir()
+	if s.Flags.HasStateDir {
+		state = resolveDoctorPath(s.Flags.StateDir)
+	}
+	if state == "" {
+		return ""
+	}
+	name := s.effectiveName()
+	if name == "" {
+		return ""
+	}
+	return filepath.Join(state, "pins-"+name+".json")
+}
+
+func (d *doctorRun) report() doctorReport {
+	findings := d.findings
+	if findings == nil {
+		findings = []doctorFinding{}
+	}
+	configs := d.configs
+	if configs == nil {
+		configs = []doctorConfig{}
+	}
+	return doctorReport{Version: version, Clean: len(findings) == 0, Configs: configs, Findings: findings}
+}
+
+func (d *doctorRun) writeJSON(report doctorReport) int {
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(report); err != nil {
+		fmt.Fprintln(os.Stderr, "sylenix-guard doctor:", err)
+		return 2
+	}
+	return 0
+}
+
+func (d *doctorRun) writeHuman(report doctorReport) {
+	fmt.Printf("Sylenix Guard doctor %s\n", cleanForDialog(report.Version, 40))
+	if len(report.Configs) == 0 && len(report.Findings) == 0 {
+		fmt.Println("No supported MCP client configs found.")
+	}
+	for _, cfg := range report.Configs {
+		fmt.Printf("\nConfig: %s (%s)\n", cleanForDialog(cfg.Path, 240), cleanForDialog(cfg.Client, 80))
+		if cfg.Error != "" {
+			fmt.Printf("  cannot inspect: %s\n", cleanForDialog(cfg.Error, 240))
+		}
+		if len(cfg.Servers) == 0 && cfg.Error == "" {
+			fmt.Println("  no MCP server map found")
+		}
+		for _, srv := range cfg.Servers {
+			name := fmt.Sprintf("%q", cleanForDialog(srv.Name, 80))
+			mapName := cleanForDialog(srv.Map, 80)
+			switch {
+			case srv.Transport == "remote":
+				fmt.Printf("  server %s [%s]: NOT covered (remote transport)\n", name, mapName)
+			case srv.Error != "":
+				status := "not wrapped"
+				if srv.Wrapped {
+					status = "wrapped"
+				}
+				fmt.Printf("  server %s [%s]: INVALID (%s): %s\n", name, mapName, status, cleanForDialog(srv.Error, 240))
+			case srv.Wrapped:
+				parts := []string{"wrapped by Guard"}
+				if srv.Allowlisted {
+					parts = append(parts, "allowlisted")
+				} else {
+					parts = append(parts, "NOT allowlisted")
+				}
+				if srv.Approval != "" {
+					parts = append(parts, "approval="+srv.Approval)
+				}
+				if len(srv.TrustedTools) > 0 {
+					parts = append(parts, "trust="+cleanForDialog(strings.Join(srv.TrustedTools, ","), 120))
+				}
+				if len(srv.ScratchDirs) > 0 {
+					parts = append(parts, "scratch="+cleanForDialog(strings.Join(srv.ScratchDirs, ","), 160))
+				}
+				fmt.Printf("  server %s [%s]: %s\n", name, mapName, strings.Join(parts, ", "))
+			default:
+				fmt.Printf("  server %s [%s]: NOT wrapped by Guard (stdio)\n", name, mapName)
+			}
+		}
+	}
+	if len(report.Findings) == 0 {
+		fmt.Println("\nNo findings.")
+		return
+	}
+	fmt.Printf("\nFindings: %d\n", len(report.Findings))
+	for _, f := range report.Findings {
+		where := ""
+		if f.Config != "" {
+			where = " in " + cleanForDialog(f.Config, 240)
+		}
+		if f.Server != "" {
+			where = fmt.Sprintf(" server %q", cleanForDialog(f.Server, 80)) + where
+		}
+		fmt.Printf("  [%s]%s: %s\n", f.Code, where, cleanForDialog(f.Detail, 400))
+		fmt.Printf("    fix: %s\n", cleanForDialog(f.Fix, 240))
+	}
+}
+
+func newDoctorFinding(code, severity, client, configPath, server, detail, fix string) doctorFinding {
+	return doctorFinding{
+		Code: code, Severity: severity, Client: client, Config: configPath,
+		Server: server, Detail: detail, Fix: fix,
+	}
+}
+
+func doctorFixForCode(code string) string {
+	switch code {
+	case "SERVER_INVALID":
+		return "make the server a stdio entry with a string command and a string args array"
+	case "WRAPPER_INVALID":
+		return "re-run `sylenix-guard install` to rewrite the wrapper, or fix the Guard flags in the config"
+	default:
+		return "fix the client config"
+	}
+}
+
+func sortDoctorFindings(findings []doctorFinding) {
+	sort.SliceStable(findings, func(i, j int) bool {
+		a, b := findings[i], findings[j]
+		if a.Config != b.Config {
+			return a.Config < b.Config
+		}
+		if a.Server != b.Server {
+			return a.Server < b.Server
+		}
+		if a.Code != b.Code {
+			return a.Code < b.Code
+		}
+		return a.Detail < b.Detail
+	})
+}
+
+func findDoctorSeparator(args []string) int {
+	valueFlags := map[string]bool{
+		"name": true, "state-dir": true, "policy": true, "readonly": true,
+		"trust": true, "approve": true, "allow-write-under": true, "grant": true,
+	}
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			return i
+		}
+		name := strings.TrimLeft(arg, "-")
+		if name == "" {
+			continue
+		}
+		if strings.Contains(name, "=") {
+			continue
+		}
+		if valueFlags[name] {
+			i++ // the next argument is this flag's value, even if it is "--"
+		}
+	}
+	return -1
+}
+
+func parseDoctorWrapperFlags(args []string) (doctorWrapperFlags, string) {
+	var f doctorWrapperFlags
+	for i := 0; i < len(args); i++ {
+		raw := args[i]
+		name := raw
+		inline := ""
+		hasInline := false
+		if eq := strings.Index(name, "="); eq >= 0 {
+			name, inline, hasInline = name[:eq], name[eq+1:], true
+		}
+		name = strings.TrimLeft(name, "-")
+		if name == "" {
+			return f, "empty Guard flag"
+		}
+		safeName := cleanForDialog(name, 80)
+		value := func() (string, string) {
+			if hasInline {
+				if inline == "--" {
+					return "", safeName + " has an empty value"
+				}
+				return inline, ""
+			}
+			if i+1 >= len(args) {
+				return "", safeName + " needs a value"
+			}
+			i++
+			if args[i] == "--" {
+				return "", safeName + " has an empty value"
+			}
+			return args[i], ""
+		}
+		switch name {
+		case "name":
+			v, detail := value()
+			if detail != "" {
+				return f, detail
+			}
+			if !validDoctorName(v) {
+				return f, "name contains a path separator, a reserved character or control characters"
+			}
+			f.HasName, f.Name = true, v
+		case "state-dir":
+			v, detail := value()
+			if detail != "" {
+				return f, detail
+			}
+			if v == "" || strings.TrimSpace(v) != v || hasUnsafePolicyChars(v) {
+				return f, "state-dir is empty or contains surrounding spaces/control characters"
+			}
+			f.HasStateDir, f.StateDir = true, v
+		case "policy":
+			v, detail := value()
+			if detail != "" {
+				return f, detail
+			}
+			if v == "" || strings.TrimSpace(v) != v || hasUnsafePolicyChars(v) {
+				return f, "policy is empty or contains surrounding spaces/control characters"
+			}
+			f.HasPolicy, f.Policy = true, v
+		case "readonly":
+			v, detail := value()
+			if detail != "" {
+				return f, detail
+			}
+			if hasUnsafePolicyChars(v) {
+				return f, "readonly contains control or invisible characters"
+			}
+			f.HasReadonly, f.Readonly = true, v
+		case "trust":
+			v, detail := value()
+			if detail != "" {
+				return f, detail
+			}
+			if hasUnsafePolicyChars(v) {
+				return f, "trust contains control or invisible characters"
+			}
+			f.HasTrust, f.Trust = true, v
+		case "approve":
+			v, detail := value()
+			if detail != "" {
+				return f, detail
+			}
+			if v != "deny" && v != "dialog" {
+				return f, "approve must be deny or dialog"
+			}
+			f.HasApprove, f.Approve = true, v
+		case "allow-write-under":
+			v, detail := value()
+			if detail != "" {
+				return f, detail
+			}
+			if hasUnsafePolicyChars(v) {
+				return f, "allow-write-under contains control or invisible characters"
+			}
+			tool, dir := "", v
+			if eq := strings.Index(v, "="); eq >= 0 {
+				tool, dir = v[:eq], v[eq+1:]
+			}
+			if dir == "" || strings.ContainsAny(tool, `/\`) || hasUnsafePolicyChars(tool) {
+				return f, "allow-write-under must be DIR or TOOL=DIR"
+			}
+			f.HasScratch = true
+			f.Scratch = append(f.Scratch, scratchRule{tool: tool, dir: dir})
+		case "grant":
+			v, detail := value()
+			if detail != "" {
+				return f, detail
+			}
+			if hasUnsafePolicyChars(v) {
+				return f, "grant contains control or invisible characters"
+			}
+			if detail := validateDoctorGrantSpec(v); detail != "" {
+				return f, detail
+			}
+			f.HasGrant = true
+			f.Grants = append(f.Grants, v)
+		case "no-spotlight", "reset-pins":
+			v := true
+			if hasInline {
+				parsed, err := strconv.ParseBool(inline)
+				if err != nil {
+					return f, safeName + " has an invalid boolean value"
+				}
+				v = parsed
+			}
+			if name == "no-spotlight" {
+				f.NoSpotlight = v
+			} else {
+				f.ResetPins = v
+			}
+		default:
+			return f, "unknown Guard flag " + safeName
+		}
+	}
+	return f, ""
+}
+
+func validateDoctorGrantSpec(spec string) string {
+	i := strings.LastIndex(spec, "=")
+	if i <= 0 {
+		return "grant must be TOOL[:DIR]=DURATION"
+	}
+	dur, err := time.ParseDuration(spec[i+1:])
+	if err != nil || dur <= 0 {
+		return "grant duration must be positive"
+	}
+	tool := spec[:i]
+	if j := strings.Index(tool, ":"); j >= 0 {
+		tool = tool[:j]
+	}
+	if tool == "" || strings.ContainsAny(tool, `/\`) {
+		return "grant must name a tool"
+	}
+	return ""
+}
+
+func validDoctorName(s string) bool {
+	if s == "" || s == "." || s == ".." || strings.TrimSpace(s) != s {
+		return false
+	}
+	if strings.ContainsAny(s, `/\`) {
+		return false
+	}
+	if runtime.GOOS == "windows" && strings.ContainsAny(s, `<>:"|?*`) {
+		return false
+	}
+	return !hasUnsafePolicyChars(s)
+}
+
+func (s doctorServer) effectiveName() string {
+	if s.Flags.HasName {
+		return s.Flags.Name
+	}
+	if s.OriginalCmd == "" {
+		return s.Name
+	}
+	return filepath.Base(s.OriginalCmd)
+}
+
+func doctorServerPolicy(pf *policyFile, name string, nameExplicit bool) (policyServer, string) {
+	if pf == nil || len(pf.Servers) == 0 {
+		return policyServer{}, ""
+	}
+	if len(pf.Servers) == 1 && !nameExplicit {
+		for _, srv := range pf.Servers {
+			return srv, ""
+		}
+	}
+	srv, ok := pf.Servers[name]
+	if !ok {
+		return policyServer{}, fmt.Sprintf("policy has no entry for server %q", cleanForDialog(name, 80))
+	}
+	return srv, ""
+}
+
+func computeDoctorEffective(pf *policyFile, srv policyServer, profile *policyProfile, f doctorWrapperFlags) doctorEffective {
+	e := doctorEffective{
+		Approve:  "deny",
+		Readonly: map[string]bool{},
+		Trust:    map[string]bool{},
+		Classes:  map[string]string{},
+	}
+	if pf != nil {
+		if pf.Approval != "" {
+			e.Approve = pf.Approval
+		}
+		if pf.AllowlistEnforced != nil {
+			e.AllowlistEnforced = *pf.AllowlistEnforced
+		} else {
+			e.AllowlistEnforced = len(pf.Allowlist) > 0
+		}
+	}
+	if f.HasApprove {
+		e.Approve = f.Approve
+	}
+	if profile != nil {
+		for tool, class := range profile.tools {
+			switch class {
+			case "read":
+				if !f.HasReadonly {
+					e.Readonly[tool] = true
+				}
+			case "write", "exec", "egress":
+				e.Classes[tool] = class
+			}
+		}
+	}
+	for tname, tool := range srv.Tools {
+		delete(e.Readonly, tname)
+		delete(e.Classes, tname)
+		switch tool.Class {
+		case "read":
+			if !f.HasReadonly {
+				e.Readonly[tname] = true
+			}
+		case "write", "exec", "egress":
+			e.Classes[tname] = tool.Class
+		}
+		if tool.Trust && !f.HasTrust {
+			e.Trust[tname] = true
+		}
+		if !f.HasScratch && tool.Class == "write" {
+			for _, p := range tool.AllowPaths {
+				e.Scratch = append(e.Scratch, scratchRule{tool: tname, dir: p})
+			}
+		}
+	}
+	if f.HasReadonly {
+		e.Readonly = toSet(f.Readonly)
+	}
+	if f.HasTrust {
+		e.Trust = toSet(f.Trust)
+	}
+	if f.HasScratch {
+		e.Scratch = append([]scratchRule(nil), f.Scratch...)
+	}
+	return e
+}
+
+func doctorHasEgress(e doctorEffective) bool {
+	for tool, class := range e.Classes {
+		if e.Readonly[tool] {
+			continue
+		}
+		if class == "egress" {
+			return true
+		}
+	}
+	return false
+}
+
+func doctorAllowlisted(pf *policyFile, command string, args []string) (bool, string) {
+	if pf == nil {
+		return false, ""
+	}
+	matched := false
+	mismatch := ""
+	for _, entry := range pf.Allowlist {
+		if !matchAllowedCommand(entry.Command, command) {
+			continue
+		}
+		if entry.Args == nil || !matchAllowedArgs(*entry.Args, args) {
+			continue
+		}
+		matched = true
+		if entry.SHA256 == "" {
+			return true, ""
+		}
+		target := entry.Lockfile
+		if target == "" {
+			resolved, ok := resolveCommandFile(command)
+			if !ok {
+				if mismatch == "" {
+					mismatch = fmt.Sprintf("cannot resolve %q to verify the allowlisted SHA-256", cleanForDialog(command, 160))
+				}
+				continue
+			}
+			target = resolved
+		}
+		sum, ok := hashFileSHA256(target)
+		if !ok {
+			if mismatch == "" {
+				mismatch = fmt.Sprintf("cannot read %q to verify the allowlisted SHA-256", cleanForDialog(target, 160))
+			}
+			continue
+		}
+		if !strings.EqualFold(sum, entry.SHA256) {
+			if mismatch == "" {
+				mismatch = "the allowlisted SHA-256 does not match the resolved command"
+			}
+			continue
+		}
+		return true, ""
+	}
+	if matched {
+		return true, mismatch
+	}
+	return false, ""
+}
+
+func findDoctorRepoRoot(start string) string {
+	if start == "" {
+		return ""
+	}
+	dir, err := filepath.Abs(start)
+	if err != nil {
+		return start
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return start
+}
+
+func resolveDoctorPath(p string) string {
+	if p == "" {
+		return ""
+	}
+	if filepath.IsAbs(p) {
+		return filepath.Clean(p)
+	}
+	if abs, err := filepath.Abs(p); err == nil {
+		return abs
+	}
+	return p
+}
+
+func readDoctorPolicyFile(path string) doctorPolicy {
+	if path == "" {
+		return doctorPolicy{err: "policy path is empty"}
+	}
+	path = resolveDoctorPath(path)
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return doctorPolicy{path: path, err: fmt.Sprintf("policy %q cannot be read", cleanForDialog(path, 160))}
+	}
+	pf, err := parsePolicyBytes(b)
+	if err != nil {
+		return doctorPolicy{path: path, err: fmt.Sprintf("policy %q is not valid; run `sylenix-guard policy validate %q`",
+			cleanForDialog(path, 160), cleanForDialog(path, 160))}
+	}
+	return doctorPolicy{pf: pf, path: path}
+}
+
+func resolveDoctorGuardCommand(command string) (string, string) {
+	if command == "" {
+		return "", "Guard command is empty"
+	}
+	if hasUnsafePolicyChars(command) {
+		return "", "Guard command contains control or invisible characters"
+	}
+	if strings.ContainsAny(command, `/\`) || filepath.IsAbs(command) || isWindowsDrivePath(command) {
+		p := resolveDoctorPath(command)
+		info, err := os.Stat(p)
+		if err != nil {
+			return "", fmt.Sprintf("Guard command %q does not exist", cleanForDialog(command, 160))
+		}
+		if info.IsDir() {
+			return "", fmt.Sprintf("Guard command %q is a directory", cleanForDialog(command, 160))
+		}
+		if !info.Mode().IsRegular() {
+			return "", fmt.Sprintf("Guard command %q is not a regular file", cleanForDialog(command, 160))
+		}
+		if info.Size() > 1<<30 {
+			return "", fmt.Sprintf("Guard command %q is too large to inspect", cleanForDialog(command, 160))
+		}
+		return p, ""
+	}
+	p, err := exec.LookPath(command)
+	if err != nil {
+		return "", fmt.Sprintf("Guard command %q is not on PATH", cleanForDialog(command, 160))
+	}
+	if abs, err := filepath.Abs(p); err == nil {
+		p = abs
+	}
+	info, err := os.Stat(p)
+	if err != nil || info.IsDir() {
+		return "", fmt.Sprintf("Guard command %q cannot be resolved to a file", cleanForDialog(command, 160))
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Sprintf("Guard command %q is not a regular file", cleanForDialog(command, 160))
+	}
+	if info.Size() > 1<<30 {
+		return "", fmt.Sprintf("Guard command %q is too large to inspect", cleanForDialog(command, 160))
+	}
+	return p, ""
+}
+
+func guardBinaryVersion(path string) (string, bool, string) {
+	if self, err := os.Executable(); err == nil && sameExecutablePath(path, self) {
+		return version, true, ""
+	}
+	info, err := buildinfo.ReadFile(path)
+	if err != nil {
+		return "", false, "not a readable Go binary"
+	}
+	if info.Main.Path != "sylenix-guard-poc" {
+		return "", false, "not a Sylenix Guard binary"
+	}
+	for _, setting := range info.Settings {
+		if setting.Key != "-ldflags" {
+			continue
+		}
+		if v, ok := versionFromLDFlags(setting.Value); ok {
+			return v, true, ""
+		}
+	}
+	if v := info.Main.Version; v != "" && v != "(devel)" && !strings.ContainsAny(v, "-+") {
+		return v, true, ""
+	}
+	return "", false, "the binary has no embedded version (built without -X main.version)"
+}
+
+func sameExecutablePath(a, b string) bool {
+	if sameCommandPath(a, b) {
+		return true
+	}
+	aa, err1 := filepath.EvalSymlinks(a)
+	bb, err2 := filepath.EvalSymlinks(b)
+	if err1 == nil && err2 == nil {
+		return sameCommandPath(aa, bb)
+	}
+	return false
+}
+
+func versionFromLDFlags(s string) (string, bool) {
+	fields := strings.Fields(s)
+	for i := 0; i < len(fields); i++ {
+		f := fields[i]
+		if f == "-X" && i+1 < len(fields) {
+			if v, ok := versionAssignment(fields[i+1]); ok {
+				return v, true
+			}
+			i++
+			continue
+		}
+		if strings.HasPrefix(f, "-X=") {
+			if v, ok := versionAssignment(strings.TrimPrefix(f, "-X=")); ok {
+				return v, true
+			}
+		}
+	}
+	return "", false
+}
+
+func versionAssignment(s string) (string, bool) {
+	s = strings.Trim(s, `"'`)
+	const prefix = "main.version="
+	if !strings.HasPrefix(s, prefix) {
+		return "", false
+	}
+	v := strings.Trim(s[len(prefix):], `"'`)
+	if v == "" {
+		return "", false
+	}
+	return v, true
+}
+
+func parseDoctorVersion(s string) ([]int, bool) {
+	s = strings.TrimSpace(s)
+	s = strings.TrimPrefix(s, "v")
+	if s == "" || strings.EqualFold(s, "dev") || s == "(devel)" {
+		return nil, false
+	}
+	if i := strings.IndexAny(s, "-+"); i >= 0 {
+		s = s[:i]
+	}
+	parts := strings.Split(s, ".")
+	if len(parts) < 2 || len(parts) > 4 {
+		return nil, false
+	}
+	out := make([]int, len(parts))
+	for i, p := range parts {
+		n, err := strconv.Atoi(p)
+		if err != nil || n < 0 {
+			return nil, false
+		}
+		out[i] = n
+	}
+	return out, true
+}
+
+func compareDoctorVersions(a, b []int) int {
+	n := len(a)
+	if len(b) > n {
+		n = len(b)
+	}
+	for i := 0; i < n; i++ {
+		av, bv := 0, 0
+		if i < len(a) {
+			av = a[i]
+		}
+		if i < len(b) {
+			bv = b[i]
+		}
+		if av < bv {
+			return -1
+		}
+		if av > bv {
+			return 1
+		}
+	}
+	return 0
 }
 
 // ---------------------------------------------------------------- install / uninstall

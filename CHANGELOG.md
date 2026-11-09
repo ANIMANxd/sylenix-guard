@@ -1,5 +1,41 @@
 # Changelog
 
+## 2026-11-09
+
+### Doctor
+
+- Added `sylenix-guard doctor [--json] [--policy PATH] [--state-dir DIR]
+  [--require-signatures]`. It reads the supported MCP client configs, reports
+  each server's transport and whether it is wrapped by Guard, and checks the
+  policy allowlist, approval mode, trust list and scratch roots.
+- Findings each carry one suggested fix: `NOT_WRAPPED`,
+  `REMOTE_NOT_COVERED`, `NOT_ALLOWLISTED`, `ALLOWLIST_NOT_ENFORCED`,
+  `ALLOWLIST_HASH_MISMATCH`, `RISKY_SCRATCH` (home, repository root, an
+  ancestor of either, a filesystem root, or an unresolvable path),
+  `TRUST_ON_EGRESS`, `APPROVALS_OFF`, `UNSIGNED_POLICY`, `UNSIGNED_PINS`,
+  `OUTDATED_GUARD`, `GUARD_NOT_FOUND`, `GUARD_VERSION_UNKNOWN`,
+  `CONFIG_UNREADABLE`, `SERVER_INVALID`, `WRAPPER_INVALID`, `POLICY_INVALID`
+  and `PINS_UNREADABLE`.
+- Exit code is 0 with no findings, 1 with findings and 2 for a usage error.
+  `--json` prints only the JSON report.
+- Doctor is read-only and never prints command arguments, environment values,
+  secrets or file contents. It never launches the configured server or Guard
+  binary. The probe checks that configs, policy and pins are byte-for-byte
+  unchanged and that no audit log is created.
+- Guard binaries are versioned with `-X main.version=<tag>`; the default local
+  version is `0.1.0` and GoReleaser now injects the release tag. Doctor reads a
+  wrapper's version safely from Go build information and also checks the
+  `_sylenixGuard` metadata version.
+- Policy and pin signing is not implemented yet. `--require-signatures` reports
+  an unverified policy or pin file as unsigned instead of assuming it is safe;
+  without the flag, unsigned files are not findings so existing setups can
+  remain clean.
+- Added `docs/DOCTOR.md`, a doctor section in `docs/INSTALL.md`, and README
+  and `POC_SPIKE.md` scope/limitation updates.
+- Added `tests/probes/test_doctor.py` (99 checks): clean setup, every finding,
+  JSON shape, no argument/env leakage and read-only behavior. Added
+  `make doctor-test` and included it in `make check`.
+
 ## 2026-11-08
 
 ### Policy file

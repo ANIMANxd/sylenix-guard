@@ -77,6 +77,22 @@ backup being present.
 
 Restart the client after installing or uninstalling so it reloads the config.
 
+## Check the installation
+
+`sylenix-guard doctor` audits the supported client configs and reports wrapped
+and unwrapped servers, allowlist gaps, risky scratch/trust/approval settings,
+unsigned policy/pins (with `--require-signatures`) and outdated Guard binaries:
+
+```bash
+sylenix-guard doctor
+sylenix-guard doctor --json
+```
+
+Exit code `0` means no findings, `1` means findings, `2` means a usage error.
+Doctor is read-only: it never launches a server, writes a config, policy or pin
+file, or prints command arguments or environment values. See
+[`DOCTOR.md`](DOCTOR.md) for the finding list and fixes.
+
 ## Release artifacts and verification
 
 Releases are built by GitHub Actions with GoReleaser only for tags matching
