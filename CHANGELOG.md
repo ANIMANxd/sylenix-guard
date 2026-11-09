@@ -36,6 +36,41 @@
   JSON shape, no argument/env leakage and read-only behavior. Added
   `make doctor-test` and included it in `make check`.
 
+### Clear taint and stats
+
+- Added `sylenix-guard clear-taint --name <session> [--state-dir DIR]`. It
+  writes a nonce-bound request to the running guard's state directory; the guard
+  shows a two-button OS dialog (Deny by default, 60 s timeout) and only a human
+  **Clear Taint** click clears the in-memory latch. The CLI has no
+  `--yes`/`--force`, and MCP tool calls, host methods, server requests or
+  notifications and environment variables cannot clear taint.
+- The guard writes a 0600 control file with a random nonce and heartbeat,
+  0600 request/result files, rejects stale heartbeats, stale requests and bad
+  nonces, and removes the control/request files on exit. The CLI removes its
+  result file; stale results are cleaned at the next guard start. A same-user
+  process can request a dialog, but cannot clear without human approval.
+- Successful clears log `CLEAR_TAINT` with `who` (OS user), event `ts`,
+  `method: dialog`, `granted: true` and a random `request_id`. Denials log
+  `CLEAR_TAINT_DENIED`; invalid requests log `CLEAR_TAINT_REJECTED`; a clean
+  session logs `CLEAR_TAINT_NOT_NEEDED`. No argument values, nonces or secrets
+  are logged.
+- Added `sylenix-guard stats [--name NAME | --file PATH] [--state-dir DIR]`.
+  It mirrors `scripts/summarize_audit.py`, including approval prompts per
+  active hour, blocks, approvals, quarantines and unparseable frames. Active
+  time excludes gaps over 600 s; prompts/hour is `n/a` below 300 active seconds.
+- Verified the existing default that built-in profile read-only tools never
+  prompt after taint. The new dialog-mode probe proves reads do not open the
+  approval dialog while a write does. An explicit `--readonly` list or policy
+  class remains a replacement and is not widened automatically.
+- Added `tests/probes/test_clear_taint.py` (64 checks) and
+  `tests/probes/test_stats.py` (21 checks), plus `make clear-taint-test` and
+  `make stats-test`, both part of `make check`.
+- Extended `demo/fake_server.py` with an unknown-method error response and an
+  opt-in `sylenix/clear-taint` server request/notification for the isolation
+  probes.
+- Updated README and POC_SPIKE scope, verification and limitations, including
+  the new human-approved clear path and the local control-file boundary.
+
 ## 2026-11-08
 
 ### Policy file

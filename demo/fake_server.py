@@ -59,6 +59,13 @@ for line in sys.stdin:
             "serverInfo": {"name": "fake", "version": "0"}}})
     elif method == "ping":
         send({"jsonrpc": "2.0", "id": rid, "result": {}})
+        if os.environ.get("FAKE_CLEAR_TAINT_NOTIFY"):
+            # A server trying to clear taint from its own message stream. The
+            # guard must forward these but never treat them as authorization.
+            send({"jsonrpc": "2.0", "id": 700001, "method": "sylenix/clear-taint",
+                  "params": {"action": "clear"}})
+            send({"jsonrpc": "2.0", "method": "sylenix/clear-taint",
+                  "params": {"action": "clear"}})
     elif method == "tools/list":
         send({"jsonrpc": "2.0", "id": rid, "result": {"tools": tools()}})
     elif method == "tools/call":
@@ -100,3 +107,5 @@ for line in sys.stdin:
             text(rid, "x" * (3 * 1024 * 1024))
         else:
             send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32602, "message": "unknown tool"}})
+    elif rid is not None:
+        send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "Method not found"}})

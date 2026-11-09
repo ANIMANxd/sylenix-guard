@@ -14,6 +14,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"debug/buildinfo"
 	"encoding/hex"
@@ -26,6 +27,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"os/user"
 	"path"
 	"path/filepath"
 	"runtime"
@@ -50,6 +52,17 @@ const guardMetaVersion = 1
 
 const policyVersion = 1
 const policyFileName = "policy.yaml"
+
+const controlVersion = 1
+const controlHeartbeatEvery = 2 * time.Second
+const controlStaleAfter = 15 * time.Second
+const clearRequestTTL = 2 * time.Minute
+const clearRequestPoll = 200 * time.Millisecond
+const clearWaitTimeout = 90 * time.Second
+const clearFileLimit = 1 << 20 // control/request/result files are tiny
+
+const auditGapLimit = 600  // gaps longer than this are idle time, not active time
+const auditMinActive = 300 // below this, prompts/hour is not meaningful
 
 // version is the Guard build version. Release builds set it with
 // -ldflags "-X main.version=<tag>"; local builds keep this default.
@@ -194,6 +207,10 @@ func main() {
 			os.Exit(runAllowCommand(os.Args[2:]))
 		case "doctor":
 			os.Exit(runDoctorCommand(os.Args[2:]))
+		case "clear-taint":
+			os.Exit(runClearTaintCommand(os.Args[2:]))
+		case "stats":
+			os.Exit(runStatsCommand(os.Args[2:]))
 		}
 	}
 	name := flag.String("name", "", "label for this server; names the pin and log files (default: command name)")
@@ -351,11 +368,17 @@ func main() {
 		"policy_source": g.policySource, "policy_version": g.policyVersion,
 		"profile": g.profileName, "profile_source": g.profileSource,
 		"allow_write_under": []string(allowWriteUnder), "grants": []string(grantSpecs)})
+	control, controlErr := startGuardControl(g)
+	if controlErr != nil {
+		g.event("control_unavailable", map[string]any{"reason": "cannot create clear-taint control"})
+		fmt.Fprintln(os.Stderr, "sylenix-guard: clear-taint unavailable:", controlErr)
+	}
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-sig
+		control.stop()
 		_ = cmd.Process.Kill()
 		os.Exit(1)
 	}()
@@ -443,6 +466,7 @@ func main() {
 			code = ee.ExitCode() // -1 means the guard killed the server; report 1
 		}
 	}
+	control.stop()
 	g.event("exit", map[string]any{"code": code})
 	os.Exit(code)
 }
@@ -1855,6 +1879,9 @@ func (g *Guard) applyProfile(profile *policyProfile) {
 	if profile == nil {
 		return
 	}
+	// A profile's read tools are allowed after taint without a prompt. This is
+	// the default when no --readonly override is set; an explicit --readonly
+	// list or policy class remains a replacement, never a widening.
 	for tool, class := range profile.tools {
 		switch class {
 		case "read":
@@ -2918,6 +2945,15 @@ func (g *Guard) latchReason(origin, reason string) {
 		g.event("taint_latched", fields)
 		alert("session tainted by %q; non-read-only tools now need approval", origin)
 	}
+}
+
+// clearTaint is only called from the human-approved clear-taint control path.
+// It never clears a quarantine, a grant, or any other latch.
+func (g *Guard) clearTaint() {
+	g.mu.Lock()
+	g.tainted = false
+	g.taintOrigin = ""
+	g.mu.Unlock()
 }
 
 func (g *Guard) datamark(f frame, origin string, orig []byte) []byte {
@@ -4169,6 +4205,52 @@ func askHuman(tool string, args map[string]any, origin, scopeNote string) (decis
 	return "deny", "no dialog support on " + runtime.GOOS
 }
 
+// askClearTaint is a two-button security decision, not a tool approval. It
+// defaults to Deny, times out to Deny, and is only reachable from the local
+// clear-taint control file, never from an MCP frame or an environment variable.
+func askClearTaint(name, origin string) (bool, string) {
+	reason := ""
+	if origin != "" {
+		reason = " The session was tainted by " + cleanForDialog(origin, 80) + "."
+	}
+	msg := fmt.Sprintf("Sylenix Guard: clear the taint latch for session %s?%s Clearing it lets non-read-only tools run without further approval until new untrusted content arrives. Deny keeps the latch.",
+		cleanForDialog(name, 80), reason)
+	switch runtime.GOOS {
+	case "darwin":
+		script := fmt.Sprintf(`display dialog "%s" with title "Sylenix Guard" buttons {"Deny","Clear Taint"} default button "Deny" with icon caution giving up after 60`, escapeAppleScript(msg))
+		out, err := exec.Command("osascript", "-e", script).Output()
+		if err != nil {
+			return false, "dialog failed: " + err.Error()
+		}
+		return strings.Contains(string(out), "button returned:Clear Taint"), "osascript"
+	case "linux":
+		// A list, because zenity --question can only offer two buttons and the
+		// first row (Deny) is the safe default. This is the same pattern as the
+		// tool-approval dialog.
+		out, err := exec.Command("zenity", "--list", "--no-markup", "--hide-header",
+			"--title=Sylenix Guard", "--width=520", "--height=220", "--timeout=60",
+			"--text="+msg, "--column=Decision", "Deny", "Clear Taint").Output()
+		if err != nil {
+			return false, "zenity: denied, timed out, or unavailable"
+		}
+		return strings.Contains(string(out), "Clear Taint"), "zenity"
+	case "windows":
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", windowsClearTaintDialogScript)
+		cmd.Env = append(os.Environ(), "SYLENIX_MSG="+msg)
+		err := cmd.Run()
+		if err == nil {
+			return true, "powershell"
+		}
+		if ee, ok := err.(*exec.ExitError); ok && ee.ExitCode() == 1 {
+			return false, "powershell: denied"
+		}
+		return false, "powershell: denied, timed out, or unavailable"
+	}
+	return false, "no dialog support on " + runtime.GOOS
+}
+
 func appleScriptChoice(out string) (decision string) {
 	switch {
 	case strings.Contains(out, "button returned:Allow Tool for 15m"):
@@ -4208,6 +4290,33 @@ $t.Add_Tick({ $f.Close() }); $t.Start()
 $r = $f.ShowDialog()
 if ($r -eq [System.Windows.Forms.DialogResult]::OK) { exit 0 }
 if ($r -eq [System.Windows.Forms.DialogResult]::Retry) { exit 2 }
+exit 1
+`
+
+// windowsClearTaintDialogScript is a two-button decision dialog. Deny is
+// focused first, is the escape key, and is the result of a timeout.
+const windowsClearTaintDialogScript = `
+Add-Type -AssemblyName System.Windows.Forms
+$f = New-Object System.Windows.Forms.Form
+$f.Text = 'Sylenix Guard'; $f.TopMost = $true; $f.StartPosition = 'CenterScreen'
+$f.FormBorderStyle = 'FixedDialog'; $f.MinimizeBox = $false; $f.MaximizeBox = $false
+$f.ClientSize = New-Object System.Drawing.Size(560, 220)
+$l = New-Object System.Windows.Forms.Label
+$l.Location = New-Object System.Drawing.Point(12, 12); $l.Size = New-Object System.Drawing.Size(536, 140)
+$l.Text = $env:SYLENIX_MSG
+$deny = New-Object System.Windows.Forms.Button
+$deny.Text = 'Deny'; $deny.Location = New-Object System.Drawing.Point(12, 164); $deny.Size = New-Object System.Drawing.Size(260, 40)
+$deny.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+$clear = New-Object System.Windows.Forms.Button
+$clear.Text = 'Clear Taint'; $clear.Location = New-Object System.Drawing.Point(288, 164); $clear.Size = New-Object System.Drawing.Size(260, 40)
+$clear.DialogResult = [System.Windows.Forms.DialogResult]::OK
+$f.CancelButton = $deny
+$f.Controls.AddRange(@($l, $deny, $clear))
+$f.Add_Shown({ $deny.Focus() })
+$t = New-Object System.Windows.Forms.Timer; $t.Interval = 60000
+$t.Add_Tick({ $f.Close() }); $t.Start()
+$r = $f.ShowDialog()
+if ($r -eq [System.Windows.Forms.DialogResult]::OK) { exit 0 }
 exit 1
 `
 
@@ -4537,6 +4646,751 @@ func sortedKeys(m map[string]bool) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// ---------------------------------------------------------------- clear-taint / stats
+
+type controlFile struct {
+	Version   int    `json:"version"`
+	Name      string `json:"name"`
+	PID       int    `json:"pid"`
+	Nonce     string `json:"nonce"`
+	StartedAt string `json:"started_at"`
+	Heartbeat string `json:"heartbeat"`
+}
+
+type clearRequest struct {
+	Version      int    `json:"version"`
+	Nonce        string `json:"nonce"`
+	GuardStarted string `json:"guard_started"`
+	RequestID    string `json:"request_id"`
+	RequestedAt  string `json:"requested_at"`
+}
+
+type clearResult struct {
+	Version   int    `json:"version"`
+	RequestID string `json:"request_id"`
+	Status    string `json:"status"`
+	Who       string `json:"who,omitempty"`
+	At        string `json:"at,omitempty"`
+	Note      string `json:"note,omitempty"`
+}
+
+type guardControl struct {
+	g           *Guard
+	stateDir    string
+	name        string
+	nonce       string
+	startedAt   string
+	controlPath string
+	requestPath string
+	done        chan struct{}
+	stopOnce    sync.Once
+	stopped     atomic.Bool
+	fileMu      sync.Mutex
+}
+
+func controlHash(name string) string {
+	sum := sha256.Sum256([]byte(name))
+	return hex.EncodeToString(sum[:16])
+}
+
+func controlFilePath(stateDir, name string) string {
+	return filepath.Join(stateDir, "control-"+controlHash(name)+".json")
+}
+
+func clearRequestFilePath(stateDir, name string) string {
+	return filepath.Join(stateDir, "clear-taint-request-"+controlHash(name)+".json")
+}
+
+func clearResultFilePath(stateDir, name, requestID string) string {
+	return filepath.Join(stateDir, "clear-taint-result-"+controlHash(name)+"-"+requestID+".json")
+}
+
+// writeFileAtomic writes a small local state file without exposing a partial
+// read to another process. O_EXCL keeps a same-user process from turning the
+// temp path into a FIFO and blocking the writer.
+func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
+	tmp := path + ".tmp"
+	_ = os.Remove(tmp)
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+func randomHex(n int) (string, error) {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+func validNonce(s string) bool {
+	if len(s) != sha256.Size*2 {
+		return false
+	}
+	_, err := hex.DecodeString(s)
+	return err == nil
+}
+
+func validRequestID(s string) bool {
+	if len(s) != 32 {
+		return false
+	}
+	_, err := hex.DecodeString(s)
+	return err == nil
+}
+
+func startGuardControl(g *Guard) (*guardControl, error) {
+	nonce, err := randomHex(sha256.Size)
+	if err != nil {
+		return nil, err
+	}
+	c := &guardControl{
+		g:           g,
+		stateDir:    g.stateDir,
+		name:        g.name,
+		nonce:       nonce,
+		startedAt:   time.Now().UTC().Format(time.RFC3339Nano),
+		controlPath: controlFilePath(g.stateDir, g.name),
+		requestPath: clearRequestFilePath(g.stateDir, g.name),
+		done:        make(chan struct{}),
+	}
+	c.cleanupStaleFiles()
+	if err := c.writeControl(); err != nil {
+		return nil, err
+	}
+	go c.run()
+	return c, nil
+}
+
+func (c *guardControl) run() {
+	go c.heartbeatLoop()
+	c.pollLoop()
+}
+
+func (c *guardControl) heartbeatLoop() {
+	t := time.NewTicker(controlHeartbeatEvery)
+	defer t.Stop()
+	for {
+		select {
+		case <-c.done:
+			return
+		case <-t.C:
+			_ = c.writeControl()
+		}
+	}
+}
+
+func (c *guardControl) pollLoop() {
+	t := time.NewTicker(clearRequestPoll)
+	defer t.Stop()
+	last := ""
+	for {
+		select {
+		case <-c.done:
+			return
+		case <-t.C:
+			last = c.pollRequest(last)
+		}
+	}
+}
+
+func (c *guardControl) writeControl() error {
+	c.fileMu.Lock()
+	defer c.fileMu.Unlock()
+	if c.stopped.Load() {
+		return nil
+	}
+	rec := controlFile{
+		Version:   controlVersion,
+		Name:      c.name,
+		PID:       os.Getpid(),
+		Nonce:     c.nonce,
+		StartedAt: c.startedAt,
+		Heartbeat: time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	b, _ := json.Marshal(rec)
+	return writeFileAtomic(c.controlPath, b, 0o600)
+}
+
+func (c *guardControl) pollRequest(last string) string {
+	info, err := os.Stat(c.requestPath)
+	if os.IsNotExist(err) {
+		return last
+	}
+	if err != nil || !info.Mode().IsRegular() || info.Size() > clearFileLimit {
+		c.rejectRequest(clearRequest{}, "request cannot be read")
+		return last
+	}
+	b, err := os.ReadFile(c.requestPath)
+	if err != nil {
+		c.rejectRequest(clearRequest{}, "request cannot be read")
+		return last
+	}
+	var req clearRequest
+	if json.Unmarshal(b, &req) != nil {
+		c.rejectRequest(clearRequest{}, "malformed request")
+		return last
+	}
+	if validRequestID(req.RequestID) && req.RequestID == last {
+		_ = os.RemoveAll(c.requestPath)
+		return last
+	}
+	if req.Version != controlVersion || req.Nonce != c.nonce || req.GuardStarted != c.startedAt || !validRequestID(req.RequestID) {
+		c.rejectRequest(req, "invalid or stale request")
+		if validRequestID(req.RequestID) {
+			last = req.RequestID
+		}
+		return last
+	}
+	requested, err := time.Parse(time.RFC3339Nano, req.RequestedAt)
+	if err != nil || time.Since(requested) > clearRequestTTL || time.Until(requested) > 5*time.Second {
+		c.rejectRequest(req, "stale request")
+		last = req.RequestID
+		return last
+	}
+	last = req.RequestID
+	_ = os.RemoveAll(c.requestPath)
+	c.handleRequest(req)
+	return last
+}
+
+func (c *guardControl) rejectRequest(req clearRequest, reason string) {
+	c.g.event("CLEAR_TAINT_REJECTED", map[string]any{"reason": reason})
+	if validRequestID(req.RequestID) {
+		_ = c.writeResult(clearResult{
+			Version:   controlVersion,
+			RequestID: req.RequestID,
+			Status:    "rejected",
+			At:        time.Now().UTC().Format(time.RFC3339Nano),
+			Note:      reason,
+		})
+	}
+	_ = os.RemoveAll(c.requestPath)
+}
+
+func (c *guardControl) handleRequest(req clearRequest) {
+	c.g.mu.Lock()
+	tainted := c.g.tainted
+	origin := c.g.taintOrigin
+	c.g.mu.Unlock()
+	who := cleanForDialog(osUser(), 120)
+
+	if !tainted {
+		at := time.Now().UTC().Format(time.RFC3339Nano)
+		c.g.event("CLEAR_TAINT_NOT_NEEDED", map[string]any{"request_id": req.RequestID})
+		_ = c.writeResult(clearResult{
+			Version:   controlVersion,
+			RequestID: req.RequestID,
+			Status:    "not_tainted",
+			Who:       who,
+			At:        at,
+		})
+		return
+	}
+
+	allowed, note := askClearTaint(c.g.name, origin)
+	at := time.Now().UTC().Format(time.RFC3339Nano)
+	note = cleanForDialog(note, 160)
+	if allowed {
+		c.g.clearTaint()
+		c.g.event("CLEAR_TAINT", map[string]any{
+			"who":        who,
+			"method":     "dialog",
+			"granted":    true,
+			"request_id": req.RequestID,
+		})
+		_ = c.writeResult(clearResult{
+			Version:   controlVersion,
+			RequestID: req.RequestID,
+			Status:    "cleared",
+			Who:       who,
+			At:        at,
+		})
+		return
+	}
+	c.g.event("CLEAR_TAINT_DENIED", map[string]any{
+		"who":        who,
+		"method":     "dialog",
+		"granted":    false,
+		"request_id": req.RequestID,
+		"note":       note,
+	})
+	_ = c.writeResult(clearResult{
+		Version:   controlVersion,
+		RequestID: req.RequestID,
+		Status:    "denied",
+		Who:       who,
+		At:        at,
+		Note:      note,
+	})
+}
+
+func (c *guardControl) writeResult(res clearResult) error {
+	c.fileMu.Lock()
+	defer c.fileMu.Unlock()
+	if c.stopped.Load() {
+		return nil
+	}
+	b, _ := json.Marshal(res)
+	return writeFileAtomic(clearResultFilePath(c.stateDir, c.name, res.RequestID), b, 0o600)
+}
+
+func (c *guardControl) cleanupStaleFiles() {
+	_ = os.RemoveAll(c.requestPath)
+	_ = os.Remove(c.requestPath + ".tmp")
+	pattern := filepath.Join(c.stateDir, "clear-taint-result-"+controlHash(c.name)+"-*.json")
+	if matches, err := filepath.Glob(pattern); err == nil {
+		for _, match := range matches {
+			_ = os.Remove(match)
+		}
+	}
+}
+
+func (c *guardControl) removeRuntimeFiles() {
+	_ = os.Remove(c.controlPath)
+	_ = os.Remove(c.controlPath + ".tmp")
+	_ = os.RemoveAll(c.requestPath)
+	_ = os.Remove(c.requestPath + ".tmp")
+}
+
+func (c *guardControl) stop() {
+	if c == nil {
+		return
+	}
+	c.stopOnce.Do(func() {
+		c.stopped.Store(true)
+		close(c.done)
+		c.fileMu.Lock()
+		c.removeRuntimeFiles()
+		c.fileMu.Unlock()
+	})
+}
+
+func osUser() string {
+	if u, err := user.Current(); err == nil && u.Username != "" {
+		return u.Username
+	}
+	for _, key := range []string{"USER", "USERNAME", "LOGNAME"} {
+		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+			return value
+		}
+	}
+	return "unknown"
+}
+
+func runClearTaintCommand(args []string) int {
+	fs := flag.NewFlagSet("clear-taint", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	name := fs.String("name", "", "guard session name (the guard --name, or its command basename)")
+	stateDir := fs.String("state-dir", "", "guard state directory (default ~/.sylenix-poc)")
+	if err := fs.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(os.Stderr, "sylenix-guard clear-taint: unexpected arguments")
+		return 2
+	}
+	if strings.TrimSpace(*name) == "" {
+		fmt.Fprintln(os.Stderr, "sylenix-guard clear-taint: --name is required")
+		return 2
+	}
+	if hasUnsafePolicyChars(*name) || hasUnsafePolicyChars(*stateDir) {
+		fmt.Fprintln(os.Stderr, "sylenix-guard clear-taint: --name or --state-dir contains control or invisible characters")
+		return 2
+	}
+	state := *stateDir
+	if state == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "sylenix-guard clear-taint: cannot find home directory; pass --state-dir")
+			return 2
+		}
+		state = filepath.Join(home, ".sylenix-poc")
+	}
+	state = resolveDoctorPath(state)
+	ctrl, err := readGuardControl(state, *name)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "sylenix-guard clear-taint:", err)
+		return 2
+	}
+	requestID, err := randomHex(16)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "sylenix-guard clear-taint: cannot create a request id")
+		return 2
+	}
+	req := clearRequest{
+		Version:      controlVersion,
+		Nonce:        ctrl.Nonce,
+		GuardStarted: ctrl.StartedAt,
+		RequestID:    requestID,
+		RequestedAt:  time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	b, _ := json.Marshal(req)
+	if err := writeFileAtomic(clearRequestFilePath(state, *name), b, 0o600); err != nil {
+		fmt.Fprintln(os.Stderr, "sylenix-guard clear-taint: cannot write the request")
+		return 2
+	}
+	res, err := waitClearResult(state, *name, requestID)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "sylenix-guard clear-taint:", err)
+		return 2
+	}
+	displayName := cleanForDialog(*name, 80)
+	switch res.Status {
+	case "cleared":
+		fmt.Printf("taint cleared for session %q by %s at %s\n", displayName, cleanForDialog(res.Who, 120), cleanForDialog(res.At, 40))
+		return 0
+	case "not_tainted":
+		fmt.Printf("session %q is not tainted\n", displayName)
+		return 0
+	case "denied":
+		note := res.Note
+		if note == "" {
+			note = "denied"
+		}
+		fmt.Printf("clear denied for session %q: %s\n", displayName, cleanForDialog(note, 160))
+		return 1
+	case "rejected":
+		note := res.Note
+		if note == "" {
+			note = "request rejected"
+		}
+		fmt.Fprintf(os.Stderr, "sylenix-guard clear-taint: request rejected: %s\n", cleanForDialog(note, 160))
+		return 2
+	default:
+		fmt.Fprintln(os.Stderr, "sylenix-guard clear-taint: unexpected result")
+		return 2
+	}
+}
+
+func readGuardControl(stateDir, name string) (controlFile, error) {
+	path := controlFilePath(stateDir, name)
+	info, err := os.Stat(path)
+	if os.IsNotExist(err) {
+		return controlFile{}, fmt.Errorf("no running guard session named %q in %s", cleanForDialog(name, 80), cleanForDialog(stateDir, 160))
+	}
+	if err != nil {
+		return controlFile{}, fmt.Errorf("cannot read the guard control file")
+	}
+	if !info.Mode().IsRegular() || info.Size() > clearFileLimit {
+		return controlFile{}, fmt.Errorf("the guard control file is not readable")
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return controlFile{}, fmt.Errorf("cannot read the guard control file")
+	}
+	var c controlFile
+	if json.Unmarshal(b, &c) != nil {
+		return controlFile{}, fmt.Errorf("the guard control file is not valid")
+	}
+	if c.Version != controlVersion || c.Name != name || !validNonce(c.Nonce) {
+		return controlFile{}, fmt.Errorf("the guard control file is not valid for this session")
+	}
+	if _, err := time.Parse(time.RFC3339Nano, c.StartedAt); err != nil {
+		return controlFile{}, fmt.Errorf("the guard control file is not valid for this session")
+	}
+	heartbeat, err := time.Parse(time.RFC3339Nano, c.Heartbeat)
+	if err != nil || time.Since(heartbeat) > controlStaleAfter || time.Until(heartbeat) > 5*time.Second {
+		return controlFile{}, fmt.Errorf("the guard session is not running or its control file is stale")
+	}
+	return c, nil
+}
+
+func waitClearResult(stateDir, name, requestID string) (clearResult, error) {
+	path := clearResultFilePath(stateDir, name, requestID)
+	deadline := time.Now().Add(clearWaitTimeout)
+	var lastLiveCheck time.Time
+	for time.Now().Before(deadline) {
+		info, err := os.Stat(path)
+		if err == nil {
+			if !info.Mode().IsRegular() || info.Size() > clearFileLimit {
+				return clearResult{}, fmt.Errorf("the clear-taint result is not readable")
+			}
+			b, readErr := os.ReadFile(path)
+			if readErr == nil {
+				var res clearResult
+				if json.Unmarshal(b, &res) == nil && res.Version == controlVersion && res.RequestID == requestID {
+					_ = os.Remove(path)
+					return res, nil
+				}
+			}
+		} else if !os.IsNotExist(err) {
+			return clearResult{}, fmt.Errorf("cannot read the clear-taint result")
+		}
+		if time.Since(lastLiveCheck) >= time.Second {
+			if _, err := readGuardControl(stateDir, name); err != nil {
+				return clearResult{}, fmt.Errorf("the guard session is no longer running")
+			}
+			lastLiveCheck = time.Now()
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	return clearResult{}, fmt.Errorf("no response from the guard; the dialog may still be open")
+}
+
+type auditRow struct {
+	TS      string `json:"ts"`
+	Event   string `json:"event"`
+	Tool    string `json:"tool"`
+	Rule    string `json:"rule"`
+	Granted bool   `json:"granted"`
+	parsed  time.Time
+}
+
+type toolRule struct {
+	tool string
+	rule string
+}
+
+func runStatsCommand(args []string) int {
+	fs := flag.NewFlagSet("stats", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	name := fs.String("name", "", "server name; reads <state-dir>/audit-<name>.jsonl")
+	file := fs.String("file", "", "path to an audit log")
+	stateDir := fs.String("state-dir", "", "state directory for --name (default ~/.sylenix-poc)")
+	if err := fs.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			return 0
+		}
+		return 2
+	}
+	visited := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { visited[f.Name] = true })
+	if fs.NArg() != 0 {
+		fmt.Fprintln(os.Stderr, "sylenix-guard stats: unexpected arguments")
+		return 2
+	}
+	if (*name == "") == (*file == "") {
+		fmt.Fprintln(os.Stderr, "sylenix-guard stats: give exactly one of --name or --file")
+		return 2
+	}
+	if visited["state-dir"] && *file != "" {
+		fmt.Fprintln(os.Stderr, "sylenix-guard stats: --state-dir is only valid with --name")
+		return 2
+	}
+	if hasUnsafePolicyChars(*name) || hasUnsafePolicyChars(*file) || hasUnsafePolicyChars(*stateDir) {
+		fmt.Fprintln(os.Stderr, "sylenix-guard stats: a path or name contains control or invisible characters")
+		return 2
+	}
+	path := *file
+	if *name != "" {
+		state := *stateDir
+		if state == "" {
+			home, err := os.UserHomeDir()
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "sylenix-guard stats: cannot find home directory; pass --state-dir")
+				return 2
+			}
+			state = filepath.Join(home, ".sylenix-poc")
+		}
+		state = resolveDoctorPath(state)
+		path = filepath.Join(state, "audit-"+*name+".jsonl")
+	}
+	rows, err := readAuditRows(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "sylenix-guard stats: %s: %v\n", cleanForDialog(path, 240), err)
+		return 2
+	}
+	printAuditSummary(path, rows)
+	return 0
+}
+
+func readAuditRows(path string) ([]auditRow, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("cannot open the audit log")
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("the audit log is not a regular file")
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("cannot open the audit log")
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 64*1024), maxFrame)
+	var rows []auditRow
+	lineNo := 0
+	for sc.Scan() {
+		lineNo++
+		line := bytes.TrimSpace(sc.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		var row auditRow
+		if err := json.Unmarshal(line, &row); err != nil {
+			return nil, fmt.Errorf("invalid JSON at line %d", lineNo)
+		}
+		if row.TS == "" || row.Event == "" {
+			return nil, fmt.Errorf("missing ts or event at line %d", lineNo)
+		}
+		ts, err := time.Parse(time.RFC3339Nano, row.TS)
+		if err != nil {
+			return nil, fmt.Errorf("invalid timestamp at line %d", lineNo)
+		}
+		row.parsed = ts
+		rows = append(rows, row)
+	}
+	if err := sc.Err(); err != nil {
+		return nil, fmt.Errorf("cannot read the audit log")
+	}
+	if len(rows) == 0 {
+		return nil, fmt.Errorf("audit log is empty")
+	}
+	sort.SliceStable(rows, func(i, j int) bool { return rows[i].parsed.Before(rows[j].parsed) })
+	return rows, nil
+}
+
+func printAuditSummary(path string, rows []auditRow) {
+	sessions, taintedSessions := 0, 0
+	curTainted, open := false, false
+	allowed, blocked, granted, denied := 0, 0, 0, 0
+	blocks := map[toolRule]int{}
+	approvals := map[string][2]int{}
+	quarantined := map[string]bool{}
+	unparseableServer, unparseableHost, serverRequests := 0, 0, 0
+	for _, row := range rows {
+		switch row.Event {
+		case "start":
+			if open && curTainted {
+				taintedSessions++
+			}
+			sessions++
+			open, curTainted = true, false
+		case "taint_latched":
+			curTainted = true
+		case "exit":
+			if open && curTainted {
+				taintedSessions++
+			}
+			open, curTainted = false, false
+		case "allow":
+			allowed++
+		case "block":
+			blocked++
+			tool, rule := row.Tool, row.Rule
+			if tool == "" {
+				tool = "?"
+			}
+			if rule == "" {
+				rule = "?"
+			}
+			blocks[toolRule{tool: tool, rule: rule}]++
+		case "approval":
+			tool := row.Tool
+			if tool == "" {
+				tool = "?"
+			}
+			counts := approvals[tool]
+			if row.Granted {
+				granted++
+				counts[0]++
+			} else {
+				denied++
+				counts[1]++
+			}
+			approvals[tool] = counts
+		case "tool_quarantined":
+			tool := row.Tool
+			if tool == "" {
+				tool = "?"
+			}
+			quarantined[tool] = true
+		case "unparseable_server_frame":
+			unparseableServer++
+		case "unparseable_host_frame":
+			unparseableHost++
+		case "server_request":
+			serverRequests++
+		}
+	}
+	if open && curTainted {
+		taintedSessions++
+	}
+	active := 0.0
+	for i := 1; i < len(rows); i++ {
+		gap := rows[i].parsed.Sub(rows[i-1].parsed).Seconds()
+		if gap >= 0 && gap <= auditGapLimit {
+			active += gap
+		}
+	}
+	hours := active / 3600
+	perHour := "n/a (active time under 300 s)"
+	if active >= auditMinActive {
+		perHour = fmt.Sprintf("%.1f", float64(granted+denied)/hours)
+	}
+	fmt.Printf("file: %s\n", cleanForDialog(path, 240))
+	fmt.Printf("events: %d   span: %s -> %s\n", len(rows), rows[0].TS, rows[len(rows)-1].TS)
+	fmt.Printf("sessions: %d  (tainted: %d)\n", sessions, taintedSessions)
+	fmt.Printf("active time: %.2f h   (gaps over 600 s excluded)\n", hours)
+	fmt.Printf("tool calls allowed: %d   blocked: %d   approvals granted: %d   approvals denied: %d\n", allowed, blocked, granted, denied)
+	fmt.Printf("approval prompts per active hour: %s\n", perHour)
+	fmt.Println("blocks by tool/rule:")
+	if len(blocks) == 0 {
+		fmt.Println("  none")
+	} else {
+		keys := make([]toolRule, 0, len(blocks))
+		for key := range blocks {
+			keys = append(keys, key)
+		}
+		sort.Slice(keys, func(i, j int) bool {
+			if keys[i].tool != keys[j].tool {
+				return keys[i].tool < keys[j].tool
+			}
+			return keys[i].rule < keys[j].rule
+		})
+		for _, key := range keys {
+			fmt.Printf("  %s %s : %d\n", cleanForDialog(key.tool, 80), cleanForDialog(key.rule, 80), blocks[key])
+		}
+	}
+	fmt.Println("approvals by tool:")
+	if len(approvals) == 0 {
+		fmt.Println("  none")
+	} else {
+		tools := make([]string, 0, len(approvals))
+		for tool := range approvals {
+			tools = append(tools, tool)
+		}
+		sort.Strings(tools)
+		for _, tool := range tools {
+			counts := approvals[tool]
+			fmt.Printf("  %s granted=%d denied=%d\n", cleanForDialog(tool, 80), counts[0], counts[1])
+		}
+	}
+	if len(quarantined) == 0 {
+		fmt.Println("tools quarantined: none")
+	} else {
+		tools := make([]string, 0, len(quarantined))
+		for tool := range quarantined {
+			tools = append(tools, cleanForDialog(tool, 80))
+		}
+		sort.Strings(tools)
+		fmt.Printf("tools quarantined: %s\n", strings.Join(tools, ", "))
+	}
+	fmt.Printf("unparseable server frames: %d   unparseable host frames: %d   server-initiated requests: %d\n",
+		unparseableServer, unparseableHost, serverRequests)
 }
 
 // ---------------------------------------------------------------- doctor

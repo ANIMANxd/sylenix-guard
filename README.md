@@ -81,6 +81,9 @@ wraps one MCP server per process over stdio.
 - `sylenix-guard doctor` audit of supported MCP client configs: wrapped vs
   unwrapped servers, allowlist gaps, risky scratch/trust/approval settings,
   unsigned policy/pins (opt-in until signing lands) and outdated Guard binaries
+- Human-approved `clear-taint` for a running session, with an OS dialog and a
+  `CLEAR_TAINT` audit event
+- `stats` audit summary with approval prompts per active hour
 - Scratch-directory write policy (`--allow-write-under`)
 - Time-bounded, directory-scoped human approvals (dialog and `--grant`)
 - Native approval dialogs: osascript (macOS), zenity (Linux), PowerShell form (Windows)
@@ -160,6 +163,50 @@ sylenix-guard doctor --require-signatures
 Exit code is `0` when there are no findings, `1` when there are findings, and `2` for a
 usage error. Each finding has one suggested fix. The full finding list is in
 [`docs/DOCTOR.md`](docs/DOCTOR.md).
+
+### Clear taint and measure prompts
+
+`clear-taint` clears the in-memory taint latch for a **running** guard session. The
+CLI only asks; the guard shows the OS dialog and only a human **Clear Taint** click
+clears the latch. There is no `--yes`, `--force`, MCP method, tool call or environment
+variable that can clear it.
+
+```bash
+sylenix-guard clear-taint --name my-server
+sylenix-guard clear-taint --name my-server --state-dir /path/to/state
+```
+
+The CLI exits `0` when the latch was cleared (or was already clean), `1` when the
+human denied or the dialog failed, and `2` when no running session was found or the
+request was rejected. A successful clear writes `CLEAR_TAINT` to the audit log with
+`who` (the OS user), `ts`, `method: dialog` and a random `request_id`; a denial writes
+`CLEAR_TAINT_DENIED`.
+
+The control files live in the 0700 state dir. A same-user process, including the
+wrapped server, can request a dialog, but cannot clear the latch without the human's
+approval. The guard must be running with the same `--name` and state directory. If
+the guard was started without `--name`, the session name is the original server
+command's basename (for example `npx` or `python.exe`).
+
+`stats` prints the audit summary, including approval prompts per active hour:
+
+```bash
+sylenix-guard stats --name my-server
+sylenix-guard stats --file /path/to/audit-my-server.jsonl
+```
+
+`--name` uses the same guard session name as `clear-taint`; use `--file` if the
+guard was started with a different state directory.
+
+Active time excludes gaps longer than 600 seconds; the prompts/hour figure is
+`n/a` below 300 seconds of active time. The metric counts approval dialogs, not
+`clear-taint` dialogs. The exact output matches
+`scripts/summarize_audit.py`, including the existing fixture. `stats` exits `0`
+on success and `2` for a usage or read/parse error.
+
+Built-in profile read-only tools are allowed after taint without a prompt when the
+profile is selected. An explicit `--readonly` list or policy `class` still replaces
+that default; it is never widened automatically.
 
 ## Configuration
 
@@ -242,6 +289,12 @@ sends nothing anywhere. Summaries with prompts-per-active-hour metrics:
   approval, changed binary/lockfile hashes, `allow` and install pre-population.
 - Doctor: `python tests/probes/test_doctor.py` covers a clean setup, every
   finding, JSON shape, no argument/env leakage and read-only behavior.
+- Taint clearing: `python tests/probes/test_clear_taint.py` covers human allow
+  and deny, a clean session, MCP tool/host/server/env attempts, a failed dialog,
+  and read-only profile tools in dialog mode.
+- Audit summary: `python tests/probes/test_stats.py` checks the fixture output
+  exactly, named-log resolution, prompts per active hour, clear-taint events and
+  usage errors.
 - Prompt cost: `python scripts/replay_profile_session.py` replays a recorded
   normal session and reports approval prompts per active hour.
 - Releases: tag `vX.Y.Z`; checksum, Cosign, SBOM, Homebrew and Scoop verification
@@ -294,7 +347,21 @@ bypass, response expectations and safe harbour.
 
 - Coverage is one MCP server per process. Host built-in tools, attachments and pasted
   text never pass through the gateway.
-- Taint does not clear for the life of the process.
+- Taint never clears automatically. A human can clear it with `clear-taint` and an
+  OS dialog; a session lasts as long as the guard process.
+- `clear-taint` only works while the guard is running with the same `--name` and
+  `--state-dir`. Use a unique `--name` per guard; two guards sharing a name share
+  the audit/pin files and the clear-taint control channel. Use an absolute
+  `--state-dir` if the guard was started with a relative one. The control file is
+  local state: a same-user process, including the wrapped server, can request a
+  dialog, but cannot clear the latch without the human's approval. Clearing does
+  not revoke grants, quarantines or the server process, and restarting the guard
+  starts a new session.
+- `stats` counts approval dialogs only; `clear-taint` dialogs are logged
+  separately. Active time excludes gaps over 600 seconds, and prompts/hour is
+  `n/a` below 300 seconds.
+- Built-in profile read-only tools are prompt-free only when the profile is
+  selected and no explicit `--readonly` or policy class replaces it.
 - `--readonly` and policy `class: read` bypass every sink check, including the hard blocks.
 - The scratch policy governs where writes land, not what they write.
 - `--allow-write-under` interprets relative names against the scratch directory; the
