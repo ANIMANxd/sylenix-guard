@@ -127,6 +127,7 @@ def case_validate():
     with tempfile.TemporaryDirectory() as d:
         valid = os.path.join(d, "valid.yaml")
         write(valid, """version: 1
+profile: auto
 approval: deny
 spotlight: true
 sensitive_paths:
@@ -184,6 +185,7 @@ servers:
             ("unknown tool field", "version: 1\nservers:\n  t:\n    tools:\n      x:\n        class: read\n        bogus: true\n"),
             ("bad class", "version: 1\nservers:\n  t:\n    tools:\n      x:\n        class: delete\n"),
             ("bad approval", "version: 1\napproval: allow\n"),
+            ("unknown profile", "version: 1\nprofile: nope\n"),
             ("allow_paths on exec", "version: 1\nservers:\n  t:\n    tools:\n      x:\n        class: exec\n        allow_paths: [out]\n"),
             ("bad sensitive glob", "version: 1\nsensitive_paths:\n  - '['\n"),
             ("bad egress host", "version: 1\negress:\n  allow_hosts:\n    - http://example.com\n"),

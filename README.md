@@ -72,6 +72,9 @@ wraps one MCP server per process over stdio.
 - Versioned policy file (`--policy` or `<state-dir>/policy.yaml`) with per-tool
   classes, path keys, allow paths, trust, sensitive patterns, egress host lists,
   approval mode and spotlight; flags remain and override the file
+- Built-in profiles for filesystem, git, GitHub, fetch, shell, Slack, Postgres,
+  browser (Playwright/Puppeteer), Notion and Jira, selected automatically from
+  the server command/package name and overridable per tool
 - Scratch-directory write policy (`--allow-write-under`)
 - Time-bounded, directory-scoped human approvals (dialog and `--grant`)
 - Native approval dialogs: osascript (macOS), zenity (Linux), PowerShell form (Windows)
@@ -97,7 +100,7 @@ CGO_ENABLED=0 go build -o bin/sylenix-guard ./cmd/sylenix-guard
 CGO_ENABLED=0 go build -o bin/sylenix-guard.exe ./cmd/sylenix-guard
 ```
 
-`make check` runs gofmt, go vet, the protocol self-test, the probe suites and the audit summarizer fixture.
+`make check` runs gofmt, go vet, the protocol self-test, the probe suites, the built-in profile tests, the prompt-cost replay and the audit summarizer fixture.
 On Windows, `make check` needs a POSIX shell (Git Bash or WSL). Without one, run the
 same steps directly: `gofmt -l cmd`, `go vet ./...`, `python demo/selftest.py`.
 
@@ -172,10 +175,17 @@ allow/deny lists and the approval mode. Unknown tools default to `exec`; unknown
 fields, duplicate keys, bad versions and malformed patterns stop the guard at
 startup instead of being ignored. The file is read once at startup.
 
+Built-in profiles cover filesystem, git, GitHub, fetch, shell, Slack, Postgres,
+browser (Playwright/Puppeteer), Notion and Jira. The profile is selected from
+the server command/package name (with `--name` as a fallback), and a policy
+entry for a tool overrides the profile. Use `profile: auto` (default),
+`profile: none`, or `profile: <name>` in the policy file to control it.
+
 Location order is `--policy PATH`, then `<state-dir>/policy.yaml`, then the
 built-in defaults. The built-in sensitive-name floor cannot be removed by a
 policy file; `sensitive_paths` only adds to it. See
-[`docs/POLICY.md`](docs/POLICY.md) for the schema and three worked examples.
+[`docs/POLICY.md`](docs/POLICY.md) for the schema, profile list and three worked
+examples.
 
 ## Audit log
 
@@ -189,6 +199,10 @@ sends nothing anywhere. Summaries with prompts-per-active-hour metrics:
 
 - Protocol self-test: 101 checks, `python demo/selftest.py` (100 run on Windows; the
   dialog test needs a real dialog and skips there).
+- Built-in profiles: `python tests/probes/test_profiles.py` exercises all ten
+  profiles, one allowed read and one blocked write/egress each.
+- Prompt cost: `python scripts/replay_profile_session.py` replays a recorded
+  normal session and reports approval prompts per active hour.
 - Releases: tag `vX.Y.Z`; checksum, Cosign, SBOM, Homebrew and Scoop verification
   steps are in [`docs/INSTALL.md`](docs/INSTALL.md).
 - Adversarial audits of the proxy itself: [`docs/AUDIT_1.md`](docs/AUDIT_1.md) and
@@ -253,6 +267,9 @@ bypass, response expectations and safe harbour.
 - The built-in sensitive-name floor is short. `sensitive_paths` can extend it but
   cannot remove it. Policy files are local, unsigned and read once at startup; the
   loader accepts only a strict YAML subset.
+- Built-in profiles are defaults matched by command/package token. A renamed
+  package, wrapper or custom server can miss the profile; review the profile in
+  the audit log and override tool classes in the policy file.
 - Egress host matching is textual on the argument value. It does not resolve DNS,
   follow redirects, inspect the actual connection or pin the resolved IP.
 - Manifest pinning is trust on first use; pin files are not signed.
@@ -269,7 +286,8 @@ Section 7 of [`POC_SPIKE.md`](POC_SPIKE.md) is the authoritative limitations lis
 cmd/sylenix-guard/main.go   the gateway (the whole implementation)
 demo/                       MCP demo server, injected tickets, harness, sweep,
                             protocol self-test, manual dialog test
-scripts/                    audit summarizer, leak rescorer, gate evaluation
+scripts/                    audit summarizer, leak rescorer, gate evaluation,
+                            profile-session replay
 docs/                       audits, tester guide, soak checklist, measurement data
 POC_SPIKE.md                scope, behavior reference, decision gates
 ```

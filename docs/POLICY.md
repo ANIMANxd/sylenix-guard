@@ -31,6 +31,9 @@ field is ignored.
 ```yaml
 version: 1
 
+# auto (default), none, or a built-in profile name
+profile: auto
+
 # deny (default) or dialog
 approval: deny
 
@@ -76,6 +79,46 @@ servers:
 The shorter `servers.<name>.<tool>` form is also accepted. A tool that is not
 listed defaults to `exec`, the most restrictive class that can still be approved
 by a human; it is never treated as a read tool.
+
+## Built-in profiles
+
+A profile supplies default classes for a known server's tool list. It is
+selected automatically from the server command and package/image tokens (for
+example `npx -y @modelcontextprotocol/server-filesystem` or
+`uvx mcp-server-fetch`). If the command does not identify a profile, the
+`--name` label is used as a fallback. `profile: auto` (the default) uses this
+selection; `profile: none` disables it; `profile: <name>` forces one. An unknown
+profile name is a startup error. `playwright` and `puppeteer` are aliases for
+`browser`, `postgresql` for `postgres`, and `atlassian` for `jira`.
+
+A policy entry for a tool replaces the profile's class for that tool, even when
+the entry only adds `path_keys` or `allow_paths`. To make a profile tool
+unknown/restrictive again, set `class: exec`.
+
+| Profile | Source used for the tool list | Typical identifiers |
+|---|---|---|
+| `filesystem` | npm `@modelcontextprotocol/server-filesystem` 2.2.0 | `@modelcontextprotocol/server-filesystem`, `mcp-server-filesystem`, `mcp/filesystem` |
+| `git` | PyPI `mcp-server-git` 2026.11.4 | `mcp-server-git`, `mcp_server_git`, `mcp/git` |
+| `github` | `github/github-mcp-server` v2.1.0, plus archived npm `@modelcontextprotocol/server-github` 2025.4.8 aliases | `github-mcp-server`, `github/github-mcp-server`, `@modelcontextprotocol/server-github` |
+| `fetch` | PyPI `mcp-server-fetch` 2026.11.4 | `mcp-server-fetch`, `mcp_server_fetch`, `mcp/fetch` |
+| `shell` | npm `mcp-shell` 0.1.3, `@mkusaka/mcp-shell-server` 0.1.1, `@mako10k/mcp-shell-server` 2.8.1 | `mcp-shell`, `mcp-shell-server`, `@mkusaka/mcp-shell-server` |
+| `slack` | npm `@modelcontextprotocol/server-slack` 2025.4.25 | `@modelcontextprotocol/server-slack`, `mcp-server-slack`, `mcp/slack` |
+| `postgres` | npm `@modelcontextprotocol/server-postgres` 0.6.2 and `postgres-mcp` 0.3.0 | `@modelcontextprotocol/server-postgres`, `mcp-server-postgres`, `postgres-mcp` |
+| `browser` | npm `@playwright/mcp` 0.0.84 and `@modelcontextprotocol/server-puppeteer` 2025.5.12 | `@playwright/mcp`, `playwright-mcp`, `mcp-server-puppeteer` |
+| `notion` | npm `@notionhq/notion-mcp-server` 2.6.1 (Notion API 2025-09-03) | `@notionhq/notion-mcp-server`, `notion-mcp-server`, `mcp/notion` |
+| `jira` | PyPI `mcp-atlassian` 0.23.1 | `mcp-atlassian`, `mcp_atlassian`, `jira-mcp-atlassian` |
+
+Profiles are conservative defaults, not a trust decision you can skip: review
+the class of any write, exec or egress tool before relying on it, and override
+it in the policy file when your server exposes a different tool list. The
+profile sources are also recorded in comments in
+`cmd/sylenix-guard/main.go`.
+
+`fetch` has only the egress-class `fetch` tool. If normal fetching should
+continue after taint, list the hosts it may reach in `egress.allow_hosts`;
+otherwise every tainted fetch is `EGRESS_TARGET`. The profile test uses an
+allowlisted host for its read-side call and an unlisted host for the blocked
+call.
 
 ## Classes
 
@@ -148,6 +191,19 @@ sylenix-guard policy validate ./policy.yaml
 
 # Print the built-in defaults as a valid policy file.
 sylenix-guard policy print-default > policy.yaml
+```
+
+## Checking prompt cost
+
+`scripts/replay_profile_session.py` replays a recorded normal session through
+the guard, with the profile selected from the fixture's package name. It counts
+the calls that would need a human decision and reports prompts per active hour.
+The default fixture is a 60-minute filesystem session; it must stay below ten
+prompts per hour.
+
+```bash
+python scripts/replay_profile_session.py
+python scripts/replay_profile_session.py --json
 ```
 
 ## Examples

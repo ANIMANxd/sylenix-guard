@@ -54,6 +54,7 @@ const policyFileName = "policy.yaml"
 // this struct does not name is an error, never silently ignored.
 type policyFile struct {
 	Version        int                     `json:"version"`
+	Profile        string                  `json:"profile"`
 	Approval       string                  `json:"approval"`
 	Spotlight      *bool                   `json:"spotlight"`
 	SensitivePaths []string                `json:"sensitive_paths"`
@@ -75,6 +76,15 @@ type policyTool struct {
 	PathKeys   []string `json:"path_keys"`
 	AllowPaths []string `json:"allow_paths"`
 	Trust      bool     `json:"trust"`
+}
+
+// policyProfile is a built-in per-server tool classification. The policy file
+// can override individual tools, or select a profile explicitly.
+type policyProfile struct {
+	name        string
+	source      string
+	identifiers []string
+	tools       map[string]string
 }
 
 type frame map[string]json.RawMessage
@@ -130,6 +140,8 @@ type Guard struct {
 	egressDeny       map[string]bool            // policy host denylist (wins over allow)
 	policySource     string
 	policyVersion    int
+	profileName      string
+	profileSource    string
 	readonlyOverride bool // --readonly was set, so policy class: read entries are ignored
 
 	mu          sync.Mutex
@@ -270,9 +282,15 @@ func main() {
 	}
 	g.policySource = source
 	g.policyVersion = pf.Version
-	g.applyPolicy(pf, visited, *readonly, *trust, *approve, flagScratch, *noSpot)
+	profile := selectPolicyProfile(*name, args, pf.Profile)
+	if profile != nil {
+		g.profileName = profile.name
+		g.profileSource = profile.source
+	}
+	g.applyPolicy(pf, profile, visited, *readonly, *trust, *approve, flagScratch, *noSpot)
 	printPolicyDeprecationNotes(visited, *policyPath, source)
-	g.event("policy_loaded", map[string]any{"source": source, "version": pf.Version, "approve": g.approve})
+	g.event("policy_loaded", map[string]any{"source": source, "version": pf.Version, "approve": g.approve,
+		"profile": g.profileName, "profile_source": g.profileSource})
 	if !g.loadPins(*resetPins) {
 		fmt.Fprintf(os.Stderr, "[sylenix-guard] pin file %s exists but cannot be read; refusing to start. Inspect it, or restart with --reset-pins to trust every tool as new.\n", g.pinsPath())
 		os.Exit(2)
@@ -296,6 +314,7 @@ func main() {
 	}
 	g.event("start", map[string]any{"command": args[0], "readonly": sortedKeys(g.readonly), "trust": sortedKeys(g.trust), "approve": g.approve,
 		"policy_source": g.policySource, "policy_version": g.policyVersion,
+		"profile": g.profileName, "profile_source": g.profileSource,
 		"allow_write_under": []string(allowWriteUnder), "grants": []string(grantSpecs)})
 
 	sig := make(chan os.Signal, 1)
@@ -553,6 +572,13 @@ func validatePolicy(pf *policyFile) error {
 	if pf.Version != policyVersion {
 		return fmt.Errorf("version must be %d", policyVersion)
 	}
+	if pf.Profile != "" {
+		profile := strings.ToLower(strings.TrimSpace(pf.Profile))
+		if profile != "auto" && profile != "none" && findBuiltinProfile(profile) == nil {
+			return fmt.Errorf("profile must be auto, none or one of: %s", strings.Join(builtinProfileNames(), ", "))
+		}
+		pf.Profile = profile
+	}
 	if pf.Approval != "" && pf.Approval != "deny" && pf.Approval != "dialog" {
 		return fmt.Errorf("approval must be deny or dialog")
 	}
@@ -690,7 +716,7 @@ func normalizePolicyHost(h string) (string, error) {
 // applyPolicy merges the file with explicitly set flags. Flags replace the
 // corresponding policy section rather than adding to it, so an operator can
 // always recover the old behaviour with the old flag.
-func (g *Guard) applyPolicy(pf *policyFile, visited map[string]bool, readonlyFlag, trustFlag, approveFlag string, flagScratch []scratchRule, noSpot bool) {
+func (g *Guard) applyPolicy(pf *policyFile, profile *policyProfile, visited map[string]bool, readonlyFlag, trustFlag, approveFlag string, flagScratch []scratchRule, noSpot bool) {
 	g.classes = map[string]string{}
 	g.toolPathKeys = map[string]map[string]bool{}
 	g.egressAllow = map[string]bool{}
@@ -735,6 +761,10 @@ func (g *Guard) applyPolicy(pf *policyFile, visited map[string]bool, readonlyFla
 		g.scratch = append([]scratchRule(nil), flagScratch...)
 	}
 
+	// Built-in profile first; an explicitly configured tool in the policy file
+	// replaces its profile entry below.
+	g.applyProfile(profile)
+
 	var srv policyServer
 	if len(pf.Servers) == 1 {
 		for _, only := range pf.Servers {
@@ -744,6 +774,10 @@ func (g *Guard) applyPolicy(pf *policyFile, visited map[string]bool, readonlyFla
 		srv = pf.Servers[g.name] // loadPolicyForRun already required this entry
 	}
 	for tname, tool := range srv.Tools {
+		// A policy entry is an explicit override, even when it only changes
+		// allow_paths or path_keys, so clear any profile classification first.
+		delete(g.readonly, tname)
+		delete(g.classes, tname)
 		switch tool.Class {
 		case "read":
 			if !g.readonlyOverride {
@@ -837,13 +871,481 @@ func runPolicyCommand(args []string) int {
 
 func defaultPolicyYAML() string {
 	var b strings.Builder
-	b.WriteString("version: 1\napproval: deny\nspotlight: true\nsensitive_paths:\n")
+	b.WriteString("version: 1\nprofile: auto\napproval: deny\nspotlight: true\nsensitive_paths:\n")
 	for _, p := range defaultSensitivePaths {
 		quoted, _ := json.Marshal(p)
 		fmt.Fprintf(&b, "  - %s\n", quoted)
 	}
 	b.WriteString("egress:\n  allow_hosts: []\n  deny_hosts: []\nservers: {}\n")
 	return b.String()
+}
+
+// ---------------------------------------------------------------- built-in profiles
+
+// Profile sources (tool lists read 2026-11-09):
+//
+//	filesystem  npm @modelcontextprotocol/server-filesystem 2.2.0
+//	            https://github.com/modelcontextprotocol/servers/tree/main/src/filesystem
+//	git         PyPI mcp-server-git 2026.11.4
+//	            https://github.com/modelcontextprotocol/servers/tree/main/src/git
+//	github      github/github-mcp-server v2.1.0, plus the archived npm
+//	            @modelcontextprotocol/server-github 2025.4.8 aliases
+//	            https://github.com/github/github-mcp-server
+//	fetch       PyPI mcp-server-fetch 2026.11.4
+//	            https://github.com/modelcontextprotocol/servers/tree/main/src/fetch
+//	shell       npm mcp-shell 0.1.3, @mkusaka/mcp-shell-server 0.1.1 and
+//	            @mako10k/mcp-shell-server 2.8.1
+//	            https://github.com/mkusaka/mcp-shell-server
+//	            https://github.com/mako10k/mcp-shell-server
+//	slack       npm @modelcontextprotocol/server-slack 2025.4.25
+//	            https://github.com/modelcontextprotocol/servers-archived/tree/main/src/slack
+//	postgres    npm @modelcontextprotocol/server-postgres 0.6.2 and
+//	            postgres-mcp 0.3.0 (CrystalDBA)
+//	            https://github.com/modelcontextprotocol/servers-archived/tree/main/src/postgres
+//	            https://github.com/crystaldba/postgres-mcp
+//	browser     npm @playwright/mcp 0.0.84 and
+//	            @modelcontextprotocol/server-puppeteer 2025.5.12
+//	            https://github.com/microsoft/playwright-mcp
+//	            https://github.com/modelcontextprotocol/servers-archived/tree/main/src/puppeteer
+//	notion      npm @notionhq/notion-mcp-server 2.6.1 (Notion API 2025-09-03)
+//	            https://github.com/makenotion/notion-mcp-server
+//	jira        PyPI mcp-atlassian 0.23.1
+//	            https://github.com/sooperset/mcp-atlassian
+//
+// The classifications are deliberately conservative: anything that changes
+// state is write, anything that runs code is exec, and anything that opens a
+// network destination is egress. A policy file may override any entry.
+
+func profileToolSet(class string, names ...string) map[string]string {
+	m := make(map[string]string, len(names))
+	for _, name := range names {
+		m[name] = class
+	}
+	return m
+}
+
+func mergeProfileTools(sets ...map[string]string) map[string]string {
+	m := make(map[string]string)
+	for _, set := range sets {
+		for name, class := range set {
+			m[name] = class
+		}
+	}
+	return m
+}
+
+var builtinProfiles = []policyProfile{
+	{
+		name:   "filesystem",
+		source: "npm @modelcontextprotocol/server-filesystem 2.2.0",
+		identifiers: []string{
+			"@modelcontextprotocol/server-filesystem", "server-filesystem",
+			"mcp-server-filesystem", "mcp_server_filesystem", "mcp/filesystem", "filesystem",
+		},
+		tools: mergeProfileTools(
+			profileToolSet("read",
+				"read_file", "read_text_file", "read_media_file", "read_multiple_files",
+				"list_directory", "list_directory_with_sizes", "directory_tree",
+				"search_files", "get_file_info", "list_allowed_directories",
+			),
+			profileToolSet("write",
+				"write_file", "append_file", "edit_file", "create_directory",
+				"move_file", "copy_file",
+			),
+		),
+	},
+	{
+		name:   "git",
+		source: "PyPI mcp-server-git 2026.11.4",
+		identifiers: []string{
+			"mcp-server-git", "mcp_server_git", "server-git", "mcp/git", "git",
+		},
+		tools: mergeProfileTools(
+			profileToolSet("read",
+				"git_status", "git_diff_unstaged", "git_diff_staged", "git_diff",
+				"git_log", "git_show", "git_branch", "git_remote",
+			),
+			profileToolSet("write",
+				"git_commit", "git_add", "git_reset", "git_create_branch",
+				"git_checkout", "git_merge",
+			),
+		),
+	},
+	{
+		name:   "github",
+		source: "github/github-mcp-server v2.1.0; npm @modelcontextprotocol/server-github 2025.4.8",
+		identifiers: []string{
+			"github/github-mcp-server", "ghcr.io/github/github-mcp-server",
+			"github-mcp-server", "@modelcontextprotocol/server-github",
+			"server-github", "mcp-server-github", "mcp_server_github", "github",
+		},
+		tools: mergeProfileTools(
+			profileToolSet("read",
+				"actions_get", "actions_list", "get_job_logs",
+				"get_code_quality_finding", "get_code_scanning_alert",
+				"list_code_scanning_alerts", "get_dependabot_alert",
+				"list_dependabot_alerts", "get_global_security_advisory",
+				"list_global_security_advisories", "get_secret_scanning_alert",
+				"list_secret_scanning_alerts", "list_org_repository_security_advisories",
+				"list_repository_security_advisories", "get_me", "get_team_members",
+				"get_teams", "ui_get", "get_discussion", "get_discussion_comments",
+				"list_discussion_categories", "list_discussions", "get_gist", "list_gists",
+				"get_label", "list_label", "get_latest_release", "get_release_by_tag",
+				"list_releases", "get_notification_details", "list_notifications",
+				"get_repository_tree", "get_tag", "list_tags", "issue_read",
+				"list_branches", "list_commits", "get_commit", "list_issue_fields",
+				"list_issue_types", "list_issues", "list_pull_requests",
+				"list_repository_collaborators", "list_starred_repositories",
+				"projects_get", "projects_list", "pull_request_read",
+				"repository_ruleset_read", "custom_properties_read",
+				"get_copilot_space", "list_copilot_spaces", "github_support_docs_search",
+				"search_code", "search_commits", "search_issues", "search_orgs",
+				"search_pull_requests", "search_repositories", "search_users",
+				"get_file_contents", "get_issue", "get_pull_request",
+				"get_pull_request_files", "get_pull_request_status",
+				"get_pull_request_comments", "get_pull_request_reviews",
+			),
+			profileToolSet("write",
+				"actions_run_trigger", "add_comment_to_pending_review",
+				"add_issue_comment", "add_reply_to_pull_request_comment",
+				"assign_copilot_to_issue", "assign_copilot_to_issue_with_intent",
+				"create_branch", "create_gist", "create_or_update_file",
+				"create_pull_request", "create_pull_request_with_copilot",
+				"create_repository", "create_repository_ruleset",
+				"custom_properties_write", "delete_file", "delete_repository",
+				"discussion_comment_write", "dismiss_notification", "fork_repository",
+				"issue_write", "label_write", "manage_notification_subscription",
+				"manage_repository_notification_subscription", "mark_all_notifications_read",
+				"merge_pull_request", "projects_write", "pull_request_review_write",
+				"push_files", "request_copilot_review", "star_repository",
+				"sub_issue_write", "unstar_repository", "update_gist",
+				"update_issue_comment", "update_pull_request", "update_pull_request_branch",
+				"create_issue", "update_issue", "create_pull_request_review",
+			),
+		),
+	},
+	{
+		name:        "fetch",
+		source:      "PyPI mcp-server-fetch 2026.11.4",
+		identifiers: []string{"mcp-server-fetch", "mcp_server_fetch", "server-fetch", "mcp/fetch", "fetch"},
+		tools:       profileToolSet("egress", "fetch"),
+	},
+	{
+		name:   "shell",
+		source: "npm mcp-shell 0.1.3; @mkusaka/mcp-shell-server 0.1.1; @mako10k/mcp-shell-server 2.8.1",
+		identifiers: []string{
+			"@mkusaka/mcp-shell-server", "@mako10k/mcp-shell-server",
+			"mcp-shell-server", "mcp-shell", "shell-mcp", "shell",
+		},
+		tools: mergeProfileTools(
+			profileToolSet("read",
+				"process_get_execution", "list_execution_outputs", "read_execution_output",
+				"get_cleanup_suggestions", "terminal_list", "terminal_get_info",
+				"command_history_query",
+			),
+			profileToolSet("exec",
+				"run_command", "shell_exec", "shell_execute", "execute_command",
+				"run_shell_command", "shell_set_default_workdir", "delete_execution_outputs",
+				"perform_auto_cleanup", "terminal_operate", "terminal_close",
+			),
+		),
+	},
+	{
+		name:   "slack",
+		source: "npm @modelcontextprotocol/server-slack 2025.4.25",
+		identifiers: []string{
+			"@modelcontextprotocol/server-slack", "server-slack", "mcp-server-slack",
+			"mcp_server_slack", "mcp/slack", "slack",
+		},
+		tools: mergeProfileTools(
+			profileToolSet("read",
+				"slack_list_channels", "slack_get_channel_history",
+				"slack_get_thread_replies", "slack_get_users", "slack_get_user_profile",
+			),
+			profileToolSet("write",
+				"slack_post_message", "slack_reply_to_thread", "slack_add_reaction",
+			),
+		),
+	},
+	{
+		name:   "postgres",
+		source: "npm @modelcontextprotocol/server-postgres 0.6.2; postgres-mcp 0.3.0",
+		identifiers: []string{
+			"@modelcontextprotocol/server-postgres", "server-postgres",
+			"mcp-server-postgres", "mcp_server_postgres", "postgres-mcp",
+			"mcp/postgres", "postgres",
+		},
+		tools: mergeProfileTools(
+			profileToolSet("read",
+				"query", "list_schemas", "list_objects", "get_object_details",
+				"explain_query", "get_top_queries", "analyze_workload_indexes",
+				"analyze_query_indexes", "analyze_db_health",
+			),
+			profileToolSet("write", "execute_sql"),
+		),
+	},
+	{
+		// Playwright's readOnlyHint marks some recording/video/PDF helpers
+		// read-only; this profile keeps them write because they create files or
+		// change page state. wait_for/verify only observe, so they stay read.
+		name:   "browser",
+		source: "npm @playwright/mcp 0.0.84; @modelcontextprotocol/server-puppeteer 2025.5.12",
+		identifiers: []string{
+			"@playwright/mcp", "playwright-mcp", "playwright_mcp", "mcp/playwright",
+			"playwright", "mcr.microsoft.com/playwright/mcp",
+			"@modelcontextprotocol/server-puppeteer", "server-puppeteer",
+			"mcp-server-puppeteer", "mcp_server_puppeteer", "mcp/puppeteer",
+			"puppeteer", "browser",
+		},
+		tools: mergeProfileTools(
+			profileToolSet("read",
+				"browser_console_messages", "browser_cookie_get", "browser_cookie_list",
+				"browser_find", "browser_generate_locator", "browser_get_config",
+				"browser_localstorage_get", "browser_localstorage_list",
+				"browser_network_request", "browser_network_requests",
+				"browser_route_list", "browser_sessionstorage_get",
+				"browser_sessionstorage_list", "browser_snapshot", "browser_storage_state",
+				"browser_take_screenshot", "browser_verify_element_visible",
+				"browser_verify_list_visible", "browser_verify_text_visible",
+				"browser_verify_value", "browser_wait_for", "puppeteer_screenshot",
+			),
+			profileToolSet("write",
+				"browser_annotate", "browser_click", "browser_close",
+				"browser_cookie_clear", "browser_cookie_delete", "browser_cookie_set",
+				"browser_drag", "browser_drop", "browser_emulate_media",
+				"browser_file_upload", "browser_fill_form", "browser_handle_dialog",
+				"browser_hide_highlight", "browser_highlight", "browser_hover",
+				"browser_localstorage_clear",
+				"browser_localstorage_delete", "browser_localstorage_set",
+				"browser_mouse_click_xy", "browser_mouse_down", "browser_mouse_drag_xy",
+				"browser_mouse_move_xy", "browser_mouse_up", "browser_mouse_wheel",
+				"browser_network_state_set", "browser_pdf_save", "browser_press_key",
+				"browser_resize", "browser_resume", "browser_route",
+				"browser_sessionstorage_clear", "browser_sessionstorage_delete",
+				"browser_sessionstorage_set", "browser_set_storage_state",
+				"browser_select_option", "browser_start_recording", "browser_start_tracing",
+				"browser_start_video", "browser_stop_recording", "browser_stop_tracing",
+				"browser_stop_video", "browser_tabs", "browser_type", "browser_unroute",
+				"browser_video_chapter",
+				"browser_video_hide_actions", "browser_video_show_actions",
+				"puppeteer_click", "puppeteer_fill", "puppeteer_hover", "puppeteer_select",
+			),
+			profileToolSet("exec",
+				"browser_evaluate", "browser_install", "browser_run_code_unsafe",
+				"puppeteer_evaluate",
+			),
+			profileToolSet("egress",
+				"browser_navigate", "browser_navigate_back", "browser_navigate_forward",
+				"puppeteer_navigate",
+			),
+		),
+	},
+	{
+		name:   "notion",
+		source: "npm @notionhq/notion-mcp-server 2.6.1 (Notion API 2025-09-03)",
+		identifiers: []string{
+			"@notionhq/notion-mcp-server", "notion-mcp-server", "notion_mcp_server",
+			"mcp/notion", "notion",
+		},
+		tools: mergeProfileTools(
+			profileToolSet("read",
+				"get-self", "get-user", "get-users", "post-search", "get-block-children",
+				"retrieve-a-block", "retrieve-a-page", "retrieve-a-page-property",
+				"retrieve-a-comment", "retrieve-a-data-source", "retrieve-a-database",
+				"retrieve-page-markdown", "list-data-source-templates", "query-data-source",
+				"search", "fetch", "get-comments", "get-teams",
+			),
+			profileToolSet("write",
+				"create-a-comment", "create-a-data-source", "delete-a-block", "move-page",
+				"patch-block-children", "patch-page", "post-page", "update-a-block",
+				"update-a-data-source", "update-page-markdown", "create-pages",
+				"update-page", "move-pages", "duplicate-page", "create-database",
+				"update-database", "create-comment",
+			),
+		),
+	},
+	{
+		name:   "jira",
+		source: "PyPI mcp-atlassian 0.23.1",
+		identifiers: []string{
+			"mcp-atlassian", "@sooperset/mcp-atlassian", "mcp_atlassian",
+			"mcp-atlassian-extended", "jira-mcp-atlassian", "atlassian", "jira",
+		},
+		tools: mergeProfileTools(
+			profileToolSet("read",
+				"get_user_profile", "search_assignable_users", "get_issue_watchers",
+				"get_issue", "search", "search_fields", "get_field_options",
+				"get_project_issues", "get_transitions", "get_worklog",
+				"download_attachments", "get_issue_images", "get_agile_boards",
+				"get_board_issues", "get_sprints_from_board", "get_sprint_issues",
+				"get_link_types", "batch_get_changelogs", "get_project_issue_types",
+				"get_create_fields", "get_project_versions", "get_project_components",
+				"get_all_projects", "search_projects", "get_project_fields",
+				"get_service_desk_for_project", "get_service_desk_queues",
+				"get_queue_issues", "get_request_types", "get_request_type_fields",
+				"get_issue_proforma_forms", "get_proforma_form_details", "get_issue_dates",
+				"get_issue_sla", "get_issue_development_info", "get_issues_development_info",
+				"get_project_epic_hierarchy", "get_cross_project_dependencies",
+				"jira_get_issue", "jira_search", "jira_search_fields",
+				"jira_search_assignable_users", "jira_get_transitions", "jira_get_worklog",
+				"jira_get_user_profile", "jira_get_issue_watchers", "jira_get_issue_images",
+				"jira_download_attachments", "jira_get_project_issues",
+				"jira_get_projects", "jira_get_all_projects", "jira_search_projects",
+				"jira_get_issue_types", "jira_get_create_fields", "jira_get_project_fields",
+				"jira_get_project_versions", "jira_get_project_components",
+				"jira_get_agile_boards", "jira_get_board_issues",
+				"jira_get_sprints_from_board", "jira_get_sprint_issues",
+				"jira_get_link_types", "jira_batch_get_changelogs",
+				"jira_get_comments", "jira_get_priorities", "jira_get_statuses",
+				"jira_get_service_desk_for_project", "jira_get_service_desk_queues",
+				"jira_get_queue_issues", "jira_get_request_types",
+				"jira_get_request_type_fields", "jira_get_issue_proforma_forms",
+				"jira_get_proforma_form_details", "jira_get_issue_dates", "jira_get_issue_sla",
+				"jira_get_issue_development_info", "jira_get_issues_development_info",
+				"jira_get_project_epic_hierarchy", "jira_get_cross_project_dependencies",
+			),
+			profileToolSet("write",
+				"add_watcher", "remove_watcher", "create_issue", "batch_create_issues",
+				"update_issue", "assign_issue", "delete_issue", "move_issue",
+				"add_comment", "edit_comment", "add_worklog", "link_to_epic",
+				"create_issue_link", "create_remote_issue_link", "remove_issue_link",
+				"transition_issue", "create_sprint", "update_sprint",
+				"add_issues_to_sprint", "move_issues_to_backlog", "create_version",
+				"batch_create_versions", "update_version", "create_customer_request",
+				"update_proforma_form_answers", "jira_add_watcher", "jira_remove_watcher",
+				"jira_create_issue", "jira_batch_create_issues", "jira_update_issue",
+				"jira_assign_issue", "jira_delete_issue", "jira_move_issue",
+				"jira_add_comment", "jira_edit_comment", "jira_add_worklog",
+				"jira_link_to_epic", "jira_create_issue_link",
+				"jira_create_remote_issue_link", "jira_remove_issue_link",
+				"jira_transition_issue", "jira_create_sprint", "jira_update_sprint",
+				"jira_add_issues_to_sprint", "jira_move_issues_to_backlog",
+				"jira_create_version", "jira_batch_create_versions", "jira_update_version",
+				"jira_create_customer_request", "jira_update_proforma_form_answers",
+			),
+		),
+	},
+}
+
+func findBuiltinProfile(name string) *policyProfile {
+	name = strings.ToLower(strings.TrimSpace(name))
+	switch name {
+	case "playwright", "puppeteer":
+		name = "browser"
+	case "postgresql":
+		name = "postgres"
+	case "atlassian":
+		name = "jira"
+	}
+	for i := range builtinProfiles {
+		if builtinProfiles[i].name == name {
+			return &builtinProfiles[i]
+		}
+	}
+	return nil
+}
+
+func builtinProfileNames() []string {
+	names := make([]string, 0, len(builtinProfiles))
+	for _, p := range builtinProfiles {
+		names = append(names, p.name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func normalizeProfileToken(t string) string {
+	t = strings.ToLower(strings.TrimSpace(t))
+	t = strings.Trim(t, `"'`)
+	t = strings.TrimSuffix(t, ".exe")
+	t = strings.TrimPrefix(t, "./")
+	if i := strings.LastIndex(t, "@"); i > 0 {
+		t = t[:i] // @scope/pkg@version -> @scope/pkg
+	}
+	return t
+}
+
+func profileMatchTokens(args []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(t string) {
+		t = normalizeProfileToken(t)
+		if t != "" && !seen[t] {
+			seen[t] = true
+			out = append(out, t)
+		}
+	}
+	for _, arg := range args {
+		add(arg)
+		add(path.Base(strings.ReplaceAll(arg, `\`, "/")))
+		add(filepath.Base(arg))
+	}
+	return out
+}
+
+func profileMatchScore(p *policyProfile, tokens []string) int {
+	best := 0
+	for _, identifier := range p.identifiers {
+		id := normalizeProfileToken(identifier)
+		for _, token := range tokens {
+			score := 0
+			switch {
+			case token == id:
+				score = 1000 + len(id)
+			case strings.HasSuffix(token, "/"+id):
+				score = 500 + len(id)
+			case strings.Contains(token, id):
+				score = 100 + len(id)
+			}
+			if score > best {
+				best = score
+			}
+		}
+	}
+	return best
+}
+
+// selectPolicyProfile applies policy.profile first, then auto-detection by
+// server command/package token, then the --name label as a last resort.
+func selectPolicyProfile(name string, serverArgs []string, override string) *policyProfile {
+	switch strings.ToLower(strings.TrimSpace(override)) {
+	case "none":
+		return nil
+	case "", "auto":
+		// auto-detect below
+	default:
+		return findBuiltinProfile(override)
+	}
+	tokens := profileMatchTokens(serverArgs)
+	var best *policyProfile
+	bestScore := 0
+	for i := range builtinProfiles {
+		score := profileMatchScore(&builtinProfiles[i], tokens)
+		if score > bestScore {
+			bestScore = score
+			best = &builtinProfiles[i]
+		}
+	}
+	if best != nil {
+		return best
+	}
+	return findBuiltinProfile(name)
+}
+
+func (g *Guard) applyProfile(profile *policyProfile) {
+	if profile == nil {
+		return
+	}
+	for tool, class := range profile.tools {
+		switch class {
+		case "read":
+			if !g.readonlyOverride {
+				g.readonly[tool] = true
+			}
+		case "write", "exec", "egress":
+			g.classes[tool] = class
+		}
+	}
 }
 
 // ---------------------------------------------------------------- strict YAML subset

@@ -32,6 +32,24 @@
 - `demo/selftest.py` now runs in flags mode or `--policy` mode; `make check`
   runs both. No existing check was weakened, deleted or skipped.
 
+### Built-in policy profiles
+
+- Added profiles for filesystem, git, GitHub, fetch, shell, Slack, Postgres,
+  browser (Playwright/Puppeteer), Notion and Jira. Each tool in each profile is
+  classified `read`, `write`, `exec` or `egress`, with the source package and
+  version cited in `cmd/sylenix-guard/main.go`.
+- Profiles are selected automatically from the server command/package/image
+  token, with `--name` as a fallback. A policy file may set `profile: auto`
+  (default), `profile: none`, or `profile: <name>`, and any per-tool policy entry
+  overrides the profile class.
+- Added `tests/probes/test_profiles.py`: every profile must allow a read after
+  taint and block a write or egress call, plus per-tool override, `profile:
+  none`, and explicit-profile checks.
+- Added `scripts/replay_profile_session.py` and
+  `demo/fixtures/normal_session.json`. The recorded 60-minute filesystem session
+  reports 1 approval prompt (1/hour), below the 10/hour budget.
+- Added `make profile-test` and `make replay-test`, both part of `make check`.
+
 ### Security
 
 - Tightened `--allow-write-under` and `--grant`: only values under known path
