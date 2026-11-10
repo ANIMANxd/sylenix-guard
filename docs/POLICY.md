@@ -319,8 +319,8 @@ suffix of it. Matching is case-insensitive, and `*`, `?` and `[...]` use Go's
 The built-in floor includes `.git`, `.env*`, `id_rsa*`, `id_ed25519*`,
 `*.pem`, `*.key`, `*.p12`, `*.pfx` and the common project/config names
 (`go.mod`, `package.json`, `Makefile`, `Dockerfile`, ...). A policy file can
-add to that floor but cannot remove it. `.git/hooks` keeps its protected-target
-treatment and can still be approved through the dialog.
+add to that floor but cannot remove it. `.git` is hard-blocked, including
+`.git/hooks`; no dialog, grant or scratch rule can approve it.
 
 ## Egress hosts
 

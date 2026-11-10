@@ -394,9 +394,10 @@ Sensitive matching:
 - Protected agent-instruction, credential and persistence targets are a separate
   table (`:4590-4662`): `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, Cursor/Windsurf
   rules, `.claude`, `.codex`, `.gemini`, `.continue`, MCP/editor config, CI
-  workflows, `.git/hooks`, `.ssh`, `.gitconfig`/`.git/config`, shell startup,
-  fish, desktop autostart, `.npmrc`/`.pypirc`/`.netrc`, cron, launchd, systemd
-  user units, Windows Startup, and Guard's state/key directories.
+  workflows, `.ssh`, `.gitconfig`/`.git/config`, shell startup, fish, desktop
+  autostart, `.npmrc`/`.pypirc`/`.netrc`, cron, launchd, systemd user units,
+  Windows Startup, and Guard's state/key directories. `.git` itself, including
+  `.git/hooks`, is hard-sensitive and never dialog- or grant-approvable.
 - `protectedTargetPathWithDirs` / `protectedCall` (`:4718-4801`) also check
   relative names against scratch roots and grant directories, so a symlink inside
   an approved root cannot hide a protected target; the active `--state-dir` is

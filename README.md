@@ -37,23 +37,23 @@ requires authorization that the agent cannot grant itself.
 1. **Always blocked.** Calls that address a network target (an argument named
    `url`/`uri`/`endpoint`/`webhook`/`href`/`link`, a destination key such as
    `host`/`server`/`to`/`recipient`, or a value that is a URL/URI) and calls
-   whose paths touch `.git` (except `.git/hooks`), `.env*`, key or certificate
-   files, or known config names (`go.mod`, `package.json`, `Makefile`, …) are
-   refused with `EGRESS_TARGET` and `SENSITIVE_TARGET`. These cannot be approved
-   through a dialog or a grant.
+   whose paths touch `.git` (all paths, including hooks), `.env*`, key or
+   certificate files, or known config names (`go.mod`, `package.json`, `Makefile`,
+   …) are refused with `EGRESS_TARGET` and `SENSITIVE_TARGET`. These cannot be
+   approved through a dialog or a grant.
 2. **Protected agent-instruction, credential and persistence files.** Agent
    instruction files (`AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, Cursor/Windsurf rules),
    agent config directories (`.claude`, `.codex`, `.gemini`, `.continue`),
    MCP/editor config (`.mcp.json`, `mcp.json`, `claude_desktop_config.json`,
    `.vscode`, `.idea`), CI and hooks (`.github/workflows`, `.gitlab-ci.yml`,
-   `.git/hooks`, `.husky`), shell startup files (including `.zshenv`, `.zprofile`,
+   `.husky`), shell startup files (including `.zshenv`, `.zprofile`,
    `.zlogin`, `.bash_login`, fish), `.ssh`, `.gitconfig`/`.git/config`, desktop
    autostart, package-manager credentials (`.npmrc`, `.pypirc`, `.netrc`), cron,
    launchd, systemd user units, Windows Startup, and Guard's own state/key
    directories (including the active `--state-dir`) are `SENSITIVE_TARGET` after
    taint. They never use a grant or scratch shortcut; with `--approve dialog` they
-   require a human decision, except `.git` paths outside `.git/hooks`, which stay
-   hard-blocked.
+   require a human decision, except the hard-blocked `.git`, `.env`, key and Guard
+   state/key paths above.
 3. **Scratch fast path.** With `--allow-write-under DIR` (or `TOOL=DIR`), calls whose
    every path argument stays inside `DIR` are forwarded without a prompt.
 4. **Authorization.** Everything else is denied (`-32000 TAINT_SINK`), or, with

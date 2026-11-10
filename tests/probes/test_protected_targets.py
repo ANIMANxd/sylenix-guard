@@ -265,7 +265,46 @@ def dialog_approval_test():
         r = s.call("write_file", {"path": os.path.join(out, ".git", "config")})
         check("dialog: .git/config remains hard blocked",
               "result" not in r and rule(r) == "SENSITIVE_TARGET", f"rule={rule(r)}")
+        r = s.call("write_file", {"path": os.path.join(out, ".git", "hooks", "pre-commit")})
+        check("dialog: .git/hooks/pre-commit remains hard blocked",
+              "result" not in r and rule(r) == "SENSITIVE_TARGET", f"rule={rule(r)}")
+        r = s.call("write_file", {"path": os.path.join(out, ".env")})
+        check("dialog: .env remains hard blocked",
+              "result" not in r and rule(r) == "SENSITIVE_TARGET", f"rule={rule(r)}")
+        r = s.call("write_file", {"path": os.path.join(out, ".ssh", "id_ed25519")})
+        check("dialog: key file remains hard blocked",
+              "result" not in r and rule(r) == "SENSITIVE_TARGET", f"rule={rule(r)}")
+        r = s.call("write_file", {"path": os.path.join(out, ".sylenix-poc", "audit.jsonl")})
+        check("dialog: Guard state path remains hard blocked",
+              "result" not in r and rule(r) == "SENSITIVE_TARGET", f"rule={rule(r)}")
         check("dialog: clean exit", s.close() == 0)
+
+
+def cli_grant_hard_block_test():
+    """A non-human --grant must never cover hard-sensitive paths."""
+    with tempfile.TemporaryDirectory() as d:
+        state = os.path.join(d, "state")
+        out = os.path.join(d, "out")
+        os.mkdir(out)
+        s = Session(state, flags=("--grant", "write_file:" + out + "=5m",
+                                  "--trust", "write_file"))
+        s.start()
+        s.call("read_ticket")
+        for label, rel in (
+            (".git/config", ".git/config"),
+            (".git/hooks/pre-commit", ".git/hooks/pre-commit"),
+            (".env", ".env"),
+            ("key file", ".ssh/id_ed25519"),
+            ("Guard state path", ".sylenix-poc/audit.jsonl"),
+        ):
+            path = os.path.join(out, rel.replace("/", os.sep))
+            r = s.call("write_file", {"path": path})
+            check(f"grant: {label} remains hard blocked",
+                  "result" not in r and rule(r) == "SENSITIVE_TARGET", f"rule={rule(r)}")
+        r = s.call("write_file", {"path": os.path.join(out, "AGENTS.md")})
+        check("grant: CLI --grant does not cover protected targets",
+              "result" not in r and rule(r) == "SENSITIVE_TARGET", f"rule={rule(r)}")
+        check("grant: clean exit", s.close() == 0)
 
 
 def main():
@@ -274,6 +313,7 @@ def main():
     run_mode("scratch", "scratch")
     run_mode("grant", "grant")
     state_dir_test()
+    cli_grant_hard_block_test()
     dialog_approval_test()
 
     print(f"\n{passed} passed, {len(failed)} failed")

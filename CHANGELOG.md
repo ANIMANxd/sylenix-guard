@@ -15,6 +15,12 @@
 - Hardened the Streamable HTTP proxy's `Origin` check: the request `Host` must
   be `127.0.0.1`, `localhost`, `::1` or the exact `--listen` host/port.
   Requests with any other `Host` now get `403` with `ORIGIN_FORBIDDEN`.
+- Hardened grant/scratch precedence: `.git/**` (including `.git/hooks`),
+  `.env*`, key files and Guard state/key directories are hard-sensitive and
+  are blocked before `grantAllows` or `scratchAllows`. Human dialog grants may
+  still cover dialog-approvable protected targets such as `AGENTS.md` and
+  `CLAUDE.md`. Added dialog-grant and CLI `--grant` regressions, including
+  `.git/hooks/pre-commit`.
 - Added protected-target categories and a configured state-dir probe to
   `tests/probes/test_protected_targets.py`, and Origin/Host cases to
   `tests/probes/test_http_proxy.py`. Tightened the expected rule for `.ssh`
@@ -24,6 +30,8 @@
 - Updated README evidence with the November 2026 launch numbers and the
   `results/2026-11-launch.md` link; updated the README, `POC_SPIKE.md` and
   `docs/ARCHITECTURE.md` protected-target and proxy Host descriptions.
+- Added `.github/workflows/ci.yml`, running `make check` on Ubuntu, Windows
+  (Git Bash) and macOS for every push and pull request.
 
 ## 2026-11-09
 

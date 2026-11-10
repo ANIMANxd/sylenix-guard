@@ -4036,6 +4036,9 @@ func (g *Guard) fromHost(line []byte) (forward bool, reply []byte) {
 	// dialog or default deny. A fast path can never reach a hard-blocked or
 	// protected target.
 	scan := scanArgs(p.Arguments, g.toolPathKeys[p.Name], g.protectedDirs)
+	if !scan.sensitive && g.hardSensitiveCall(p.Name, scan.paths) {
+		scan.sensitive = true
+	}
 	egressAllowed := false
 	if scan.egress {
 		egressAllowed = len(scan.egressHosts) > 0
@@ -4754,6 +4757,32 @@ func (g *Guard) protectedCanonicalPath(p string) bool {
 	return protectedCanonicalPathWithDirs(p, g.protectedDirs)
 }
 
+// isHardSensitivePath is the subset of protected paths that no human grant or
+// scratch rule may cover: .git, .env, key/certificate names, known config
+// names, and Guard's own state/key directories.
+func isHardSensitivePath(p string, extraDirs []string) bool {
+	if isSensitivePath(p) {
+		return true
+	}
+	canonical := p
+	if resolved, ok := canonicalPath(p); ok {
+		canonical = resolved
+	}
+	for _, dir := range extraDirs {
+		if dir != "" && insideDir(dir, canonical) {
+			return true
+		}
+	}
+	components := pathComponents(canonical)
+	fold := caseInsensitiveFS(filepath.Dir(canonical))
+	for _, c := range components {
+		if componentEqual(c, ".sylenix-poc", fold) || componentEqual(c, ".sylenix-keys", fold) {
+			return true
+		}
+	}
+	return false
+}
+
 // protectedCall also checks relative names against the approved roots, so a
 // symlink inside a scratch or grant directory cannot hide a protected target.
 func (g *Guard) protectedCall(tool string, paths []string) bool {
@@ -4780,6 +4809,40 @@ func (g *Guard) protectedCall(tool string, paths []string) bool {
 				continue
 			}
 			if canonical, ok := canonicalPath(gr.dir + string(os.PathSeparator) + p); ok && g.protectedCanonicalPath(canonical) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// hardSensitiveCall repeats protectedCall's relative-path resolution so a
+// scratch or grant root cannot hide a hard-sensitive path from the pre-grant
+// check.
+func (g *Guard) hardSensitiveCall(tool string, paths []string) bool {
+	for _, p := range paths {
+		if isHardSensitivePath(p, g.protectedDirs) {
+			return true
+		}
+		if isExplicitlyRooted(p) {
+			continue
+		}
+		for _, rule := range g.scratch {
+			if rule.tool != "" && rule.tool != tool {
+				continue
+			}
+			if canonical, ok := canonicalPath(rule.dir + string(os.PathSeparator) + p); ok && isHardSensitivePath(canonical, g.protectedDirs) {
+				return true
+			}
+		}
+		g.mu.Lock()
+		grants := append([]grant(nil), g.grants...)
+		g.mu.Unlock()
+		for _, gr := range grants {
+			if gr.tool != tool || gr.dir == "" {
+				continue
+			}
+			if canonical, ok := canonicalPath(gr.dir + string(os.PathSeparator) + p); ok && isHardSensitivePath(canonical, g.protectedDirs) {
 				return true
 			}
 		}
@@ -4835,11 +4898,11 @@ func scanArgs(args map[string]any, extraPathKeys map[string]bool, extraDirs []st
 					protected = protectedTargetPathWithDirs(t, extraDirs)
 				}
 				if protected {
-					// Agent-instruction and persistence targets are the one
-					// sensitive class a human may approve with --approve dialog.
+					// Protected targets are dialog-approvable unless they are
+					// hard-sensitive: .git, .env, key files, or Guard state.
 					s.protected = true
-					if isSensitivePathWithoutGit(t) ||
-						(resolvedOK && isSensitivePathWithoutGit(resolved)) {
+					if isHardSensitivePath(t, extraDirs) ||
+						(resolvedOK && isHardSensitivePath(resolved, extraDirs)) {
 						s.sensitive = true
 					}
 				} else if isSensitivePath(t) {
@@ -4856,7 +4919,7 @@ func scanArgs(args map[string]any, extraPathKeys map[string]bool, extraDirs []st
 				}
 			case protectedTargetPathWithDirs(t, extraDirs):
 				s.protected = true
-				if isSensitivePathWithoutGit(t) {
+				if isHardSensitivePath(t, extraDirs) {
 					s.sensitive = true
 				}
 			case isSensitivePath(t):
@@ -5116,13 +5179,6 @@ func isWindowsDrivePath(s string) bool {
 
 func isSensitivePath(p string) bool {
 	return isSensitivePathParts(p, true)
-}
-
-// isSensitivePathWithoutGit keeps .env, key, certificate and config checks but
-// lets a human approve .git/hooks targets without making every .git path
-// dialog-approvable.
-func isSensitivePathWithoutGit(p string) bool {
-	return isSensitivePathParts(p, false)
 }
 
 func isSensitivePathParts(p string, checkGit bool) bool {
