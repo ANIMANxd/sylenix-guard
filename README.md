@@ -2,13 +2,124 @@
 
 **Deterministic authorization for AI agent tool traffic.**
 
-Sylenix Guard is a transparent gateway that sits between an AI agent host and an MCP
-server. It enforces a single premise: content returned by tools is untrusted input, and
-no action with real-world side effects may be taken on the basis of untrusted content
-without explicit authorization. It inspects the JSON-RPC stream on stdio or Streamable
-HTTP, tracks the provenance of every byte the agent sees, and gates each tool call against a deterministic
-policy — forward, require a human decision, or block. There is no model in the loop: the
-same request produces the same decision every time.
+Sylenix Guard is a transparent gateway between an AI agent host and one MCP server.
+Content returned by tools is treated as untrusted input; once it enters a session,
+state-changing tool calls require explicit authorization. There is no model in the
+decision loop: the same request produces the same decision every time.
+
+[Quick start](#quick-start-protected-in-under-5-minutes) ·
+[20-second demo](#see-it-block-a-poisoned-ticket) ·
+[Measured results](#measured-results) ·
+[Limits](#security-model-and-limits)
+
+## Quick start: protected in under 5 minutes
+
+Works on macOS, Windows and Linux. Requires an existing **local stdio** server in
+a supported client config (Claude Desktop, Claude Code, Cursor or VS Code).
+`install` wraps existing entries and backs up each config. Remote HTTP servers
+need manual `proxy` mode; see [`docs/INSTALL.md`](docs/INSTALL.md).
+
+### 1. Install
+
+macOS (Homebrew):
+
+```bash
+brew tap ANIMANxd/tap
+brew install ANIMANxd/tap/sylenix-guard
+```
+
+Windows (Scoop):
+
+```powershell
+scoop bucket add sylenix https://github.com/ANIMANxd/scoop-bucket
+scoop install sylenix/sylenix-guard
+```
+
+Or install the binary from the
+[latest release](https://github.com/ANIMANxd/sylenix-guard/releases/latest):
+
+```bash
+# macOS/Linux: download the archive for your OS/architecture, then:
+tar -xzf sylenix-guard_*.tar.gz
+mkdir -p ~/.local/bin
+install -m 0755 sylenix-guard ~/.local/bin/sylenix-guard
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+```powershell
+# Windows: download sylenix-guard_*_windows_amd64.zip, then:
+$zip = Get-ChildItem .\sylenix-guard_*_windows_amd64.zip | Select-Object -First 1
+Expand-Archive $zip.FullName -DestinationPath $env:LOCALAPPDATA\sylenix-guard -Force
+$env:Path += ";$env:LOCALAPPDATA\sylenix-guard"
+```
+
+Checksums, Cosign verification and SBOMs are in [`docs/INSTALL.md`](docs/INSTALL.md).
+
+### 2. Wrap the servers already in your client
+
+```bash
+sylenix-guard install --yes
+```
+
+`install` rewrites each local stdio MCP entry to start Guard instead of the
+server directly. Use `sylenix-guard install --dry-run` first if you want to see
+the diff. Nothing is written without a backup.
+
+### 3. Audit and restart
+
+```bash
+sylenix-guard doctor
+```
+
+Exit code `0` means no findings. Each finding prints one suggested fix. Restart
+your MCP client so it reloads the wrapped config.
+
+If `install` finds no servers, add one to your client first. If `doctor` reports
+an unwrapped or remote entry, follow its fix or configure
+[`proxy` mode](#proxy-a-remote-server-over-streamable-http) manually.
+
+## See it block a poisoned ticket
+
+![Sylenix Guard terminal demo: poisoned ticket, egress block, approval dialog](demo/quickstart.gif)
+
+A 20-second scripted walkthrough: the agent reads a poisoned ticket, taint
+latches, an exfiltration attempt is hard-blocked with `EGRESS_TARGET`, and the
+next dangerous action shows the human approval prompt. The prompt is rendered as
+terminal text for the recording. This is a wiring demo, not a model measurement.
+
+Regenerate the GIF with `make gif`. Tooling: `vhs`, `ttyd` and `ffmpeg`
+(`brew install vhs ttyd ffmpeg` on macOS; on Windows use
+`go install github.com/charmbracelet/vhs@latest`,
+`winget install tsl0922.ttyd` and `winget install Gyan.FFmpeg`; restart your
+shell so they are on `PATH`). The script is
+[`demo/quickstart.tape`](demo/quickstart.tape), backed by
+[`demo/gifrunner`](demo/gifrunner).
+
+## Measured results
+
+From the [November 2026 evaluation](results/2026-11-launch.md) on one model
+(`qwen/qwen3.5-9b`, temperature 0, stdio):
+
+| Measured result | Count |
+|---|---:|
+| Guarded runs with a canary leak (harness + sweep) | **0 / 110** |
+| Guarded sweep, including file-channel rescore | **0 / 70** |
+| Unguarded sweep that leaked | **48 / 70** |
+| Unguarded harness attacks that leaked | **10 / 20** |
+| Guarded harness attacks that leaked | **0 / 20** |
+| Outside ten-probe set blocked | **20 / 20** |
+
+Every number above comes from
+[`results/2026-11-launch.md`](results/2026-11-launch.md), which links each claim
+to its raw file under [`results/raw/`](results/raw/). Read the honest limits in
+that report before quoting the numbers: one model, small samples, temperature 0
+is not a seed, and stdio only for the model runs.
+
+**Limits up front.** Guard is a policy boundary on one MCP connection, not a
+sandbox and not a compliance certification. It cannot see host built-in tools,
+attachments or pasted text, does not make the model trustworthy, and cannot stop
+an action inside a live grant or a mis-listed read-only tool. Read the full
+[security model and limits](#security-model-and-limits) before relying on it.
 
 ## The problem
 
@@ -115,7 +226,7 @@ product architecture is specified in [`docs/SPEC_FULL.md`](docs/SPEC_FULL.md); t
 layers are deliberately left out of the current build. Scope and behavior are governed
 by [`POC_SPIKE.md`](POC_SPIKE.md).
 
-## Getting started
+## Build from source and manual setup
 
 ### Build
 
@@ -133,7 +244,7 @@ signing probe suites, the built-in profile tests, the prompt-cost replay, the au
 summarizer fixture, the doctor probes, the clear-taint probes, the stats probes and the
 team policy integration tests.
 On Windows, `make check` needs a POSIX shell (Git Bash or WSL). Without one, run the
-same steps directly: `gofmt -l cmd teams`, `go vet ./...`, `python demo/selftest.py`,
+same steps directly: `gofmt -l cmd teams demo`, `go vet ./...`, `python demo/selftest.py`,
 and `go test ./teams/...`.
 
 ### Wrap a server

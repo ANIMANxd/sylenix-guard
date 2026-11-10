@@ -1,4 +1,4 @@
-.PHONY: build fmt vet selftest probe-test proxy-test signing-test profile-test replay-test summary-test doctor-test clear-taint-test stats-test team-test check harness-scripted
+.PHONY: build fmt vet selftest probe-test proxy-test signing-test profile-test replay-test summary-test doctor-test clear-taint-test stats-test team-test check harness-scripted gif
 
 build:
 	CGO_ENABLED=0 go build -o bin/sylenix-guard ./cmd/sylenix-guard
@@ -9,7 +9,7 @@ ifeq ($(OS),Windows_NT)
 endif
 
 fmt:
-	@test -z "$$(gofmt -l cmd teams)" || (echo "gofmt needed for:"; gofmt -l cmd teams; exit 1)
+	@test -z "$$(gofmt -l cmd teams demo)" || (echo "gofmt needed for:"; gofmt -l cmd teams demo; exit 1)
 
 vet:
 	CGO_ENABLED=0 go vet ./...
@@ -56,3 +56,7 @@ check: fmt vet selftest probe-test proxy-test signing-test profile-test replay-t
 
 harness-scripted: build
 	.venv/bin/python demo/harness.py --agent scripted --runs 3 --out results-scripted
+
+gif: build
+	go build -o bin/gifrunner ./demo/gifrunner
+	vhs demo/quickstart.tape

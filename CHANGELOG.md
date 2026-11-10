@@ -2,6 +2,20 @@
 
 ## 2026-11-10
 
+### Five-minute README and terminal demo
+
+- Rewrote the top of `README.md` around a three-step quick start: install
+  (Homebrew, Scoop or release binary), `sylenix-guard install --yes`, and
+  `sylenix-guard doctor`. Added the restart step and a clear local-stdio/remote
+  distinction.
+- Added a 20-second terminal GIF (`demo/quickstart.gif`) showing a poisoned
+  ticket, taint, an `EGRESS_TARGET` block and the approval prompt representation.
+  Added `demo/quickstart.tape` and `demo/gifrunner`, plus a `make gif` target.
+- Added a measured-results table with links to `results/2026-11-launch.md` and
+  its raw files, and kept the limits summary and full limitations section.
+- Updated `Makefile` and the demo README wording; no product enforcement code
+  changed.
+
 ### Audit evidence CSV and PDF export
 
 - Added authenticated `GET /v1/export.csv` and `GET /v1/export.pdf` endpoints
