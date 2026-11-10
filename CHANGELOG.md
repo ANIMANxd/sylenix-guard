@@ -2,6 +2,26 @@
 
 ## 2026-11-10
 
+### Audit evidence CSV and PDF export
+
+- Added authenticated `GET /v1/export.csv` and `GET /v1/export.pdf` endpoints
+  for an inclusive date range. They accept `YYYY-MM-DD` or RFC3339 bounds and
+  either the team bearer token or the dashboard session cookie.
+- CSV exports exactly the seven sanitized event fields: timestamp, developer ID,
+  server, tool, decision, reason code and taint state. No argument, content or
+  tool-output column exists.
+- The PDF summarizes totals, blocks by reason, policy revision history and
+  machines covered. Its wording describes recorded events only, explicitly
+  avoids a compliance claim, and includes a blank section titled "Mapping to
+  DPDP security safeguards (to be reviewed by counsel)".
+- Added policy publication history (`policy-history-<team>.jsonl`) recording a
+  1-based revision, publication time, SHA-256 and byte size for each successful
+  policy store.
+- Added export tests that compare the 24-hour PDF/CSV numbers with the dashboard,
+  verify the policy history and placeholder text, validate PDF structure, and
+  assert argument markers never appear. Extended the real-Guard integration test
+  to fetch CSV and PDF exports with argument markers.
+
 ### Server-rendered audit dashboard
 
 - Added `GET /dashboard` to the collector. It requires a login with the team

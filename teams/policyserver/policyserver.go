@@ -40,6 +40,9 @@ const (
 	SyslogAPI = "/v1/events/syslog"
 	// DashboardAPI is the server-rendered audit page and token login.
 	DashboardAPI = "/dashboard"
+	// CSVExportAPI and PDFExportAPI export evidence for a date range.
+	CSVExportAPI = "/v1/export.csv"
+	PDFExportAPI = "/v1/export.pdf"
 
 	maxEnvelope  = 4 << 20
 	maxEventBody = 2 << 20
@@ -65,7 +68,8 @@ type Server struct {
 	logger     *log.Logger
 	sessionKey []byte
 
-	eventsMu sync.Mutex
+	eventsMu  sync.Mutex
+	historyMu sync.Mutex
 }
 
 // New validates the configuration and returns a server. It does not create the
@@ -264,7 +268,13 @@ func (s *Server) WriteStored(team string, policy, signature []byte) error {
 	if err := writeAtomic(path+".sig", signature); err != nil {
 		return err
 	}
-	return writeAtomic(path, policy)
+	if err := writeAtomic(path, policy); err != nil {
+		return err
+	}
+	if err := s.appendPolicyHistory(team, policy); err != nil {
+		s.logger.Printf("policy history write failed team=%s reason=storage", team)
+	}
+	return nil
 }
 
 func writeAtomic(path string, data []byte) error {
@@ -465,6 +475,28 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.handleEventsSyslog(w, team)
+	case CSVExportAPI:
+		team, ok := s.requireExportTeam(w, r)
+		if !ok {
+			return
+		}
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", "GET")
+			s.fail(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "use GET")
+			return
+		}
+		s.handleExportCSV(w, r, team)
+	case PDFExportAPI:
+		team, ok := s.requireExportTeam(w, r)
+		if !ok {
+			return
+		}
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", "GET")
+			s.fail(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "use GET")
+			return
+		}
+		s.handleExportPDF(w, r, team)
 	case DashboardAPI:
 		s.handleDashboard(w, r)
 	case "/":
@@ -487,6 +519,20 @@ func (s *Server) requireTeam(w http.ResponseWriter, r *http.Request) (string, bo
 		return "", false
 	}
 	return team, true
+}
+
+// requireExportTeam accepts either the normal API bearer token or the
+// dashboard's signed session cookie, so a browser can download the export.
+func (s *Server) requireExportTeam(w http.ResponseWriter, r *http.Request) (string, bool) {
+	if team, ok := s.authenticate(r); ok {
+		return team, true
+	}
+	if team, ok := s.sessionTeam(r); ok {
+		return team, true
+	}
+	w.Header().Set("WWW-Authenticate", `Bearer realm="sylenix-teams"`)
+	s.fail(w, http.StatusUnauthorized, "UNAUTHORIZED", "valid team token required")
+	return "", false
 }
 
 func (s *Server) authenticate(r *http.Request) (string, bool) {

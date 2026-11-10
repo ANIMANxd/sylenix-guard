@@ -81,9 +81,9 @@ wraps one MCP server per process over stdio or Streamable HTTP.
   pull every 15 minutes, team-signature verification, last-good cache, and local
   policy that can only tighten the team policy; see [`teams/README.md`](teams/README.md)
 - Optional sanitized audit shipping to the team collector: batched/retried
-  events, a disk outbox while offline, JSON export, RFC 5424 syslog output and a
-  token-login server-rendered audit dashboard; the event schema never includes
-  argument values or content
+  events, a disk outbox while offline, JSON export, RFC 5424 syslog output, a
+  token-login server-rendered audit dashboard, and date-range CSV/PDF evidence
+  exports; the event schema never includes argument values or content
 - Result datamarking and invisible-character stripping, including `structuredContent`
 - Session taint tracking with default-deny flow control
 - Hard blocks for network targets and sensitive paths

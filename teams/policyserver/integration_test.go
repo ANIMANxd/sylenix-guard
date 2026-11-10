@@ -855,6 +855,34 @@ func TestAuditEventsFromThreeGuardsAndOfflineBuffer(t *testing.T) {
 		t.Fatal("dashboard references an external script or resource")
 	}
 
+	// CSV and PDF exports use the same sanitized events and also contain no
+	// argument text.
+	exportQuery := url.Values{
+		"from": {time.Now().UTC().Add(-24 * time.Hour).Format(time.RFC3339)},
+		"to":   {time.Now().UTC().Add(time.Minute).Format(time.RFC3339)},
+	}.Encode()
+	for _, path := range []string{policyserver.CSVExportAPI, policyserver.PDFExportAPI} {
+		req, _ := http.NewRequest(http.MethodGet, httpsSrv.URL+path+"?"+exportQuery, nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := httpsSrv.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		exportBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s: code=%d body=%s", path, resp.StatusCode, exportBody)
+		}
+		if strings.Contains(string(exportBody), marker) {
+			t.Fatalf("%s leaked an argument value", path)
+		}
+		if path == policyserver.PDFExportAPI {
+			if !strings.HasPrefix(string(exportBody), "%PDF-1.4") || !strings.Contains(string(exportBody), "Mapping to DPDP security safeguards") {
+				t.Fatalf("PDF export is missing the evidence summary or placeholder heading")
+			}
+		}
+	}
+
 	// Offline: the collector returns 503, the Guard must keep the event on disk
 	// and then deliver it after the collector returns.
 	waitFor(t, 2*time.Second, "guard-0 outbox to drain", func() bool {

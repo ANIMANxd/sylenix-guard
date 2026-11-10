@@ -45,6 +45,8 @@ policy endpoint and the audit collector:
 - `POST /v1/events` accepts a batch of sanitized audit events.
 - `GET /v1/events` exports those events as JSON.
 - `GET /v1/events/syslog` exports them as RFC 5424 lines.
+- `GET /v1/export.csv?from=...&to=...` exports sanitized events for a range.
+- `GET /v1/export.pdf?from=...&to=...` exports a PDF evidence summary.
 - `GET /dashboard` serves the token-login, server-rendered audit page.
 
 There is no plaintext HTTP mode.
@@ -156,6 +158,38 @@ outbox is truncated can resend it.
 Syslog export uses `local0.info` (`PRI 134`) for normal events and
 `local0.warning` (`PRI 132`) for blocks/denials, with the event fields in a
 `sylenix@32473` structured-data element.
+
+## Evidence export
+
+The collector exports the caller team's events for an inclusive date range.
+`from` and `to` accept `YYYY-MM-DD` or RFC3339. A date-only `to` includes that
+whole UTC day. Both endpoints accept the team bearer token or the dashboard
+session cookie, so they can be downloaded from a browser or a script.
+
+```bash
+curl -H "Authorization: Bearer $TEAM_TOKEN" \
+  "https://policy.example.com/v1/export.csv?from=2026-11-01&to=2026-11-10"
+
+curl -H "Authorization: Bearer $TEAM_TOKEN" \
+  "https://policy.example.com/v1/export.pdf?from=2026-11-01&to=2026-11-10" \
+  -o audit-evidence.pdf
+```
+
+The CSV has exactly these columns: `timestamp`, `developer_id`, `server`,
+`tool`, `decision`, `reason_code`, `taint_state`. It contains no argument,
+content or output columns.
+
+The PDF contains totals, blocks by reason, policy revision history, machines
+covered and a deliberately blank section titled **Mapping to DPDP security
+safeguards (to be reviewed by counsel)**. Its wording describes what was
+recorded and explicitly avoids a compliance claim; counsel must complete the
+placeholder section.
+
+Every successful policy publication appends a revision to
+`policy-history-<team>.jsonl` (timestamp, SHA-256, byte size). Revisions are
+1-based and are included in the PDF when their publication time falls inside the
+requested range. No history is fabricated for policies published before this
+history existed.
 
 ## Audit dashboard
 
