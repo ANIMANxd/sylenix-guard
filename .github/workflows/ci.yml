@@ -52,5 +52,18 @@ jobs:
             chmod +x "$HOME/.local/bin/python3"
             export PATH="$HOME/.local/bin:$PATH"
           fi
-          make --version
-          make SHELL="$(command -v bash)" check
+          set +e
+          {
+            echo "make: $(command -v make || true)"
+            make --version || true
+            echo "bash: $(command -v bash || true)"
+            make SHELL="$(command -v bash)" check
+          } > /tmp/make-check.log 2>&1
+          rc=$?
+          cat /tmp/make-check.log
+          if [ "$rc" -ne 0 ]; then
+            tail -25 /tmp/make-check.log | while IFS= read -r line; do
+              echo "::error::$line"
+            done
+          fi
+          exit "$rc"
