@@ -4,6 +4,11 @@ Sylenix Guard can read one versioned policy file per run. It replaces the
 repetitive `--readonly`, `--trust`, `--approve`, `--allow-write-under` and
 `--no-spotlight` flags; the flags still work and override the file when set.
 
+The paid-tier `--team-url` mode adds a signed team policy pulled over HTTPS. In
+that mode the local file described here is an overlay that can only tighten the
+team policy. See [`teams/README.md`](../teams/README.md) for the service, pull
+cadence, cache, token model and merge rules.
+
 ## Where the file comes from
 
 1. `--policy PATH`, if the flag is set.

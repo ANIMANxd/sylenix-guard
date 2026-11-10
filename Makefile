@@ -1,13 +1,15 @@
-.PHONY: build fmt vet selftest probe-test proxy-test signing-test profile-test replay-test summary-test doctor-test clear-taint-test stats-test check harness-scripted
+.PHONY: build fmt vet selftest probe-test proxy-test signing-test profile-test replay-test summary-test doctor-test clear-taint-test stats-test team-test check harness-scripted
 
 build:
 	CGO_ENABLED=0 go build -o bin/sylenix-guard ./cmd/sylenix-guard
+	CGO_ENABLED=0 go build -o bin/sylenix-teams ./teams/cmd/sylenix-teams
 ifeq ($(OS),Windows_NT)
 	CGO_ENABLED=0 go build -o bin/sylenix-guard.exe ./cmd/sylenix-guard
+	CGO_ENABLED=0 go build -o bin/sylenix-teams.exe ./teams/cmd/sylenix-teams
 endif
 
 fmt:
-	@test -z "$$(gofmt -l cmd)" || (echo "gofmt needed for:"; gofmt -l cmd; exit 1)
+	@test -z "$$(gofmt -l cmd teams)" || (echo "gofmt needed for:"; gofmt -l cmd teams; exit 1)
 
 vet:
 	CGO_ENABLED=0 go vet ./...
@@ -47,7 +49,10 @@ clear-taint-test: build
 stats-test: build
 	python3 tests/probes/test_stats.py
 
-check: fmt vet selftest probe-test proxy-test signing-test profile-test replay-test summary-test doctor-test clear-taint-test stats-test
+team-test: build
+	go test ./teams/... -count=1
+
+check: fmt vet selftest probe-test proxy-test signing-test profile-test replay-test summary-test doctor-test clear-taint-test stats-test team-test
 
 harness-scripted: build
 	.venv/bin/python demo/harness.py --agent scripted --runs 3 --out results-scripted

@@ -2,6 +2,33 @@
 
 ## 2026-11-10
 
+### Team policy service (paid tier)
+
+- Added `teams/`, a separate stdlib-only Go package and `bin/sylenix-teams`
+  binary. It serves one signed policy per team over HTTPS at `/v1/policy`
+  (`GET` to pull, `PUT` to publish), verifies the existing Ed25519 detached
+  `.sig` format before storing, and stores only SHA-256 token hashes. The
+  `serve`, `token hash` and `publish` commands are available; there is no
+  plaintext HTTP mode.
+- Added Guard flags `--team-url`, `--team-token-file` (or
+  `SYLENIX_TEAM_TOKEN`), `--team-pubkey`, `--team-ca` and `--team-interval`
+  (default `15m`). Guard pulls on start and on every interval, verifies the team
+  signature, caches the last good policy under `--state-dir`, and fails closed
+  when neither a verified pull nor a verified cache is available.
+- Policy changes are applied at runtime through an immutable policy snapshot.
+  A rejected or tampered refresh keeps the last good policy. Local policy files
+  and local flags are overlays that can only tighten the team policy; loosening
+  attempts are ignored and recorded as `team_policy_loosen_ignored`.
+- Added `teams/policyserver/integration_test.go`: a TLS test service plus three
+  real Guard subprocesses prove a policy change is picked up within one pull, a
+  tampered served policy is rejected with the last good policy retained, local
+  loosening is ignored, and cache/no-cache/tampered-cache paths fail closed.
+  Added unit tests for token hashing, envelope handling, authentication and
+  stored-signature verification. Added `make team-test` to `make check`, and
+  `make build` now builds both binaries.
+- Documented the service in `teams/README.md` and added the team-policy
+  limitations to `POC_SPIKE.md` section 7.
+
 ### Protected targets and proxy Host validation
 
 - Extended the built-in protected-target table with agent config directories

@@ -77,6 +77,9 @@ wraps one MCP server per process over stdio or Streamable HTTP.
 - Tool-definition pinning (trust on first use) with quarantine on change or hidden characters
 - Ed25519 signing for `policy.yaml` and the pin store, with `keys init`, `policy sign`,
   `pins sign`, and fail-closed startup on an unsigned or modified file
+- Optional paid-tier team policy service (`teams/`, `bin/sylenix-teams`): HTTPS
+  pull every 15 minutes, team-signature verification, last-good cache, and local
+  policy that can only tighten the team policy; see [`teams/README.md`](teams/README.md)
 - Result datamarking and invisible-character stripping, including `structuredContent`
 - Session taint tracking with default-deny flow control
 - Hard blocks for network targets and sensitive paths
@@ -123,9 +126,11 @@ CGO_ENABLED=0 go build -o bin/sylenix-guard.exe ./cmd/sylenix-guard
 
 `make check` runs gofmt, go vet, the protocol self-test, the stdio, Streamable HTTP and
 signing probe suites, the built-in profile tests, the prompt-cost replay, the audit
-summarizer fixture, the doctor probes, the clear-taint probes and the stats probes.
+summarizer fixture, the doctor probes, the clear-taint probes, the stats probes and the
+team policy integration tests.
 On Windows, `make check` needs a POSIX shell (Git Bash or WSL). Without one, run the
-same steps directly: `gofmt -l cmd`, `go vet ./...`, `python demo/selftest.py`.
+same steps directly: `gofmt -l cmd teams`, `go vet ./...`, `python demo/selftest.py`,
+and `go test ./teams/...`.
 
 ### Wrap a server
 

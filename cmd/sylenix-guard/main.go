@@ -17,6 +17,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
 	"crypto/x509"
 	"debug/buildinfo"
 	"encoding/hex"
@@ -161,6 +162,135 @@ type stringList []string
 func (l *stringList) String() string     { return strings.Join(*l, ", ") }
 func (l *stringList) Set(v string) error { *l = append(*l, v); return nil }
 
+// policyState is the immutable decision state read by request handlers. Team
+// policy refreshes build a new value and swap the pointer, so a call never sees
+// a half-applied policy.
+type policyState struct {
+	readonly          map[string]bool
+	trust             map[string]bool
+	approve           string
+	spotlight         bool
+	scratch           []scratchRule
+	classes           map[string]string
+	toolPathKeys      map[string]map[string]bool
+	egressAllow       map[string]bool
+	egressDeny        map[string]bool
+	allowlistEnforced bool
+	allowlist         []policyAllowEntry
+}
+
+func (s *policyState) clone() *policyState {
+	if s == nil {
+		return &policyState{
+			readonly:     map[string]bool{},
+			trust:        map[string]bool{},
+			approve:      "deny",
+			spotlight:    true,
+			classes:      map[string]string{},
+			toolPathKeys: map[string]map[string]bool{},
+			egressAllow:  map[string]bool{},
+			egressDeny:   map[string]bool{},
+		}
+	}
+	out := &policyState{
+		readonly:          cloneBoolMap(s.readonly),
+		trust:             cloneBoolMap(s.trust),
+		approve:           s.approve,
+		spotlight:         s.spotlight,
+		scratch:           append([]scratchRule(nil), s.scratch...),
+		classes:           cloneStringMap(s.classes),
+		toolPathKeys:      map[string]map[string]bool{},
+		egressAllow:       cloneBoolMap(s.egressAllow),
+		egressDeny:        cloneBoolMap(s.egressDeny),
+		allowlistEnforced: s.allowlistEnforced,
+		allowlist:         append([]policyAllowEntry(nil), s.allowlist...),
+	}
+	for tool, keys := range s.toolPathKeys {
+		out.toolPathKeys[tool] = cloneBoolMap(keys)
+	}
+	return out
+}
+
+func cloneBoolMap(m map[string]bool) map[string]bool {
+	out := make(map[string]bool, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+func cloneStringMap(m map[string]string) map[string]string {
+	out := make(map[string]string, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+func (s *policyState) classFor(tool string) string {
+	if s == nil {
+		return "exec"
+	}
+	if s.readonly[tool] {
+		return "read"
+	}
+	if class := s.classes[tool]; class != "" {
+		return class
+	}
+	return "exec"
+}
+
+func (s *policyState) hostDenied(host string) bool {
+	return s != nil && hostMatchesPattern(host, s.egressDeny)
+}
+
+func (s *policyState) hostAllowed(host string) bool {
+	return s != nil && hostMatchesPattern(host, s.egressAllow)
+}
+
+func (s *policyState) scratchAllows(tool string, paths []string) bool {
+	if s == nil || len(paths) == 0 {
+		return false
+	}
+	for _, e := range s.scratch {
+		if e.tool != "" && e.tool != tool {
+			continue
+		}
+		if allInside(e.dir, paths) {
+			return true
+		}
+	}
+	return false
+}
+
+// teamPolicyRuntime holds the pull configuration. It never logs or persists the
+// bearer token.
+type teamPolicyRuntime struct {
+	url          string
+	token        string
+	pub          ed25519.PublicKey
+	interval     time.Duration
+	client       *http.Client
+	cachePolicy  string
+	cacheSig     string
+	local        *policyFile
+	localSource  string
+	localPath    string
+	nameExplicit bool
+	lastHash     [sha256.Size]byte
+	opts         teamApplyOptions
+}
+
+type teamApplyOptions struct {
+	visited     map[string]bool
+	readonly    string
+	trust       string
+	approve     string
+	flagScratch []scratchRule
+	noSpotlight bool
+	serverArgs  []string
+}
+
 type Guard struct {
 	name      string
 	stateDir  string
@@ -194,6 +324,8 @@ type Guard struct {
 	grants      []grant // live time-bounded approvals
 
 	serverGone atomic.Bool // set once the server's stdout has closed
+	policy     atomic.Pointer[policyState]
+	team       *teamPolicyRuntime
 
 	outMu sync.Mutex // serializes every write to the host's stdout
 	out   io.Writer
@@ -222,6 +354,11 @@ type guardOptions struct {
 	GrantSpecs      []string
 	Visited         map[string]bool
 	ServerArgs      []string
+	TeamURL         string
+	TeamTokenFile   string
+	TeamPubKey      string
+	TeamCA          string
+	TeamInterval    string
 }
 
 func main() {
@@ -254,6 +391,11 @@ func main() {
 	policyPath := flag.String("policy", "", "path to a versioned policy file (default: <state-dir>/policy.yaml, else built-in defaults)")
 	policyPubKey := flag.String("policy-pubkey", "", "Ed25519 public key used to verify policy and pin signatures")
 	policyKey := flag.String("policy-key", "", "Ed25519 private key used to sign the pin store on write")
+	teamURL := flag.String("team-url", "", "HTTPS URL of the team policy service")
+	teamTokenFile := flag.String("team-token-file", "", "file containing the per-team bearer token (or SYLENIX_TEAM_TOKEN)")
+	teamPubKey := flag.String("team-pubkey", "", "Ed25519 public key used to verify the team policy")
+	teamCA := flag.String("team-ca", "", "optional extra CA certificate PEM for the team policy service")
+	teamInterval := flag.String("team-interval", "15m", "how often to pull the team policy")
 	readonly := flag.String("readonly", "", "comma-separated tools that stay allowed when the session is tainted")
 	trust := flag.String("trust", "", "comma-separated tools whose results do NOT taint the session")
 	approve := flag.String("approve", "deny", "what to do with a blocked call: deny | dialog")
@@ -288,6 +430,11 @@ func main() {
 		GrantSpecs:      grantSpecs,
 		Visited:         visited,
 		ServerArgs:      args,
+		TeamURL:         *teamURL,
+		TeamTokenFile:   *teamTokenFile,
+		TeamPubKey:      *teamPubKey,
+		TeamCA:          *teamCA,
+		TeamInterval:    *teamInterval,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "sylenix-guard:", err)
@@ -328,6 +475,7 @@ func main() {
 		"policy_source": g.policySource, "policy_version": g.policyVersion,
 		"profile": g.profileName, "profile_source": g.profileSource,
 		"allow_write_under": []string(allowWriteUnder), "grants": []string(grantSpecs)})
+	g.startTeamPoller()
 	control, controlErr := startGuardControl(g)
 	if controlErr != nil {
 		g.event("control_unavailable", map[string]any{"reason": "cannot create clear-taint control"})
@@ -482,6 +630,14 @@ func prepareGuard(opts guardOptions) (*Guard, error) {
 		}
 		seeded = append(seeded, grant{tool: tool, dir: dir, expires: time.Now().Add(dur)})
 	}
+	teamMode := strings.TrimSpace(opts.TeamURL) != ""
+	droppedGrants := false
+	if teamMode && len(seeded) > 0 {
+		// A pre-approved grant is local authority and could loosen the team
+		// policy. Team mode accepts only the policy and the human dialog.
+		seeded = nil
+		droppedGrants = true
+	}
 
 	name := opts.Name
 	nameExplicit := visited["name"] && name != ""
@@ -554,6 +710,49 @@ func prepareGuard(opts guardOptions) (*Guard, error) {
 		verifyKey:     verifyKey,
 		signKey:       signKey,
 	}
+	if teamMode {
+		localPF, localSource, localPath, localPresent, err := loadLocalPolicyForTeam(opts.PolicyPath, visited["policy"], stateDir, name, nameExplicit, g.verifyKey)
+		if err != nil {
+			g.event("policy_invalid", map[string]any{"source": localSource, "reason": "local_overlay_invalid"})
+			_ = logf.Close()
+			return nil, err
+		}
+		tr, remotePF, policyBytes, sig, fromCache, err := newTeamPolicyRuntime(g, opts, localPF, localSource, localPath, flagScratch)
+		if err != nil {
+			g.event("team_policy_unavailable", map[string]any{"reason": teamReason(err)})
+			_ = logf.Close()
+			return nil, err
+		}
+		g.team = tr
+		ignored, profile, err := g.applyTeamPolicy(remotePF, tr)
+		if err != nil {
+			g.event("team_policy_rejected", map[string]any{"reason": "invalid_policy"})
+			_ = logf.Close()
+			return nil, err
+		}
+		tr.lastHash = sha256.Sum256(policyBytes)
+		if !fromCache {
+			if err := tr.writeCache(policyBytes, sig); err != nil {
+				g.event("team_policy_cache_error", map[string]any{"reason": teamReason(err)})
+				tr.lastHash = [sha256.Size]byte{}
+			}
+		}
+		if droppedGrants {
+			g.event("team_policy_loosen_ignored", map[string]any{"fields": []string{"grant"}})
+		}
+		if len(ignored) > 0 {
+			g.event("team_policy_loosen_ignored", map[string]any{"fields": ignored})
+		}
+		source := "team"
+		if fromCache {
+			source = "cache"
+		}
+		g.event("team_policy_loaded", map[string]any{"source": source, "version": remotePF.Version,
+			"local_source": localSource, "local_present": localPresent, "approve": g.approve,
+			"profile": profile, "url": redactTeamURL(tr.url)})
+		return g, nil
+	}
+
 	pf, source, resolvedPath, err := loadPolicyForRun(opts.PolicyPath, visited["policy"], stateDir, name, nameExplicit, g.verifyKey)
 	if err != nil {
 		g.event("policy_invalid", map[string]any{"source": source, "reason": err.Error()})
@@ -575,6 +774,14 @@ func prepareGuard(opts guardOptions) (*Guard, error) {
 	return g, nil
 }
 
+func redactTeamURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	return u.Scheme + "://" + u.Host + u.Path
+}
+
 // ---------------------------------------------------------------- streamable HTTP proxy
 
 // guardFlagValues is the common proxy configuration. The stdio path keeps its
@@ -585,6 +792,11 @@ type guardFlagValues struct {
 	PolicyPath      string
 	PolicyPubKey    string
 	PolicyKey       string
+	TeamURL         string
+	TeamTokenFile   string
+	TeamPubKey      string
+	TeamCA          string
+	TeamInterval    string
 	Readonly        string
 	Trust           string
 	Approve         string
@@ -600,6 +812,11 @@ func registerGuardFlags(fs *flag.FlagSet, v *guardFlagValues) {
 	fs.StringVar(&v.PolicyPath, "policy", "", "path to a versioned policy file (default: <state-dir>/policy.yaml, else built-in defaults)")
 	fs.StringVar(&v.PolicyPubKey, "policy-pubkey", "", "Ed25519 public key used to verify policy and pin signatures")
 	fs.StringVar(&v.PolicyKey, "policy-key", "", "Ed25519 private key used to sign the pin store on write")
+	fs.StringVar(&v.TeamURL, "team-url", "", "HTTPS URL of the team policy service")
+	fs.StringVar(&v.TeamTokenFile, "team-token-file", "", "file containing the per-team bearer token (or SYLENIX_TEAM_TOKEN)")
+	fs.StringVar(&v.TeamPubKey, "team-pubkey", "", "Ed25519 public key used to verify the team policy")
+	fs.StringVar(&v.TeamCA, "team-ca", "", "optional extra CA certificate PEM for the team policy service")
+	fs.StringVar(&v.TeamInterval, "team-interval", "15m", "how often to pull the team policy")
 	fs.StringVar(&v.Readonly, "readonly", "", "comma-separated tools that stay allowed when the session is tainted")
 	fs.StringVar(&v.Trust, "trust", "", "comma-separated tools whose results do NOT taint the session")
 	fs.StringVar(&v.Approve, "approve", "deny", "what to do with a blocked call: deny | dialog")
@@ -693,6 +910,11 @@ func runProxyCommand(args []string) int {
 		PolicyPath:      vals.PolicyPath,
 		PolicyPubKey:    vals.PolicyPubKey,
 		PolicyKey:       vals.PolicyKey,
+		TeamURL:         vals.TeamURL,
+		TeamTokenFile:   vals.TeamTokenFile,
+		TeamPubKey:      vals.TeamPubKey,
+		TeamCA:          vals.TeamCA,
+		TeamInterval:    vals.TeamInterval,
 		Readonly:        vals.Readonly,
 		Trust:           vals.Trust,
 		Approve:         vals.Approve,
@@ -740,6 +962,7 @@ func runProxyCommand(args []string) int {
 		"allow_write_under": []string(vals.AllowWriteUnder),
 		"grants":            []string(vals.GrantSpecs),
 	})
+	g.startTeamPoller()
 
 	handler := &proxyHandler{g: g, upstream: upstream, client: newProxyClient(), listen: listenAddr}
 	srv := &http.Server{
@@ -1670,12 +1893,880 @@ func loadPolicyForRun(explicitPath string, explicit bool, stateDir, serverName s
 	if err != nil {
 		return nil, source, pathUsed, fmt.Errorf("policy %s: %w", pathUsed, err)
 	}
-	if len(pf.Servers) > 0 {
-		if _, ok := pf.Servers[serverName]; !ok && (nameExplicit || len(pf.Servers) != 1) {
-			return nil, source, pathUsed, fmt.Errorf("policy %s: no entry for server %q; add servers.%s.tools or remove the servers block", pathUsed, serverName, serverName)
-		}
+	if err := validatePolicyServerEntry(pf, serverName, nameExplicit); err != nil {
+		return nil, source, pathUsed, fmt.Errorf("policy %s: %w", pathUsed, err)
 	}
 	return pf, source, pathUsed, nil
+}
+
+func validatePolicyServerEntry(pf *policyFile, serverName string, nameExplicit bool) error {
+	if len(pf.Servers) == 0 {
+		return nil
+	}
+	if _, ok := pf.Servers[serverName]; !ok && (nameExplicit || len(pf.Servers) != 1) {
+		return fmt.Errorf("no entry for server %q; add servers.%s.tools or remove the servers block", serverName, serverName)
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------- team policy
+
+const teamPolicyMaxBody = 4 << 20
+
+type teamPolicyEnvelope struct {
+	Policy    []byte `json:"policy"`
+	Signature []byte `json:"signature"`
+}
+
+// loadLocalPolicyForTeam reads only the local overlay. Missing is not an error:
+// with a team policy the overlay is optional, but if present it must parse.
+func loadLocalPolicyForTeam(explicitPath string, explicit bool, stateDir, serverName string, nameExplicit bool, verifyKey ed25519.PublicKey) (*policyFile, string, string, bool, error) {
+	pathUsed, source := explicitPath, "flag"
+	if !explicit {
+		pathUsed, source = filepath.Join(stateDir, policyFileName), "state-dir"
+	}
+	if explicit && explicitPath == "" {
+		return nil, source, "", false, fmt.Errorf("--policy needs a file path")
+	}
+	data, err := os.ReadFile(pathUsed)
+	if os.IsNotExist(err) {
+		if explicit {
+			return nil, source, pathUsed, false, fmt.Errorf("cannot read policy %s: %w", pathUsed, err)
+		}
+		return nil, source, pathUsed, false, nil
+	}
+	if err != nil {
+		return nil, source, pathUsed, false, fmt.Errorf("cannot read policy %s: %w", pathUsed, err)
+	}
+	if verifyKey != nil {
+		if err := verifyDetachedSignature(pathUsed, data, verifyKey); err != nil {
+			return nil, source, pathUsed, false, fmt.Errorf("policy signature verification failed for %s: %w", pathUsed, err)
+		}
+	}
+	pf, err := parsePolicyBytes(data)
+	if err != nil {
+		return nil, source, pathUsed, false, fmt.Errorf("policy %s: %w", pathUsed, err)
+	}
+	if err := validatePolicyServerEntry(pf, serverName, nameExplicit); err != nil {
+		return nil, source, pathUsed, false, fmt.Errorf("policy %s: %w", pathUsed, err)
+	}
+	return pf, source, pathUsed, true, nil
+}
+
+func readTeamToken(path string) (string, error) {
+	var raw []byte
+	var err error
+	if path != "" {
+		raw, err = os.ReadFile(path)
+		if err != nil {
+			return "", err
+		}
+	} else {
+		raw = []byte(os.Getenv("SYLENIX_TEAM_TOKEN"))
+		if len(raw) == 0 {
+			return "", fmt.Errorf("pass --team-token-file or set SYLENIX_TEAM_TOKEN")
+		}
+	}
+	token := strings.TrimRight(string(raw), "\r\n")
+	if token == "" || strings.ContainsAny(token, " \t\r\n") {
+		return "", fmt.Errorf("team token must be non-empty and contain no whitespace")
+	}
+	return token, nil
+}
+
+func newTeamPolicyRuntime(g *Guard, opts guardOptions, local *policyFile, localSource, localPath string, flagScratch []scratchRule) (*teamPolicyRuntime, *policyFile, []byte, []byte, bool, error) {
+	if opts.TeamPubKey == "" {
+		return nil, nil, nil, nil, false, fmt.Errorf("--team-pubkey is required with --team-url")
+	}
+	u, err := url.Parse(opts.TeamURL)
+	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return nil, nil, nil, nil, false, fmt.Errorf("--team-url must be an absolute https URL without userinfo, query or fragment")
+	}
+	pub, err := loadPublicKeyFile(opts.TeamPubKey)
+	if err != nil {
+		return nil, nil, nil, nil, false, fmt.Errorf("cannot load --team-pubkey: %w", err)
+	}
+	token, err := readTeamToken(opts.TeamTokenFile)
+	if err != nil {
+		return nil, nil, nil, nil, false, err
+	}
+	interval := 15 * time.Minute
+	if strings.TrimSpace(opts.TeamInterval) != "" {
+		interval, err = time.ParseDuration(opts.TeamInterval)
+		if err != nil || interval <= 0 {
+			return nil, nil, nil, nil, false, fmt.Errorf("--team-interval must be a positive duration, for example 15m")
+		}
+	}
+	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12}
+	if opts.TeamCA != "" {
+		raw, err := os.ReadFile(opts.TeamCA)
+		if err != nil {
+			return nil, nil, nil, nil, false, fmt.Errorf("cannot read --team-ca: %w", err)
+		}
+		pool, err := x509.SystemCertPool()
+		if err != nil || pool == nil {
+			pool = x509.NewCertPool()
+		}
+		if !pool.AppendCertsFromPEM(raw) {
+			return nil, nil, nil, nil, false, fmt.Errorf("--team-ca contains no PEM certificates")
+		}
+		tlsConfig.RootCAs = pool
+	}
+	tr := &teamPolicyRuntime{
+		url:          u.String(),
+		token:        token,
+		pub:          pub,
+		interval:     interval,
+		cachePolicy:  filepath.Join(g.stateDir, "team-policy-"+g.name+".yaml"),
+		local:        local,
+		localSource:  localSource,
+		localPath:    localPath,
+		nameExplicit: opts.Visited["name"] && opts.Name != "",
+		opts: teamApplyOptions{
+			visited:     opts.Visited,
+			readonly:    opts.Readonly,
+			trust:       opts.Trust,
+			approve:     opts.Approve,
+			flagScratch: flagScratch,
+			noSpotlight: opts.NoSpotlight,
+			serverArgs:  opts.ServerArgs,
+		},
+	}
+	tr.cacheSig = tr.cachePolicy + signatureSuffix
+	tr.client = &http.Client{
+		Transport: &http.Transport{
+			Proxy:               http.ProxyFromEnvironment,
+			ForceAttemptHTTP2:   true,
+			TLSClientConfig:     tlsConfig,
+			TLSHandshakeTimeout: 10 * time.Second,
+		},
+		Timeout: 15 * time.Second,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	pf, raw, sig, err := tr.fetch()
+	if err == nil {
+		if err = validatePolicyServerEntry(pf, g.name, tr.nameExplicit); err == nil {
+			return tr, pf, raw, sig, false, nil
+		}
+	}
+	cachePF, cacheRaw, cacheSig, cacheErr := tr.readCache()
+	if cacheErr == nil {
+		cacheErr = validatePolicyServerEntry(cachePF, g.name, tr.nameExplicit)
+	}
+	if cacheErr != nil {
+		return nil, nil, nil, nil, false, fmt.Errorf("team policy fetch failed (%s) and no valid cached policy is available (%s)", teamReason(err), teamReason(cacheErr))
+	}
+	return tr, cachePF, cacheRaw, cacheSig, true, nil
+}
+
+// teamReason maps transport and parse failures to stable audit reason codes. It
+// deliberately does not echo URLs, tokens or policy contents.
+func teamReason(err error) string {
+	if err == nil {
+		return "ok"
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "signature"):
+		return "bad_signature"
+	case strings.Contains(msg, "parse") || strings.Contains(msg, "yaml") || strings.Contains(msg, "policy") || strings.Contains(msg, "no entry"):
+		return "invalid_policy"
+	case strings.Contains(msg, "not found"), strings.Contains(msg, "no policy"), strings.Contains(msg, "returned 404"):
+		return "not_found"
+	case strings.Contains(msg, "401"), strings.Contains(msg, "unauthorized"):
+		return "unauthorized"
+	case strings.Contains(msg, "timeout"), strings.Contains(msg, "deadline"):
+		return "timeout"
+	case strings.Contains(msg, "tls"), strings.Contains(msg, "certificate"):
+		return "tls"
+	default:
+		return "unavailable"
+	}
+}
+
+func (t *teamPolicyRuntime) fetch() (*policyFile, []byte, []byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, t.url, nil)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Authorization", "Bearer "+t.token)
+	resp, err := t.client.Do(req)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, nil, nil, fmt.Errorf("team policy service returned %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, teamPolicyMaxBody+1))
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if len(body) > teamPolicyMaxBody {
+		return nil, nil, nil, fmt.Errorf("team policy envelope is too large")
+	}
+	policy, sig, err := decodeTeamPolicyEnvelope(body)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if err := verifyTeamPolicy(t.pub, policy, sig); err != nil {
+		return nil, nil, nil, err
+	}
+	pf, err := parsePolicyBytes(policy)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("parse team policy: %w", err)
+	}
+	return pf, policy, sig, nil
+}
+
+func decodeTeamPolicyEnvelope(data []byte) ([]byte, []byte, error) {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	var env teamPolicyEnvelope
+	if err := dec.Decode(&env); err != nil {
+		return nil, nil, err
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		return nil, nil, fmt.Errorf("trailing data after team policy envelope")
+	}
+	if len(env.Policy) == 0 {
+		return nil, nil, fmt.Errorf("team policy is empty")
+	}
+	if len(env.Signature) != ed25519.SignatureSize {
+		return nil, nil, fmt.Errorf("team policy signature has the wrong size")
+	}
+	return env.Policy, env.Signature, nil
+}
+
+func verifyTeamPolicy(pub ed25519.PublicKey, policy, sig []byte) error {
+	if len(pub) != ed25519.PublicKeySize {
+		return fmt.Errorf("invalid team public key")
+	}
+	if len(sig) != ed25519.SignatureSize || !ed25519.Verify(pub, policy, sig) {
+		return fmt.Errorf("team policy signature does not verify (policy changed or wrong key)")
+	}
+	return nil
+}
+
+func (t *teamPolicyRuntime) readCache() (*policyFile, []byte, []byte, error) {
+	policy, err := os.ReadFile(t.cachePolicy)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	sig, err := os.ReadFile(t.cacheSig)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if err := verifyTeamPolicy(t.pub, policy, sig); err != nil {
+		return nil, nil, nil, err
+	}
+	pf, err := parsePolicyBytes(policy)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return pf, policy, sig, nil
+}
+
+func (t *teamPolicyRuntime) writeCache(policy, sig []byte) error {
+	if err := verifyTeamPolicy(t.pub, policy, sig); err != nil {
+		return err
+	}
+	if err := writeFileAtomic(t.cachePolicy, policy, 0o600); err != nil {
+		return err
+	}
+	return writeFileAtomic(t.cacheSig, sig, 0o600)
+}
+
+func (g *Guard) startTeamPoller() {
+	if g.team == nil {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(g.team.interval)
+		defer ticker.Stop()
+		for range ticker.C {
+			g.refreshTeamPolicy()
+		}
+	}()
+}
+
+func (g *Guard) refreshTeamPolicy() {
+	tr := g.team
+	if tr == nil {
+		return
+	}
+	pf, policy, sig, err := tr.fetch()
+	if err == nil {
+		err = validatePolicyServerEntry(pf, g.name, tr.nameExplicit)
+	}
+	if err != nil {
+		g.event("team_policy_rejected", map[string]any{"reason": teamReason(err)})
+		alert("team policy pull rejected: %s; keeping the last good policy", teamReason(err))
+		return
+	}
+	hash := sha256.Sum256(policy)
+	if hash == tr.lastHash {
+		return
+	}
+	ignored, profile, err := g.applyTeamPolicy(pf, tr)
+	if err != nil {
+		g.event("team_policy_rejected", map[string]any{"reason": "invalid_policy"})
+		alert("team policy rejected: %s; keeping the last good policy", err)
+		return
+	}
+	if err := tr.writeCache(policy, sig); err != nil {
+		g.event("team_policy_cache_error", map[string]any{"reason": teamReason(err)})
+		tr.lastHash = [sha256.Size]byte{}
+	} else {
+		tr.lastHash = hash
+	}
+	if len(ignored) > 0 {
+		g.event("team_policy_loosen_ignored", map[string]any{"fields": ignored})
+	}
+	g.event("team_policy_reloaded", map[string]any{"version": pf.Version, "profile": profile})
+}
+
+func (g *Guard) applyTeamPolicy(remote *policyFile, tr *teamPolicyRuntime) ([]string, string, error) {
+	effective, ignored := tightenPolicy(remote, tr.local)
+	remoteProfile := selectPolicyProfile(g.name, tr.opts.serverArgs, remote.Profile)
+	profile := selectPolicyProfile(g.name, tr.opts.serverArgs, effective.Profile)
+	oldPatterns := append([]string(nil), currentSensitivePatterns()...)
+	floor := stateFromPolicy(remote, remoteProfile, g.name)
+	safeOpts := sanitizeTeamFlags(floor, tr.opts)
+	candidate := stateFromPolicyWithFlags(effective, profile, g.name, safeOpts)
+	merged := tightenPolicyState(floor, candidate)
+	newPatterns := mergeSensitivePatterns(effective.SensitivePaths)
+	// The temporary policy builds above set the process-wide pattern list.
+	// Publish a superset before swapping the policy snapshot, then narrow to the
+	// new list, so a request never sees fewer patterns than either old or new.
+	setSensitivePatterns(mergeSensitivePatterns(append(oldPatterns, newPatterns...)))
+	g.assignPolicyState(merged)
+	setSensitivePatterns(newPatterns)
+	g.policyVersion = effective.Version
+	g.policySource = "team"
+	g.policyPath = tr.url
+	g.profileName = ""
+	g.profileSource = ""
+	if profile != nil {
+		g.profileName = profile.name
+		g.profileSource = profile.source
+	}
+	return ignored, g.profileName, nil
+}
+
+func stateFromPolicy(pf *policyFile, profile *policyProfile, name string) *policyState {
+	tmp := &Guard{name: name}
+	tmp.applyPolicy(pf, profile, map[string]bool{}, "", "", "", nil, false)
+	return tmp.stateFromFields()
+}
+
+func stateFromPolicyWithFlags(pf *policyFile, profile *policyProfile, name string, opts teamApplyOptions) *policyState {
+	// applyPolicy's --readonly path deletes the flag entries for every tool
+	// named in the policy file. In team mode build the policy state first and
+	// narrow it below instead, so a valid --readonly subset is not lost.
+	visited := cloneVisited(opts.visited)
+	delete(visited, "readonly")
+	tmp := &Guard{name: name}
+	tmp.applyPolicy(pf, profile, visited, "", opts.trust, opts.approve, opts.flagScratch, opts.noSpotlight)
+	st := tmp.stateFromFields()
+	if opts.visited["readonly"] {
+		requested := toSet(opts.readonly)
+		for tool := range st.readonly {
+			if !requested[tool] {
+				delete(st.readonly, tool)
+				st.classes[tool] = "exec"
+			}
+		}
+	}
+	return st
+}
+
+func cloneVisited(in map[string]bool) map[string]bool {
+	out := make(map[string]bool, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+// sanitizeTeamFlags drops flag values that would loosen the team floor. A flag
+// that cannot be applied as a narrowing is ignored entirely, so it does not
+// accidentally remove team permissions either.
+func sanitizeTeamFlags(floor *policyState, opts teamApplyOptions) teamApplyOptions {
+	out := opts
+	out.visited = map[string]bool{}
+	for k, v := range opts.visited {
+		out.visited[k] = v
+	}
+	if out.visited["approve"] && out.approve == "dialog" && floor.approve == "deny" {
+		delete(out.visited, "approve")
+		out.approve = ""
+	}
+	if out.visited["no-spotlight"] && out.noSpotlight && floor.spotlight {
+		delete(out.visited, "no-spotlight")
+		out.noSpotlight = false
+	}
+	if out.visited["readonly"] {
+		requested := toSet(out.readonly)
+		kept := []string{}
+		for name := range requested {
+			if floor.readonly[name] {
+				kept = append(kept, name)
+			}
+		}
+		sort.Strings(kept)
+		if len(kept) == 0 && len(requested) > 0 {
+			delete(out.visited, "readonly")
+			out.readonly = ""
+		} else {
+			out.readonly = strings.Join(kept, ",")
+		}
+	}
+	if out.visited["trust"] {
+		requested := toSet(out.trust)
+		kept := []string{}
+		for name := range requested {
+			if floor.trust[name] {
+				kept = append(kept, name)
+			}
+		}
+		sort.Strings(kept)
+		if len(kept) == 0 && len(requested) > 0 {
+			delete(out.visited, "trust")
+			out.trust = ""
+		} else {
+			out.trust = strings.Join(kept, ",")
+		}
+	}
+	if out.visited["allow-write-under"] {
+		kept := []scratchRule{}
+		for _, cand := range out.flagScratch {
+			for _, fl := range floor.scratch {
+				if scratchRuleCovered(fl, cand) {
+					kept = append(kept, cand)
+					break
+				}
+			}
+		}
+		if len(kept) == 0 && len(out.flagScratch) > 0 {
+			delete(out.visited, "allow-write-under")
+			out.flagScratch = nil
+		} else {
+			out.flagScratch = kept
+		}
+	}
+	return out
+}
+
+func tightenPolicyState(floor, candidate *policyState) *policyState {
+	out := candidate.clone()
+	tools := map[string]bool{}
+	for name := range floor.readonly {
+		tools[name] = true
+	}
+	for name := range floor.classes {
+		tools[name] = true
+	}
+	for name := range candidate.readonly {
+		tools[name] = true
+	}
+	for name := range candidate.classes {
+		tools[name] = true
+	}
+	out.readonly = map[string]bool{}
+	out.classes = map[string]string{}
+	for name := range tools {
+		rank := policyClassRank(floor, name)
+		if r := policyClassRank(candidate, name); r > rank {
+			rank = r
+		}
+		switch rank {
+		case 0:
+			out.readonly[name] = true
+		case 1:
+			out.classes[name] = "write"
+		case 2:
+			out.classes[name] = "egress"
+		default:
+			out.classes[name] = "exec"
+		}
+	}
+	out.trust = map[string]bool{}
+	for name := range candidate.trust {
+		if floor.trust[name] {
+			out.trust[name] = true
+		}
+	}
+	out.toolPathKeys = map[string]map[string]bool{}
+	for name, keys := range floor.toolPathKeys {
+		out.toolPathKeys[name] = cloneBoolMap(keys)
+	}
+	for name, keys := range candidate.toolPathKeys {
+		if out.toolPathKeys[name] == nil {
+			out.toolPathKeys[name] = map[string]bool{}
+		}
+		for k := range keys {
+			out.toolPathKeys[name][k] = true
+		}
+	}
+	out.approve = "dialog"
+	if floor.approve == "deny" || candidate.approve == "deny" || floor.approve == "" || candidate.approve == "" {
+		out.approve = "deny"
+	}
+	out.spotlight = floor.spotlight || candidate.spotlight
+	out.scratch = nil
+	for _, cand := range candidate.scratch {
+		for _, fl := range floor.scratch {
+			if scratchRuleCovered(fl, cand) {
+				out.scratch = append(out.scratch, cand)
+				break
+			}
+		}
+	}
+	out.egressDeny = cloneBoolMap(floor.egressDeny)
+	for host := range candidate.egressDeny {
+		out.egressDeny[host] = true
+	}
+	out.egressAllow = map[string]bool{}
+	for host := range candidate.egressAllow {
+		for allowed := range floor.egressAllow {
+			if hostPatternCovered(allowed, host) {
+				out.egressAllow[host] = true
+				break
+			}
+		}
+	}
+	if floor.allowlistEnforced {
+		out.allowlistEnforced = true
+		out.allowlist = intersectAllowEntries(floor.allowlist, candidate.allowlist)
+	} else if candidate.allowlistEnforced {
+		out.allowlistEnforced = true
+		out.allowlist = append([]policyAllowEntry(nil), candidate.allowlist...)
+	} else {
+		out.allowlistEnforced = false
+		out.allowlist = append([]policyAllowEntry(nil), floor.allowlist...)
+	}
+	return out
+}
+
+func policyClassRank(st *policyState, tool string) int {
+	if st == nil {
+		return 3
+	}
+	if st.readonly[tool] {
+		return 0
+	}
+	switch st.classes[tool] {
+	case "read":
+		return 0
+	case "write":
+		return 1
+	case "egress":
+		return 2
+	default:
+		return 3
+	}
+}
+
+func scratchRuleCovered(floor, cand scratchRule) bool {
+	if floor.tool != "" && floor.tool != cand.tool {
+		return false
+	}
+	if floor.dir == cand.dir {
+		return true
+	}
+	return insideDir(floor.dir, cand.dir)
+}
+
+func hostPatternCovered(floor, cand string) bool {
+	floor = normalizePolicyHostValue(floor)
+	cand = normalizePolicyHostValue(cand)
+	if floor == "" || cand == "" {
+		return false
+	}
+	if floor == cand {
+		return true
+	}
+	if strings.HasPrefix(floor, "*.") && !strings.ContainsAny(floor[2:], "*?[") {
+		suffix := floor[1:] // include the leading dot
+		return cand != suffix && strings.HasSuffix(cand, suffix)
+	}
+	return false
+}
+
+func intersectAllowEntries(floor, candidate []policyAllowEntry) []policyAllowEntry {
+	out := []policyAllowEntry{}
+	for _, want := range candidate {
+		for _, have := range floor {
+			if sameAllowEntry(have, want) {
+				out = append(out, want)
+				break
+			}
+		}
+	}
+	return out
+}
+
+func clonePolicyFile(pf *policyFile) *policyFile {
+	if pf == nil {
+		return nil
+	}
+	out := *pf
+	out.SensitivePaths = append([]string(nil), pf.SensitivePaths...)
+	if pf.Spotlight != nil {
+		out.Spotlight = boolPtr(*pf.Spotlight)
+	}
+	if pf.AllowlistEnforced != nil {
+		out.AllowlistEnforced = boolPtr(*pf.AllowlistEnforced)
+	}
+	if pf.Egress != nil {
+		out.Egress = &policyEgress{
+			AllowHosts: append([]string(nil), pf.Egress.AllowHosts...),
+			DenyHosts:  append([]string(nil), pf.Egress.DenyHosts...),
+		}
+	}
+	out.Allowlist = make([]policyAllowEntry, len(pf.Allowlist))
+	for i, e := range pf.Allowlist {
+		out.Allowlist[i] = e
+		if e.Args != nil {
+			args := append([]string(nil), (*e.Args)...)
+			out.Allowlist[i].Args = &args
+		}
+	}
+	out.Servers = make(map[string]policyServer, len(pf.Servers))
+	for sname, srv := range pf.Servers {
+		ns := policyServer{Tools: make(map[string]policyTool, len(srv.Tools))}
+		for tname, tool := range srv.Tools {
+			nt := tool
+			nt.PathKeys = append([]string(nil), tool.PathKeys...)
+			nt.AllowPaths = append([]string(nil), tool.AllowPaths...)
+			ns.Tools[tname] = nt
+		}
+		out.Servers[sname] = ns
+	}
+	return &out
+}
+
+func policyAllowlistEnforced(pf *policyFile) bool {
+	if pf == nil {
+		return false
+	}
+	if pf.AllowlistEnforced != nil {
+		return *pf.AllowlistEnforced
+	}
+	return len(pf.Allowlist) > 0
+}
+
+func classAtLeastAsStrict(floor, candidate string) bool {
+	if floor == candidate {
+		return true
+	}
+	switch floor {
+	case "read":
+		return true
+	case "write":
+		return candidate == "write" || candidate == "exec"
+	case "egress":
+		return candidate == "egress" || candidate == "exec"
+	case "exec":
+		return candidate == "exec"
+	}
+	return false
+}
+
+func insideAllowRoot(root, p string) bool {
+	rr, ok := canonicalPath(root)
+	if !ok {
+		return false
+	}
+	pp, ok := canonicalPath(p)
+	if !ok {
+		return false
+	}
+	return insideDir(rr, pp)
+}
+
+// tightenPolicy overlays the local policy on the team policy. Every accepted
+// local change is equal or stricter; loosening fields are reported and ignored.
+func tightenPolicy(remote, local *policyFile) (*policyFile, []string) {
+	out := clonePolicyFile(remote)
+	if out.Approval == "" {
+		out.Approval = "deny"
+	}
+	if local == nil {
+		return out, nil
+	}
+	var ignored []string
+	if local.Profile != "" && local.Profile != out.Profile {
+		ignored = append(ignored, "profile")
+	}
+	if local.Approval == "deny" && out.Approval != "deny" {
+		out.Approval = "deny"
+	} else if local.Approval != "" && local.Approval != out.Approval && out.Approval == "deny" {
+		ignored = append(ignored, "approval")
+	}
+	remoteSpotlight := true
+	if out.Spotlight != nil {
+		remoteSpotlight = *out.Spotlight
+	}
+	if local.Spotlight != nil {
+		if *local.Spotlight {
+			out.Spotlight = boolPtr(true)
+		} else if remoteSpotlight {
+			ignored = append(ignored, "spotlight")
+		}
+	}
+	seenSensitive := map[string]bool{}
+	for _, p := range out.SensitivePaths {
+		seenSensitive[strings.ToLower(p)] = true
+	}
+	for _, p := range local.SensitivePaths {
+		if !seenSensitive[strings.ToLower(p)] {
+			out.SensitivePaths = append(out.SensitivePaths, p)
+			seenSensitive[strings.ToLower(p)] = true
+		}
+	}
+	remoteEnforced := policyAllowlistEnforced(out)
+	if local.AllowlistEnforced != nil && !*local.AllowlistEnforced && remoteEnforced {
+		ignored = append(ignored, "allowlist_enforced")
+	}
+	if local.Allowlist != nil {
+		if remoteEnforced {
+			matched := intersectAllowEntries(out.Allowlist, local.Allowlist)
+			if len(matched) != len(local.Allowlist) {
+				ignored = append(ignored, "allowlist")
+			}
+			out.Allowlist = matched
+			out.AllowlistEnforced = boolPtr(true)
+		} else {
+			out.Allowlist = clonePolicyFile(&policyFile{Allowlist: local.Allowlist}).Allowlist
+			out.AllowlistEnforced = boolPtr(true)
+		}
+	} else if local.AllowlistEnforced != nil && *local.AllowlistEnforced {
+		if remoteEnforced {
+			out.AllowlistEnforced = boolPtr(true)
+		} else {
+			out.Allowlist = nil
+			out.AllowlistEnforced = boolPtr(true)
+		}
+	}
+	if local.Egress != nil {
+		if out.Egress == nil {
+			out.Egress = &policyEgress{}
+		}
+		if local.Egress.AllowHosts != nil {
+			kept := []string{}
+			for _, want := range local.Egress.AllowHosts {
+				covered := false
+				for _, have := range out.Egress.AllowHosts {
+					if hostPatternCovered(have, want) {
+						covered = true
+						break
+					}
+				}
+				if covered {
+					kept = append(kept, want)
+				}
+			}
+			if len(local.Egress.AllowHosts) > len(kept) {
+				ignored = append(ignored, "egress.allow_hosts")
+			}
+			out.Egress.AllowHosts = kept
+		}
+		seenDeny := map[string]bool{}
+		for _, h := range out.Egress.DenyHosts {
+			seenDeny[normalizePolicyHostValue(h)] = true
+		}
+		for _, h := range local.Egress.DenyHosts {
+			if !seenDeny[normalizePolicyHostValue(h)] {
+				out.Egress.DenyHosts = append(out.Egress.DenyHosts, h)
+				seenDeny[normalizePolicyHostValue(h)] = true
+			}
+		}
+	}
+	if out.Servers == nil {
+		out.Servers = map[string]policyServer{}
+	}
+	localServers := make([]string, 0, len(local.Servers))
+	for name := range local.Servers {
+		localServers = append(localServers, name)
+	}
+	sort.Strings(localServers)
+	for _, sname := range localServers {
+		lsrv := local.Servers[sname]
+		rsrv, ok := out.Servers[sname]
+		if !ok {
+			rsrv = policyServer{Tools: map[string]policyTool{}}
+		}
+		if rsrv.Tools == nil {
+			rsrv.Tools = map[string]policyTool{}
+		}
+		localTools := make([]string, 0, len(lsrv.Tools))
+		for name := range lsrv.Tools {
+			localTools = append(localTools, name)
+		}
+		sort.Strings(localTools)
+		for _, tname := range localTools {
+			lt := lsrv.Tools[tname]
+			rt, exists := rsrv.Tools[tname]
+			if !exists {
+				if lt.Class != "exec" {
+					ignored = append(ignored, "servers."+sname+".tools."+tname)
+					continue
+				}
+				rt = policyTool{Class: "exec"}
+			}
+			if !classAtLeastAsStrict(rt.Class, lt.Class) {
+				ignored = append(ignored, "servers."+sname+".tools."+tname+".class")
+				lt.Class = rt.Class
+			}
+			rt.Class = lt.Class
+			if lt.Trust && !rt.Trust {
+				ignored = append(ignored, "servers."+sname+".tools."+tname+".trust")
+			} else if !lt.Trust && rt.Trust {
+				rt.Trust = false
+			}
+			seen := map[string]bool{}
+			for _, k := range rt.PathKeys {
+				seen[strings.ToLower(k)] = true
+			}
+			for _, k := range lt.PathKeys {
+				if !seen[strings.ToLower(k)] {
+					rt.PathKeys = append(rt.PathKeys, k)
+					seen[strings.ToLower(k)] = true
+				}
+			}
+			if rt.Class != "write" {
+				if len(lt.AllowPaths) > 0 && exists {
+					ignored = append(ignored, "servers."+sname+".tools."+tname+".allow_paths")
+				}
+				rt.AllowPaths = nil
+			} else if lt.AllowPaths != nil {
+				kept := []string{}
+				for _, p := range lt.AllowPaths {
+					for _, root := range rt.AllowPaths {
+						if insideAllowRoot(root, p) {
+							kept = append(kept, p)
+							break
+						}
+					}
+				}
+				if len(kept) != len(lt.AllowPaths) {
+					ignored = append(ignored, "servers."+sname+".tools."+tname+".allow_paths")
+				}
+				rt.AllowPaths = kept
+			}
+			rsrv.Tools[tname] = rt
+		}
+		out.Servers[sname] = rsrv
+	}
+	return out, ignored
 }
 
 func defaultPolicyFile() *policyFile {
@@ -2075,6 +3166,61 @@ func (g *Guard) applyPolicy(pf *policyFile, profile *policyProfile, visited map[
 			}
 		}
 	}
+	g.policy.Store(g.stateFromFields())
+}
+
+// stateFromFields captures the current policy fields. Callers must not mutate
+// the returned maps or slices.
+func (g *Guard) stateFromFields() *policyState {
+	st := &policyState{
+		readonly:          cloneBoolMap(g.readonly),
+		trust:             cloneBoolMap(g.trust),
+		approve:           g.approve,
+		spotlight:         g.spotlight,
+		scratch:           append([]scratchRule(nil), g.scratch...),
+		classes:           cloneStringMap(g.classes),
+		toolPathKeys:      map[string]map[string]bool{},
+		egressAllow:       cloneBoolMap(g.egressAllow),
+		egressDeny:        cloneBoolMap(g.egressDeny),
+		allowlistEnforced: g.allowlistEnforced,
+		allowlist:         append([]policyAllowEntry(nil), g.allowlist...),
+	}
+	for tool, keys := range g.toolPathKeys {
+		st.toolPathKeys[tool] = cloneBoolMap(keys)
+	}
+	if st.approve == "" {
+		st.approve = "deny"
+	}
+	return st
+}
+
+// assignPolicyState installs a fully built state and publishes it atomically.
+func (g *Guard) assignPolicyState(st *policyState) {
+	st = st.clone()
+	g.readonly = cloneBoolMap(st.readonly)
+	g.trust = cloneBoolMap(st.trust)
+	g.approve = st.approve
+	g.spotlight = st.spotlight
+	g.scratch = append([]scratchRule(nil), st.scratch...)
+	g.classes = cloneStringMap(st.classes)
+	g.toolPathKeys = map[string]map[string]bool{}
+	for tool, keys := range st.toolPathKeys {
+		g.toolPathKeys[tool] = cloneBoolMap(keys)
+	}
+	g.egressAllow = cloneBoolMap(st.egressAllow)
+	g.egressDeny = cloneBoolMap(st.egressDeny)
+	g.allowlistEnforced = st.allowlistEnforced
+	g.allowlist = append([]policyAllowEntry(nil), st.allowlist...)
+	g.policy.Store(st)
+}
+
+func (g *Guard) currentPolicy() *policyState {
+	if st := g.policy.Load(); st != nil {
+		return st
+	}
+	st := g.stateFromFields()
+	g.policy.Store(st)
+	return st
 }
 
 func boolPtr(v bool) *bool { return &v }
@@ -4018,13 +5164,14 @@ func (g *Guard) fromHost(line []byte) (forward bool, reply []byte) {
 	reason, quarantined := g.quarantined[p.Name]
 	tainted, origin := g.tainted, g.taintOrigin
 	g.mu.Unlock()
+	pol := g.currentPolicy()
 
 	if quarantined {
 		g.event("block", map[string]any{"tool": p.Name, "rule": "MANIFEST_QUARANTINE", "detail": reason})
 		alert("tool %q blocked: %s", p.Name, reason)
 		return false, replyIfRequest(id, -32001, "Blocked by Sylenix Guard", "MANIFEST_QUARANTINE")
 	}
-	class := g.classFor(p.Name)
+	class := pol.classFor(p.Name)
 	if !tainted || class == "read" {
 		g.event("allow", map[string]any{"tool": p.Name, "tainted": tainted, "class": class, "arg_keys": argKeys(p.Arguments)})
 		g.track(id, method, p.Name)
@@ -4035,15 +5182,15 @@ func (g *Guard) fromHost(line []byte) (forward bool, reply []byte) {
 	// first, then protected persistence targets, then grants/scratch, then the
 	// dialog or default deny. A fast path can never reach a hard-blocked or
 	// protected target.
-	scan := scanArgs(p.Arguments, g.toolPathKeys[p.Name], g.protectedDirs)
-	if !scan.sensitive && g.hardSensitiveCall(p.Name, scan.paths) {
+	scan := scanArgs(p.Arguments, pol.toolPathKeys[p.Name], g.protectedDirs)
+	if !scan.sensitive && g.hardSensitiveCall(p.Name, scan.paths, pol.scratch) {
 		scan.sensitive = true
 	}
 	egressAllowed := false
 	if scan.egress {
 		egressAllowed = len(scan.egressHosts) > 0
 		for _, host := range scan.egressHosts {
-			if g.hostDenied(host) || !g.hostAllowed(host) {
+			if pol.hostDenied(host) || !pol.hostAllowed(host) {
 				egressAllowed = false
 			}
 		}
@@ -4058,10 +5205,10 @@ func (g *Guard) fromHost(line []byte) (forward bool, reply []byte) {
 		alert("tool %q blocked: sensitive path in a session tainted by %q", p.Name, origin)
 		return false, replyIfRequest(id, -32000, "Blocked by Sylenix Guard", "SENSITIVE_TARGET")
 	}
-	if !scan.protected && g.protectedCall(p.Name, scan.paths) {
+	if !scan.protected && g.protectedCall(p.Name, scan.paths, pol.scratch) {
 		scan.protected = true
 	}
-	if scan.protected && g.approve != "dialog" {
+	if scan.protected && pol.approve != "dialog" {
 		g.event("block", map[string]any{"tool": p.Name, "rule": "SENSITIVE_TARGET", "origin": origin, "class": class, "arg_keys": argKeys(p.Arguments)})
 		alert("tool %q blocked: protected persistence path in a session tainted by %q", p.Name, origin)
 		return false, replyIfRequest(id, -32000, "Blocked by Sylenix Guard", "SENSITIVE_TARGET")
@@ -4091,12 +5238,12 @@ func (g *Guard) fromHost(line []byte) (forward bool, reply []byte) {
 		g.track(id, method, p.Name)
 		return true, nil
 	}
-	if !scan.egress && !scan.protected && !scan.ambiguous && g.scratchAllows(p.Name, scan.paths) {
+	if !scan.egress && !scan.protected && !scan.ambiguous && pol.scratchAllows(p.Name, scan.paths) {
 		g.event("allow", map[string]any{"tool": p.Name, "tainted": true, "class": class, "rule": "SCRATCH", "arg_keys": argKeys(p.Arguments)})
 		g.track(id, method, p.Name)
 		return true, nil
 	}
-	if g.approve == "dialog" {
+	if pol.approve == "dialog" {
 		scope := scopeDir(scan.paths)
 		decision, note := askHuman(p.Name, p.Arguments, origin, grantScopeNote(p.Name, scope))
 		g.event("approval", map[string]any{"tool": p.Name, "granted": decision != "deny", "decision": decision, "class": class, "note": note, "arg_keys": argKeys(p.Arguments)})
@@ -4206,11 +5353,12 @@ func (g *Guard) fromServer(line []byte) []byte {
 		if origin == "" {
 			origin = p.method
 		}
-		if p.method == "tools/call" && g.trust[p.tool] {
+		pol := g.currentPolicy()
+		if p.method == "tools/call" && pol.trust[p.tool] {
 			return line
 		}
 		g.latch(origin) // latch BEFORE the host can see the content
-		if g.spotlight && p.method == "tools/call" {
+		if pol.spotlight && p.method == "tools/call" {
 			return g.datamark(f, origin, line)
 		}
 	}
@@ -4526,12 +5674,23 @@ var defaultSensitivePaths = []string{
 	"tsconfig.json", "setup.py", "gemfile", "composer.json",
 }
 
-// activeSensitivePatterns is set once at startup, before any proxy goroutine
-// starts, and only read afterwards.
-var activeSensitivePatterns = append([]string(nil), defaultSensitivePaths...)
+// activeSensitivePatterns is an immutable slice swapped atomically. Team
+// policy refreshes can change it while request handlers are classifying paths.
+var activeSensitivePatterns atomic.Value
+
+func init() {
+	activeSensitivePatterns.Store(append([]string(nil), defaultSensitivePaths...))
+}
 
 func setSensitivePatterns(patterns []string) {
-	activeSensitivePatterns = append([]string(nil), patterns...)
+	activeSensitivePatterns.Store(append([]string(nil), patterns...))
+}
+
+func currentSensitivePatterns() []string {
+	if v := activeSensitivePatterns.Load(); v != nil {
+		return v.([]string)
+	}
+	return defaultSensitivePaths
 }
 
 func mergeSensitivePatterns(extra []string) []string {
@@ -4785,7 +5944,7 @@ func isHardSensitivePath(p string, extraDirs []string) bool {
 
 // protectedCall also checks relative names against the approved roots, so a
 // symlink inside a scratch or grant directory cannot hide a protected target.
-func (g *Guard) protectedCall(tool string, paths []string) bool {
+func (g *Guard) protectedCall(tool string, paths []string, scratch []scratchRule) bool {
 	for _, p := range paths {
 		if protectedTargetPathWithDirs(p, g.protectedDirs) {
 			return true
@@ -4793,7 +5952,7 @@ func (g *Guard) protectedCall(tool string, paths []string) bool {
 		if isExplicitlyRooted(p) {
 			continue
 		}
-		for _, rule := range g.scratch {
+		for _, rule := range scratch {
 			if rule.tool != "" && rule.tool != tool {
 				continue
 			}
@@ -4819,7 +5978,7 @@ func (g *Guard) protectedCall(tool string, paths []string) bool {
 // hardSensitiveCall repeats protectedCall's relative-path resolution so a
 // scratch or grant root cannot hide a hard-sensitive path from the pre-grant
 // check.
-func (g *Guard) hardSensitiveCall(tool string, paths []string) bool {
+func (g *Guard) hardSensitiveCall(tool string, paths []string, scratch []scratchRule) bool {
 	for _, p := range paths {
 		if isHardSensitivePath(p, g.protectedDirs) {
 			return true
@@ -4827,7 +5986,7 @@ func (g *Guard) hardSensitiveCall(tool string, paths []string) bool {
 		if isExplicitlyRooted(p) {
 			continue
 		}
-		for _, rule := range g.scratch {
+		for _, rule := range scratch {
 			if rule.tool != "" && rule.tool != tool {
 				continue
 			}
@@ -5027,16 +6186,6 @@ func isHostPort(s string) bool {
 
 // looksLikePath reports whether a value has a filename shape. It is used only
 // to refuse a fast path for values whose key does not identify them as paths.
-func (g *Guard) classFor(tool string) string {
-	if g.readonly[tool] {
-		return "read"
-	}
-	if class := g.classes[tool]; class != "" {
-		return class
-	}
-	return "exec"
-}
-
 func policyHostSet(hosts []string) map[string]bool {
 	m := map[string]bool{}
 	for _, h := range hosts {
@@ -5068,14 +6217,6 @@ func hostMatchesPattern(host string, patterns map[string]bool) bool {
 		}
 	}
 	return false
-}
-
-func (g *Guard) hostDenied(host string) bool {
-	return hostMatchesPattern(host, g.egressDeny)
-}
-
-func (g *Guard) hostAllowed(host string) bool {
-	return hostMatchesPattern(host, g.egressAllow)
 }
 
 // hostFromArgument extracts a lower-case host from a URL, URI, host:port or
@@ -5205,7 +6346,7 @@ func isSensitivePathParts(p string, checkGit bool) bool {
 	case ".pem", ".key", ".p12", ".pfx":
 		return true
 	}
-	for _, pattern := range activeSensitivePatterns {
+	for _, pattern := range currentSensitivePatterns() {
 		if !checkGit && sensitivePatternIsGit(pattern) {
 			continue
 		}
@@ -5567,24 +6708,6 @@ func (g *Guard) grantAllows(tool string, paths []string, protected bool) bool {
 	}
 	g.grants = kept
 	return allowed
-}
-
-// scratchAllows is the --allow-write-under fast path: no prompt while every
-// path argument stays inside the configured directory. A call with no
-// recognizable path argument never qualifies.
-func (g *Guard) scratchAllows(tool string, paths []string) bool {
-	if len(paths) == 0 {
-		return false
-	}
-	for _, e := range g.scratch {
-		if e.tool != "" && e.tool != tool {
-			continue
-		}
-		if allInside(e.dir, paths) {
-			return true
-		}
-	}
-	return false
 }
 
 // ---------------------------------------------------------------- approval dialog
