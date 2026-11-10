@@ -2,6 +2,26 @@
 
 ## 2026-11-10
 
+### Audit event shipping and team collector
+
+- Added sanitized audit event shipping from Guard to the team collector. Events
+  contain only timestamp, developer/machine ID, server, tool, decision, reason
+  code and taint state. The shipped schema has no argument, content, URL or
+  free-text field, and the collector rejects unknown fields.
+- Added Guard flags `--audit-url`, `--audit-token-file` (falls back to the team
+  token), `--audit-ca`, `--audit-id`, `--audit-interval` (default `5s`) and
+  `--audit-batch` (default `50`). Events are appended to a disk outbox before
+  sending, batched, retried with exponential backoff, and drained after restart.
+- Added collector endpoints on `sylenix-teams`: `POST /v1/events` for batches,
+  `GET /v1/events` for JSON export and `GET /v1/events/syslog` for RFC 5424
+  output. All use the per-team bearer token and append only sanitized events.
+- Added `teams/auditevent` (strict schema, RFC 5424 formatting),
+  `teams/auditshipper` (outbox, batching, backoff, retry) and collector/API
+  tests. The integration test proves events from 3 Guards arrive, offline
+  buffering delivers after recovery, and argument text never appears in the
+  export, syslog output, outbox or stored log.
+- Documented the collector, event schema and audit flags in `teams/README.md`.
+
 ### Team policy service (paid tier)
 
 - Added `teams/`, a separate stdlib-only Go package and `bin/sylenix-teams`

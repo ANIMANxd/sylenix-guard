@@ -21,9 +21,11 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"sylenix-guard-poc/teams/auditevent"
 	"sylenix-guard-poc/teams/policyserver"
 )
 
@@ -48,6 +50,19 @@ func (s *syncBuffer) String() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.b.String()
+}
+
+type toggleHandler struct {
+	next    http.Handler
+	offline atomic.Bool
+}
+
+func (h *toggleHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if h.offline.Load() {
+		http.Error(w, "offline", http.StatusServiceUnavailable)
+		return
+	}
+	h.next.ServeHTTP(w, r)
 }
 
 type guardProc struct {
@@ -637,6 +652,201 @@ func TestTeamPolicyIntegration(t *testing.T) {
 	)
 	if code != 2 || !strings.Contains(strings.ToLower(out), "https") {
 		t.Fatalf("plain-HTTP Guard: code=%d out=%s", code, out)
+	}
+}
+
+func TestAuditEventsFromThreeGuardsAndOfflineBuffer(t *testing.T) {
+	root := repoRoot(t)
+	fake := filepath.Join(root, "demo", "fake_server.py")
+	py := pythonExe(t)
+	tmp := t.TempDir()
+
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokenPath := filepath.Join(tmp, "team.token")
+	writeFile(t, tokenPath, token+"\n")
+	policyPath := filepath.Join(tmp, "policy.yaml")
+	writeFile(t, policyPath, policyYAML("exec"))
+
+	dataDir := filepath.Join(tmp, "collector-data")
+	srv, err := policyserver.New(policyserver.Config{
+		DataDir:   dataDir,
+		PublicKey: pub,
+		Tokens:    map[string]string{teamName: policyserver.HashToken(token)},
+		Logger:    log.New(io.Discard, "", 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	toggle := &toggleHandler{next: srv}
+	httpsSrv := httptest.NewTLSServer(toggle)
+	defer httpsSrv.Close()
+	caPath := filepath.Join(tmp, "ca.pem")
+	writeFile(t, caPath, string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: httpsSrv.Certificate().Raw})))
+	eventsEndpoint := httpsSrv.URL + policyserver.EventsAPI
+	syslogEndpoint := httpsSrv.URL + policyserver.SyslogAPI
+
+	fetchExport := func() string {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodGet, eventsEndpoint, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := httpsSrv.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		raw, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("event export: %d %s", resp.StatusCode, raw)
+		}
+		return string(raw)
+	}
+	parseExport := func(raw string) []auditevent.Event {
+		t.Helper()
+		var events []auditevent.Event
+		if err := json.Unmarshal([]byte(raw), &events); err != nil {
+			t.Fatalf("event export is not JSON: %v %s", err, raw)
+		}
+		return events
+	}
+	countBlocks := func(events []auditevent.Event, developer, tool string) int {
+		n := 0
+		for _, ev := range events {
+			if ev.DeveloperID == developer && ev.Tool == tool && ev.Decision == "block" && ev.ReasonCode == "TAINT_SINK" {
+				n++
+			}
+		}
+		return n
+	}
+	countStoredBlocks := func(developer, tool string) int {
+		t.Helper()
+		stored, err := srv.ReadEvents(teamName)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return countBlocks(stored, developer, tool)
+	}
+
+	var guards []*guardProc
+	states := []string{}
+	marker := "AUDIT-SECRET-ARGUMENT-" + fmt.Sprint(time.Now().UnixNano())
+	for i := 0; i < 3; i++ {
+		state := filepath.Join(tmp, fmt.Sprintf("audit-guard-%d", i))
+		states = append(states, state)
+		g := startGuard(t,
+			"--name", "demo",
+			"--state-dir", state,
+			"--audit-url", eventsEndpoint,
+			"--audit-token-file", tokenPath,
+			"--audit-ca", caPath,
+			"--audit-id", fmt.Sprintf("guard-%d", i),
+			"--audit-interval", "100ms",
+			"--audit-batch", "50",
+			"--policy", policyPath,
+			"--", py, fake,
+		)
+		guards = append(guards, g)
+		g.initialize()
+		if read := g.call("read_ticket", map[string]any{"ticket_id": 7}); read["result"] == nil {
+			t.Fatalf("guard %d read_ticket failed: %v", i, read)
+		}
+		if write := g.call("write_file", map[string]any{"path": "note.txt", "content": marker}); rule(write) != "TAINT_SINK" {
+			t.Fatalf("guard %d write_file was not blocked: %v", i, write)
+		}
+	}
+
+	waitFor(t, 5*time.Second, "three Guards' block events", func() bool {
+		events := parseExport(fetchExport())
+		for i := 0; i < 3; i++ {
+			if countBlocks(events, fmt.Sprintf("guard-%d", i), "write_file") < 1 {
+				return false
+			}
+		}
+		return true
+	})
+	exported := fetchExport()
+	events := parseExport(exported)
+	for i := 0; i < 3; i++ {
+		developer := fmt.Sprintf("guard-%d", i)
+		found := false
+		for _, ev := range events {
+			if ev.DeveloperID == developer && ev.Tool == "write_file" && ev.Decision == "block" {
+				found = true
+				if ev.Server != "demo" || ev.ReasonCode != "TAINT_SINK" || ev.TaintState != "tainted" {
+					t.Fatalf("guard %d event has wrong fields: %+v", i, ev)
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("guard %d event missing from export", i)
+		}
+	}
+	if strings.Contains(exported, marker) {
+		t.Fatalf("event export leaked an argument value: %s", exported)
+	}
+	req, _ := http.NewRequest(http.MethodGet, syslogEndpoint, nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := httpsSrv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	syslogRaw, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(syslogRaw), "<132>1 ") || !strings.Contains(string(syslogRaw), `reason_code="TAINT_SINK"`) {
+		t.Fatalf("syslog export: %d %s", resp.StatusCode, syslogRaw)
+	}
+	if strings.Contains(string(syslogRaw), marker) {
+		t.Fatalf("syslog export leaked an argument value: %s", syslogRaw)
+	}
+	for i, state := range states {
+		raw, err := os.ReadFile(filepath.Join(state, "audit-outbox-demo.jsonl"))
+		if err != nil {
+			t.Fatalf("guard %d outbox: %v", i, err)
+		}
+		if strings.Contains(string(raw), marker) {
+			t.Fatalf("guard %d outbox leaked an argument value: %s", i, raw)
+		}
+	}
+
+	// Offline: the collector returns 503, the Guard must keep the event on disk
+	// and then deliver it after the collector returns.
+	waitFor(t, 2*time.Second, "guard-0 outbox to drain", func() bool {
+		raw, err := os.ReadFile(filepath.Join(states[0], "audit-outbox-demo.jsonl"))
+		return err == nil && len(bytes.TrimSpace(raw)) == 0
+	})
+	time.Sleep(150 * time.Millisecond) // let any acknowledged batch settle
+	before := countStoredBlocks("guard-0", "noisy")
+	toggle.offline.Store(true)
+	time.Sleep(250 * time.Millisecond)
+	offlineMarker := marker + "-OFFLINE"
+	if write := guards[0].call("noisy", map[string]any{"path": "offline.txt", "content": offlineMarker}); rule(write) != "TAINT_SINK" {
+		t.Fatalf("offline noisy call was not blocked: %v", write)
+	}
+	waitFor(t, 2*time.Second, "offline event in outbox", func() bool {
+		raw, err := os.ReadFile(filepath.Join(states[0], "audit-outbox-demo.jsonl"))
+		return err == nil && strings.Contains(string(raw), `"reason_code":"TAINT_SINK"`) && strings.Contains(string(raw), `"tool":"noisy"`)
+	})
+	offlineRaw, err := os.ReadFile(filepath.Join(states[0], "audit-outbox-demo.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(offlineRaw), offlineMarker) {
+		t.Fatalf("offline outbox leaked an argument value: %s", offlineRaw)
+	}
+	if got := countStoredBlocks("guard-0", "noisy"); got != before {
+		t.Fatalf("offline event reached the collector: before=%d after=%d", before, got)
+	}
+	toggle.offline.Store(false)
+	waitFor(t, 5*time.Second, "buffered event after collector returns", func() bool {
+		return countStoredBlocks("guard-0", "noisy") > before
+	})
+	for _, g := range guards {
+		g.close()
 	}
 }
 

@@ -64,7 +64,7 @@ requires authorization that the agent cannot grant itself.
 ## Current state
 
 The enforcement core above is implemented, tested and measured. The implementation is a
-single Go binary (`cmd/sylenix-guard/main.go`) using only the standard library, and it
+single Go binary (`cmd/sylenix-guard/main.go`) using the standard library plus the optional in-repo `teams/` packages, and it
 wraps one MCP server per process over stdio or Streamable HTTP.
 
 **Implemented today**
@@ -80,6 +80,9 @@ wraps one MCP server per process over stdio or Streamable HTTP.
 - Optional paid-tier team policy service (`teams/`, `bin/sylenix-teams`): HTTPS
   pull every 15 minutes, team-signature verification, last-good cache, and local
   policy that can only tighten the team policy; see [`teams/README.md`](teams/README.md)
+- Optional sanitized audit shipping to the team collector: batched/retried
+  events, a disk outbox while offline, JSON export and RFC 5424 syslog output;
+  the event schema never includes argument values or content
 - Result datamarking and invisible-character stripping, including `structuredContent`
 - Session taint tracking with default-deny flow control
 - Hard blocks for network targets and sensitive paths

@@ -7,7 +7,9 @@
 // What it does: pins tool definitions (trust on first use), latches session
 // taint when untrusted content comes back from a tool, blocks every tool that
 // is not on the read-only list once the session is tainted, and can ask a human
-// through an OS dialog instead of blocking. Standard library only.
+// through an OS dialog instead of blocking. The proxy core uses only the
+// standard library; the optional team policy and audit shipper use in-repo
+// packages under teams/.
 package main
 
 import (
@@ -45,6 +47,9 @@ import (
 	"time"
 	"unicode"
 	"unicode/utf8"
+
+	"sylenix-guard-poc/teams/auditevent"
+	"sylenix-guard-poc/teams/auditshipper"
 )
 
 const maxFrame = 10 << 20      // longest accepted JSON-RPC line: 10 MiB
@@ -323,9 +328,12 @@ type Guard struct {
 	quarantined map[string]string
 	grants      []grant // live time-bounded approvals
 
-	serverGone atomic.Bool // set once the server's stdout has closed
-	policy     atomic.Pointer[policyState]
-	team       *teamPolicyRuntime
+	serverGone  atomic.Bool // set once the server's stdout has closed
+	taintedFlag atomic.Bool
+	policy      atomic.Pointer[policyState]
+	team        *teamPolicyRuntime
+	audit       *auditshipper.Shipper
+	auditID     string
 
 	outMu sync.Mutex // serializes every write to the host's stdout
 	out   io.Writer
@@ -359,6 +367,12 @@ type guardOptions struct {
 	TeamPubKey      string
 	TeamCA          string
 	TeamInterval    string
+	AuditURL        string
+	AuditTokenFile  string
+	AuditCA         string
+	AuditID         string
+	AuditInterval   string
+	AuditBatch      int
 }
 
 func main() {
@@ -396,6 +410,12 @@ func main() {
 	teamPubKey := flag.String("team-pubkey", "", "Ed25519 public key used to verify the team policy")
 	teamCA := flag.String("team-ca", "", "optional extra CA certificate PEM for the team policy service")
 	teamInterval := flag.String("team-interval", "15m", "how often to pull the team policy")
+	auditURL := flag.String("audit-url", "", "HTTPS collector endpoint for sanitized audit events")
+	auditTokenFile := flag.String("audit-token-file", "", "collector token file (default: --team-token-file or SYLENIX_TEAM_TOKEN)")
+	auditCA := flag.String("audit-ca", "", "optional extra CA certificate PEM for the collector")
+	auditID := flag.String("audit-id", "", "machine/developer ID attached to shipped events")
+	auditInterval := flag.String("audit-interval", "5s", "maximum time between audit batches")
+	auditBatch := flag.Int("audit-batch", 50, "number of audit events per batch")
 	readonly := flag.String("readonly", "", "comma-separated tools that stay allowed when the session is tainted")
 	trust := flag.String("trust", "", "comma-separated tools whose results do NOT taint the session")
 	approve := flag.String("approve", "deny", "what to do with a blocked call: deny | dialog")
@@ -435,6 +455,12 @@ func main() {
 		TeamPubKey:      *teamPubKey,
 		TeamCA:          *teamCA,
 		TeamInterval:    *teamInterval,
+		AuditURL:        *auditURL,
+		AuditTokenFile:  *auditTokenFile,
+		AuditCA:         *auditCA,
+		AuditID:         *auditID,
+		AuditInterval:   *auditInterval,
+		AuditBatch:      *auditBatch,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "sylenix-guard:", err)
@@ -710,6 +736,11 @@ func prepareGuard(opts guardOptions) (*Guard, error) {
 		verifyKey:     verifyKey,
 		signKey:       signKey,
 	}
+	if err := g.startAuditShipper(opts); err != nil {
+		g.event("audit_config_invalid", map[string]any{"reason": "invalid_audit_configuration"})
+		_ = logf.Close()
+		return nil, err
+	}
 	if teamMode {
 		localPF, localSource, localPath, localPresent, err := loadLocalPolicyForTeam(opts.PolicyPath, visited["policy"], stateDir, name, nameExplicit, g.verifyKey)
 		if err != nil {
@@ -782,6 +813,88 @@ func redactTeamURL(raw string) string {
 	return u.Scheme + "://" + u.Host + u.Path
 }
 
+func (g *Guard) startAuditShipper(opts guardOptions) error {
+	if strings.TrimSpace(opts.AuditURL) == "" {
+		return nil
+	}
+	tokenFile := opts.AuditTokenFile
+	if tokenFile == "" {
+		tokenFile = opts.TeamTokenFile
+	}
+	token, err := readTeamToken(tokenFile)
+	if err != nil {
+		return fmt.Errorf("cannot read audit token: %w", err)
+	}
+	caFile := opts.AuditCA
+	if caFile == "" {
+		caFile = opts.TeamCA
+	}
+	interval := 5 * time.Second
+	if strings.TrimSpace(opts.AuditInterval) != "" {
+		interval, err = time.ParseDuration(opts.AuditInterval)
+		if err != nil || interval <= 0 {
+			return fmt.Errorf("--audit-interval must be a positive duration, for example 5s")
+		}
+	}
+	if opts.AuditBatch <= 0 {
+		return fmt.Errorf("--audit-batch must be positive")
+	}
+	id := normalizeAuditID(opts.AuditID)
+	if id == "" {
+		id = defaultAuditID()
+	}
+	if id == "" {
+		return fmt.Errorf("--audit-id is empty after removing unsupported characters")
+	}
+	sh, err := auditshipper.New(auditshipper.Config{
+		URL:           opts.AuditURL,
+		Token:         token,
+		CAFile:        caFile,
+		OutboxPath:    filepath.Join(g.stateDir, "audit-outbox-"+g.name+".jsonl"),
+		BatchSize:     opts.AuditBatch,
+		FlushInterval: interval,
+		Logger: func(err error) {
+			alert("audit shipper: %v", err)
+		},
+	})
+	if err != nil {
+		return err
+	}
+	g.auditID = id
+	g.audit = sh
+	sh.Start()
+	return nil
+}
+
+func defaultAuditID() string {
+	user := osUser()
+	if user == "" {
+		user = "unknown"
+	}
+	host, _ := os.Hostname()
+	if host == "" {
+		host = "unknown"
+	}
+	return normalizeAuditID(user + "@" + host)
+}
+
+func normalizeAuditID(s string) string {
+	s = strings.TrimSpace(s)
+	var b strings.Builder
+	for _, r := range s {
+		if r > 32 && r < 127 {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('-')
+		}
+	}
+	out := strings.Trim(b.String(), "-")
+	if len(out) > 256 {
+		out = out[:256]
+	}
+	return out
+}
+
 // ---------------------------------------------------------------- streamable HTTP proxy
 
 // guardFlagValues is the common proxy configuration. The stdio path keeps its
@@ -797,6 +910,12 @@ type guardFlagValues struct {
 	TeamPubKey      string
 	TeamCA          string
 	TeamInterval    string
+	AuditURL        string
+	AuditTokenFile  string
+	AuditCA         string
+	AuditID         string
+	AuditInterval   string
+	AuditBatch      int
 	Readonly        string
 	Trust           string
 	Approve         string
@@ -817,6 +936,12 @@ func registerGuardFlags(fs *flag.FlagSet, v *guardFlagValues) {
 	fs.StringVar(&v.TeamPubKey, "team-pubkey", "", "Ed25519 public key used to verify the team policy")
 	fs.StringVar(&v.TeamCA, "team-ca", "", "optional extra CA certificate PEM for the team policy service")
 	fs.StringVar(&v.TeamInterval, "team-interval", "15m", "how often to pull the team policy")
+	fs.StringVar(&v.AuditURL, "audit-url", "", "HTTPS collector endpoint for sanitized audit events")
+	fs.StringVar(&v.AuditTokenFile, "audit-token-file", "", "collector token file (default: --team-token-file or SYLENIX_TEAM_TOKEN)")
+	fs.StringVar(&v.AuditCA, "audit-ca", "", "optional extra CA certificate PEM for the collector")
+	fs.StringVar(&v.AuditID, "audit-id", "", "machine/developer ID attached to shipped events")
+	fs.StringVar(&v.AuditInterval, "audit-interval", "5s", "maximum time between audit batches")
+	fs.IntVar(&v.AuditBatch, "audit-batch", 50, "number of audit events per batch")
 	fs.StringVar(&v.Readonly, "readonly", "", "comma-separated tools that stay allowed when the session is tainted")
 	fs.StringVar(&v.Trust, "trust", "", "comma-separated tools whose results do NOT taint the session")
 	fs.StringVar(&v.Approve, "approve", "deny", "what to do with a blocked call: deny | dialog")
@@ -915,6 +1040,12 @@ func runProxyCommand(args []string) int {
 		TeamPubKey:      vals.TeamPubKey,
 		TeamCA:          vals.TeamCA,
 		TeamInterval:    vals.TeamInterval,
+		AuditURL:        vals.AuditURL,
+		AuditTokenFile:  vals.AuditTokenFile,
+		AuditCA:         vals.AuditCA,
+		AuditID:         vals.AuditID,
+		AuditInterval:   vals.AuditInterval,
+		AuditBatch:      vals.AuditBatch,
 		Readonly:        vals.Readonly,
 		Trust:           vals.Trust,
 		Approve:         vals.Approve,
@@ -5373,6 +5504,7 @@ func (g *Guard) latchReason(origin, reason string) {
 	g.mu.Lock()
 	first := !g.tainted
 	g.tainted = true
+	g.taintedFlag.Store(true)
 	if first {
 		g.taintOrigin = origin
 	}
@@ -5393,6 +5525,7 @@ func (g *Guard) clearTaint() {
 	g.mu.Lock()
 	g.tainted = false
 	g.taintOrigin = ""
+	g.taintedFlag.Store(false)
 	g.mu.Unlock()
 }
 
@@ -7157,16 +7290,114 @@ func (g *Guard) write(b []byte) {
 }
 
 // event appends one JSON line to the audit log. It never records argument
-// values, only their key names.
+// values, only their key names. The shipped event is built from an allowlist of
+// fields, so argument values, content, URLs and free-form notes cannot escape.
 func (g *Guard) event(kind string, fields map[string]any) {
-	rec := map[string]any{"ts": time.Now().UTC().Format(time.RFC3339Nano), "server": g.name, "event": kind}
+	ts := time.Now().UTC().Format(time.RFC3339Nano)
+	rec := map[string]any{"ts": ts, "server": g.name, "event": kind}
 	for k, v := range fields {
 		rec[k] = v
 	}
 	b, _ := json.Marshal(rec)
 	g.logMu.Lock()
-	defer g.logMu.Unlock()
 	_, _ = g.log.Write(append(b, '\n'))
+	g.logMu.Unlock()
+
+	if g.audit == nil {
+		return
+	}
+	ev := auditevent.Event{
+		Timestamp:   ts,
+		DeveloperID: g.auditID,
+		Server:      g.name,
+		Tool:        auditTool(fields),
+		Decision:    auditDecision(kind, fields),
+		ReasonCode:  auditReason(kind, fields),
+		TaintState:  "clean",
+	}
+	if g.taintedFlag.Load() {
+		ev.TaintState = "tainted"
+	}
+	if err := g.audit.Enqueue(ev); err != nil {
+		alert("audit event not buffered: %v", err)
+	}
+}
+
+func auditTool(fields map[string]any) string {
+	tool, _ := fields["tool"].(string)
+	return auditText(tool, 256)
+}
+
+func auditDecision(kind string, fields map[string]any) string {
+	lower := strings.ToLower(kind)
+	switch lower {
+	case "allow":
+		return "allow"
+	case "block", "tool_quarantined":
+		return "block"
+	case "approval":
+		if granted, _ := fields["granted"].(bool); granted {
+			return "allow"
+		}
+		if decision, _ := fields["decision"].(string); decision == "grant" || decision == "once" {
+			return "allow"
+		}
+		return "deny"
+	case "taint_latched":
+		return "taint"
+	}
+	if strings.HasPrefix(lower, "clear_taint") {
+		return "clear_taint"
+	}
+	return "info"
+}
+
+func auditReason(kind string, fields map[string]any) string {
+	lower := strings.ToLower(kind)
+	switch lower {
+	case "block", "allow":
+		if rule, _ := fields["rule"].(string); rule != "" {
+			return auditText(rule, 128)
+		}
+		if lower == "allow" {
+			return "ALLOW"
+		}
+		return "BLOCK"
+	case "tool_quarantined":
+		return "MANIFEST_QUARANTINE"
+	case "approval":
+		if auditDecision(kind, fields) == "allow" {
+			return "APPROVAL_GRANTED"
+		}
+		return "APPROVAL_DENIED"
+	case "taint_latched":
+		if reason, _ := fields["reason"].(string); reason != "" {
+			return auditText(reason, 128)
+		}
+		return "TAINT"
+	default:
+		reason := strings.ToUpper(kind)
+		if reason == "" {
+			reason = "EVENT"
+		}
+		return auditText(reason, 128)
+	}
+}
+
+func auditText(s string, max int) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r > 32 && r < 127 && r != '"' && r != '\\' {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('_')
+		}
+	}
+	out := b.String()
+	if len(out) > max {
+		out = out[:max]
+	}
+	return out
 }
 
 func alert(format string, a ...any) {
