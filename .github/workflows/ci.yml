@@ -62,7 +62,10 @@ jobs:
           rc=$?
           cat /tmp/make-check.log
           if [ "$rc" -ne 0 ]; then
-            tail -25 /tmp/make-check.log | while IFS= read -r line; do
+            {
+              grep -n -E "FAIL|Traceback|make: \\*\\*\\*|Error|error:" /tmp/make-check.log || true
+              tail -25 /tmp/make-check.log
+            } | while IFS= read -r line; do
               echo "::error::$line"
             done
           fi
