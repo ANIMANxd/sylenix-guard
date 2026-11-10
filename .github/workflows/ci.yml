@@ -52,4 +52,5 @@ jobs:
             chmod +x "$HOME/.local/bin/python3"
             export PATH="$HOME/.local/bin:$PATH"
           fi
-          make check
+          make --version
+          make SHELL="$(command -v bash)" check
