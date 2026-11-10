@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Regression probes for agent-instruction and persistence targets.
 
 Every path is first written before taint (it must stay allowed), then the same

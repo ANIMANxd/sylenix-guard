@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Regression probes for Ed25519 policy and pin signing.
 
 Covers key generation, detached policy signatures, fail-closed startup on an

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Replay a recorded normal session through the guard and count approvals.
 
 The fixture names the server package (so the built-in profile is selected

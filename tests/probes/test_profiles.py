@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Built-in policy profile probes.
 
 For each shipped profile: select it automatically from the server command /

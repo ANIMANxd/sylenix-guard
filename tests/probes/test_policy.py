@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Regression probes for the versioned policy file.
 
 Covers the strict loader, the three policy sources (flag, state-dir, built-in),

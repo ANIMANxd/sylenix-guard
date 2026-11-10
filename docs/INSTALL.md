@@ -98,6 +98,12 @@ file, or prints command arguments or environment values. See
 
 ## Release artifacts and verification
 
+Release artifacts are published from **v0.1.0** onward. There is no published
+release at this commit; until v0.1.0 exists, use the source build in the
+[README](../README.md#build-from-source-and-manual-setup). The
+artifact names, checksums, signatures and manifests below describe what a
+release will contain.
+
 Releases are built by GitHub Actions with GoReleaser only for tags matching
 `vX.Y.Z`. The workflow runs `make check` and the protocol self-test before the
 release job starts.

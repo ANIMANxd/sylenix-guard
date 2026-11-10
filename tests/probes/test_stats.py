@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Probes for `sylenix-guard stats`.
 
 The exact fixture check keeps the Go summary identical to

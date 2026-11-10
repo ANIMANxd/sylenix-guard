@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Manual check of the approval dialog. Run it on a machine with a screen:
 
     python demo/manual_dialog_test.py

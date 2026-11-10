@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Install/uninstall round-trip tests for supported MCP client configs.
 
 The test runs the built Guard binary in a temporary HOME/APPDATA/XDG tree and a

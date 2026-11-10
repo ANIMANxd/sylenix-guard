@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Regression probes for `sylenix-guard doctor`.
 
 Covers a clean setup and one case for every doctor finding:

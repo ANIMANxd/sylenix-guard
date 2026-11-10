@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+
 """Count canary leaks by channel for harness or sweep output directories.
 
     python scripts/rescore_leaks.py results-qwen results-qwen-write sweep-A-guarded

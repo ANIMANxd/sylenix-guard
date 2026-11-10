@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+
 """Summarize a sylenix-guard audit log (JSON lines).
 
     python3 scripts/summarize_audit.py --name filesystem

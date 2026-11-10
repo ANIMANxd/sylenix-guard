@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Measure what the guard does to a real agent.
 
 For each task, in each mode (direct, guarded), run the agent N times against

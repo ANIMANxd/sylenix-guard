@@ -1,4 +1,4 @@
-.PHONY: build fmt vet selftest probe-test proxy-test signing-test profile-test replay-test summary-test doctor-test clear-taint-test stats-test team-test check harness-scripted gif
+.PHONY: build fmt spdx-check vet selftest probe-test proxy-test signing-test profile-test replay-test summary-test doctor-test clear-taint-test stats-test team-test check harness-scripted gif
 
 build:
 	CGO_ENABLED=0 go build -o bin/sylenix-guard ./cmd/sylenix-guard
@@ -10,6 +10,12 @@ endif
 
 fmt:
 	@test -z "$$(gofmt -l cmd teams demo)" || (echo "gofmt needed for:"; gofmt -l cmd teams demo; exit 1)
+
+spdx-check:
+	@missing=$$(find cmd teams demo scripts tests -type f \( -name '*.go' -o -name '*.py' \) -exec grep -L 'SPDX-License-Identifier: Apache-2.0' {} +); \
+	if [ -n "$$missing" ]; then \
+		echo "SPDX header missing from:"; echo "$$missing"; exit 1; \
+	fi
 
 vet:
 	CGO_ENABLED=0 go vet ./...
@@ -49,10 +55,12 @@ clear-taint-test: build
 stats-test: build
 	python3 tests/probes/test_stats.py
 
+# CGO_ENABLED=0 keeps the test binaries internally linked. cgo external linking
+# on newer macOS SDKs produced dyld "missing LC_UUID" failures for these tests.
 team-test: build
-	go test ./teams/... -count=1
+	CGO_ENABLED=0 go test ./teams/... -count=1
 
-check: fmt vet selftest probe-test proxy-test signing-test profile-test replay-test summary-test doctor-test clear-taint-test stats-test team-test
+check: fmt spdx-check vet selftest probe-test proxy-test signing-test profile-test replay-test summary-test doctor-test clear-taint-test stats-test team-test
 
 harness-scripted: build
 	.venv/bin/python demo/harness.py --agent scripted --runs 3 --out results-scripted

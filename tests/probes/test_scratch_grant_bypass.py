@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Regression probes for the scratch and grant fast-path bypasses.
 
 Each probe first taints the session by reading a ticket, then makes a sink call

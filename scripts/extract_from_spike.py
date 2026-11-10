@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+
 """Write the files embedded in section 8 of POC_SPIKE.md to disk, verbatim.
 
 Run once from the repository root. It refuses to overwrite existing files unless

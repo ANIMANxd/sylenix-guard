@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Minimal Streamable HTTP MCP server for the Guard proxy probes.
 
 It is deliberately not an MCP SDK server: the proxy tests need to control

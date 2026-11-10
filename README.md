@@ -21,25 +21,39 @@ need manual `proxy` mode; see [`docs/INSTALL.md`](docs/INSTALL.md).
 
 ### 1. Install
 
-macOS (Homebrew):
+Homebrew and Scoop installs are available from **v0.1.0**.
+
+macOS (Homebrew, from v0.1.0):
 
 ```bash
 brew tap ANIMANxd/tap
 brew install ANIMANxd/tap/sylenix-guard
 ```
 
-Windows (Scoop):
+Windows (Scoop, from v0.1.0):
 
 ```powershell
 scoop bucket add sylenix https://github.com/ANIMANxd/scoop-bucket
 scoop install sylenix/sylenix-guard
 ```
 
-Or install the binary from the
-[latest release](https://github.com/ANIMANxd/sylenix-guard/releases/latest):
+Release binaries are also available from v0.1.0 on the
+[releases page](https://github.com/ANIMANxd/sylenix-guard/releases). Until that
+release is published, build from source with Go 1.22+:
 
 ```bash
-# macOS/Linux: download the archive for your OS/architecture, then:
+git clone https://github.com/ANIMANxd/sylenix-guard.git
+cd sylenix-guard
+make build
+# macOS/Linux: bin/sylenix-guard
+# Windows: bin\sylenix-guard.exe
+```
+
+Once the v0.1.0 archives exist, download the matching archive and put the
+binary on `PATH`:
+
+```bash
+# macOS/Linux
 tar -xzf sylenix-guard_*.tar.gz
 mkdir -p ~/.local/bin
 install -m 0755 sylenix-guard ~/.local/bin/sylenix-guard
@@ -47,7 +61,7 @@ export PATH="$HOME/.local/bin:$PATH"
 ```
 
 ```powershell
-# Windows: download sylenix-guard_*_windows_amd64.zip, then:
+# Windows
 $zip = Get-ChildItem .\sylenix-guard_*_windows_amd64.zip | Select-Object -First 1
 Expand-Archive $zip.FullName -DestinationPath $env:LOCALAPPDATA\sylenix-guard -Force
 $env:Path += ";$env:LOCALAPPDATA\sylenix-guard"
@@ -108,6 +122,10 @@ From the [November 2026 evaluation](results/2026-11-launch.md) on one model
 | Unguarded harness attacks that leaked | **10 / 20** |
 | Guarded harness attacks that leaked | **0 / 20** |
 | Outside ten-probe set blocked | **20 / 20** |
+
+These numbers were measured at commit `7305895` (Guard `0.1.0`). Current HEAD
+contains later feature work, so treat them as the recorded evaluation result,
+not a measurement of every later commit.
 
 Every number above comes from
 [`results/2026-11-launch.md`](results/2026-11-launch.md), which links each claim
@@ -239,13 +257,13 @@ CGO_ENABLED=0 go build -o bin/sylenix-guard ./cmd/sylenix-guard
 CGO_ENABLED=0 go build -o bin/sylenix-guard.exe ./cmd/sylenix-guard
 ```
 
-`make check` runs gofmt, go vet, the protocol self-test, the stdio, Streamable HTTP and
-signing probe suites, the built-in profile tests, the prompt-cost replay, the audit
-summarizer fixture, the doctor probes, the clear-taint probes, the stats probes and the
-team policy integration tests.
+`make check` runs gofmt, the SPDX header check, go vet, the protocol self-test, the
+stdio, Streamable HTTP and signing probe suites, the built-in profile tests, the
+prompt-cost replay, the audit summarizer fixture, the doctor probes, the clear-taint
+probes, the stats probes and the team policy integration tests.
 On Windows, `make check` needs a POSIX shell (Git Bash or WSL). Without one, run the
-same steps directly: `gofmt -l cmd teams demo`, `go vet ./...`, `python demo/selftest.py`,
-and `go test ./teams/...`.
+same steps directly: `gofmt -l cmd teams demo`, `make spdx-check`, `go vet ./...`,
+`python demo/selftest.py`, and `CGO_ENABLED=0 go test ./teams/...`.
 
 ### Wrap a server
 

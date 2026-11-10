@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """A small but real MCP server (official Python SDK) used by the harness.
 
 Four tools and a workspace directory. Nothing here touches the network:

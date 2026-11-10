@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Protocol self-test for sylenix-guard. Needs only Python 3 and the built binary.
 
     python demo/selftest.py            # expects ./bin/sylenix-guard

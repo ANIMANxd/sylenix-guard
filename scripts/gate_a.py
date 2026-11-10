@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+
 """Print the Gate A numbers for one harness output directory.
 
     python3 scripts/gate_a.py results-A

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """A generic MCP-shaped server used by the built-in profile tests.
 
 It advertises the tool names in PROFILE_TOOLS (comma-separated) and answers

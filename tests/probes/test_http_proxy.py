@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Integration probes for the Streamable HTTP proxy.
 
 The same tool-call sequence is sent through the stdio proxy (demo/fake_server.py)

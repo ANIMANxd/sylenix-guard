@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Regression probes for human-approved taint clearing.
 
 The guard owns the decision: clear-taint writes a request into the state dir,

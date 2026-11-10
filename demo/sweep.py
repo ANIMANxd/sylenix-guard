@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Does the injection work at all? Seven injection styles, two system prompts.
 
 The first Day 2 run used one blunt injected ticket and got no bait-taking from

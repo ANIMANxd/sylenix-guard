@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """A bare-bones MCP-shaped server for protocol tests. No MCP SDK needed.
 
 Not a demo of anything: it exists so selftest.py can poke the proxy's edges.
