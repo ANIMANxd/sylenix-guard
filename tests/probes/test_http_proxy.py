@@ -316,6 +316,21 @@ class StdioClient:
             self.proc.kill()
 
 
+def raw_post(port, body, headers):
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    try:
+        conn.request("POST", "/mcp", body=body, headers=headers)
+        resp = conn.getresponse()
+        data = resp.read()
+        return resp.status, (json.loads(data.decode("utf-8")) if data else None)
+    finally:
+        conn.close()
+
+
+def origin_rule(body):
+    return ((body or {}).get("error") or {}).get("data", {}).get("rule")
+
+
 def outcome(body):
     if not isinstance(body, dict):
         return ("missing",)
@@ -348,6 +363,56 @@ def read_state_text(root):
             except OSError:
                 pass
     return "\n".join(chunks)
+
+
+def test_origin_and_host():
+    print("Origin and Host checks")
+    with tempfile.TemporaryDirectory() as state_dir:
+        fake = FakeHTTPMCP()
+        proc = None
+        try:
+            proc, port = start_proxy(state_dir, f"http://127.0.0.1:{fake.port}/mcp")
+            body = json.dumps({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": {"name": "origin-probe", "version": "0"},
+                },
+            }, separators=(",", ":"))
+            base = {"Content-Type": "application/json",
+                    "Accept": "application/json, text/event-stream"}
+
+            status, resp = raw_post(port, body, {
+                **base,
+                "Host": f"evil.example:{port}",
+                "Origin": f"http://evil.example:{port}",
+            })
+            check("Origin evil + Host evil returns 403", status == 403, f"status={status}")
+            check("Origin evil + Host evil names ORIGIN_FORBIDDEN",
+                  origin_rule(resp) == "ORIGIN_FORBIDDEN", str(resp)[:160])
+
+            status, resp = raw_post(port, body, {
+                **base,
+                "Host": "evil.example",
+            })
+            check("no Origin + Host evil returns 403", status == 403, f"status={status}")
+            check("no Origin + Host evil names ORIGIN_FORBIDDEN",
+                  origin_rule(resp) == "ORIGIN_FORBIDDEN", str(resp)[:160])
+
+            status, resp = raw_post(port, body, {
+                **base,
+                "Host": f"127.0.0.1:{port}",
+                "Origin": f"http://localhost:{port}",
+            })
+            check("localhost Origin + 127.0.0.1 Host is allowed",
+                  status == 200 and isinstance(resp, dict) and "result" in resp,
+                  f"status={status} body={str(resp)[:160]}")
+        finally:
+            stop_process(proc)
+            fake.close()
 
 
 def test_parity_and_transport():
@@ -499,6 +564,7 @@ def main():
     if not os.path.exists(GUARD):
         sys.exit("build first: CGO_ENABLED=0 go build -o bin/sylenix-guard ./cmd/sylenix-guard")
     t0 = time.time()
+    test_origin_and_host()
     test_parity_and_transport()
     test_sse_post_and_notification()
     test_sse_get()

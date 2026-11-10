@@ -1,5 +1,30 @@
 # Changelog
 
+## 2026-11-10
+
+### Protected targets and proxy Host validation
+
+- Extended the built-in protected-target table with agent config directories
+  (`.claude`, `.codex`, `.gemini`, `.continue`), `.ssh`, fish and desktop
+  autostart config, `.gitconfig`/`.git/config`, zsh/bash login files,
+  package-manager credentials (`.npmrc`, `.pypirc`, `.netrc`) and Guard's own
+  `.sylenix-poc`/`.sylenix-keys` state. The active `--state-dir` is resolved at
+  startup and protected as well. These targets are `SENSITIVE_TARGET` after
+  taint and are never covered by `--allow-write-under` or `--grant`; a scratch
+  root inside the state directory is therefore protected too.
+- Hardened the Streamable HTTP proxy's `Origin` check: the request `Host` must
+  be `127.0.0.1`, `localhost`, `::1` or the exact `--listen` host/port.
+  Requests with any other `Host` now get `403` with `ORIGIN_FORBIDDEN`.
+- Added protected-target categories and a configured state-dir probe to
+  `tests/probes/test_protected_targets.py`, and Origin/Host cases to
+  `tests/probes/test_http_proxy.py`. Tightened the expected rule for `.ssh`
+  paths in `test_scratch_grant_bypass.py` from `TAINT_SINK` to the stricter
+  `SENSITIVE_TARGET`, and separated test state directories from scratch roots
+  in the affected fixtures.
+- Updated README evidence with the November 2026 launch numbers and the
+  `results/2026-11-launch.md` link; updated the README, `POC_SPIKE.md` and
+  `docs/ARCHITECTURE.md` protected-target and proxy Host descriptions.
+
 ## 2026-11-09
 
 ### Policy and pin signing

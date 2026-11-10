@@ -138,7 +138,7 @@ def probes(out):
         ("drive-relative path under an unknown key",
          {"path": os.path.join(out, "ok.md"), "extra": "C:escape.txt"}, "TAINT_SINK"),
         ("home-relative ssh path under an unknown key",
-         {"path": os.path.join(out, "ok.md"), "extra": "~/.ssh/authorized_keys"}, "TAINT_SINK"),
+         {"path": os.path.join(out, "ok.md"), "extra": "~/.ssh/authorized_keys"}, "SENSITIVE_TARGET"),
         ("home-relative aws path under an unknown key",
          {"path": os.path.join(out, "ok.md"), "extra": "~/.aws/credentials"}, "TAINT_SINK"),
         ("hostname under an unknown key",
@@ -187,25 +187,25 @@ def run_controls(s, out, mode):
           "result" not in r and rule(r) == "EGRESS_TARGET", f"rule={rule(r)}")
 
     r = s.call("write_file", {"path": os.path.join(out, "ok.md"), "extra": ".ssh"})
-    check(f"{mode}: hidden directory name under an unknown key is blocked",
-          "result" not in r and rule(r) == "TAINT_SINK", f"rule={rule(r)}")
+    check(f"{mode}: protected hidden directory name under an unknown key is blocked",
+          "result" not in r and rule(r) == "SENSITIVE_TARGET", f"rule={rule(r)}")
 
     r = s.call("write_file", {"path": os.path.join(out, "ok.md"),
                               "destination": os.path.join(os.path.dirname(out), "escape.md")})
     check(f"{mode}: outside path under a known path key is blocked",
           "result" not in r and rule(r) == "TAINT_SINK", f"rule={rule(r)}")
 
-    for label, args in (
-        ("parent traversal in a path key", {"path": os.path.join("..", "escape.md")}),
-        ("home-relative path key", {"path": "~/.ssh/authorized_keys"}),
-        ("environment-expanded path key", {"path": "$HOME/.ssh/authorized_keys"}),
-        ("embedded environment path key", {"path": os.path.join(out, "$HOME", "escape.md")}),
-        ("percent-encoded path key", {"path": os.path.join(out, "%2e%2e", "escape.md")}),
-        ("drive-relative path key", {"path": "C:escape.txt"}),
+    for label, args, want in (
+        ("parent traversal in a path key", {"path": os.path.join("..", "escape.md")}, "TAINT_SINK"),
+        ("home-relative path key", {"path": "~/.ssh/authorized_keys"}, "SENSITIVE_TARGET"),
+        ("environment-expanded path key", {"path": "$HOME/.ssh/authorized_keys"}, "SENSITIVE_TARGET"),
+        ("embedded environment path key", {"path": os.path.join(out, "$HOME", "escape.md")}, "TAINT_SINK"),
+        ("percent-encoded path key", {"path": os.path.join(out, "%2e%2e", "escape.md")}, "TAINT_SINK"),
+        ("drive-relative path key", {"path": "C:escape.txt"}, "TAINT_SINK"),
     ):
         r = s.call("write_file", args)
         check(f"{mode}: {label} is blocked",
-              "result" not in r and rule(r) == "TAINT_SINK", f"rule={rule(r)}")
+              "result" not in r and rule(r) == want, f"rule={rule(r)}")
 
     r = s.call("write_file", {"path": os.path.join(out, ".e\u200bnv")})
     check(f"{mode}: zero-width hidden sensitive path is blocked",
@@ -276,10 +276,11 @@ def main():
     if not os.path.exists(GUARD):
         sys.exit("build first: CGO_ENABLED=0 go build -o bin/sylenix-guard ./cmd/sylenix-guard")
     with tempfile.TemporaryDirectory() as d:
+        state = os.path.join(d, "state")
         out = os.path.join(d, "out")
         os.mkdir(out)
 
-        s = Session(d, flags=("--allow-write-under", out))
+        s = Session(state, flags=("--allow-write-under", out))
         s.start()
         s.call("read_ticket")
         print("--allow-write-under")
@@ -289,7 +290,7 @@ def main():
         run_symlink_escape(s, out, "scratch")
         check("scratch: clean exit", s.close() == 0)
 
-        s = Session(d, flags=("--grant", "write_file:" + out + "=5m"))
+        s = Session(state, flags=("--grant", "write_file:" + out + "=5m"))
         s.start()
         s.call("read_ticket")
         print("--grant (scoped)")
@@ -299,7 +300,7 @@ def main():
         run_symlink_escape(s, out, "grant")
         check("grant: clean exit", s.close() == 0)
 
-        s = Session(d, flags=("--grant", "write_file=5m"))
+        s = Session(state, flags=("--grant", "write_file=5m"))
         s.start()
         s.call("read_ticket")
         print("--grant (tool-wide)")

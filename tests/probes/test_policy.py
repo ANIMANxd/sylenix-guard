@@ -228,6 +228,7 @@ allowlist:
 def case_classes_and_paths():
     print("per-tool classes, allow_paths, path_keys and unknown tools")
     with tempfile.TemporaryDirectory() as d:
+        state = os.path.join(d, "state")
         out = os.path.join(d, "out")
         os.mkdir(out)
         policy = os.path.join(d, "policy.yaml")
@@ -250,7 +251,7 @@ servers:
       big:
         class: exec
 """)
-        s = Session(d, flags=("--policy", policy), name="p")
+        s = Session(state, flags=("--policy", policy), name="p")
         s.start()
         s.call("read_ticket")
         r = s.call("read_ticket")
@@ -272,7 +273,7 @@ servers:
         check("unknown tool defaults to exec", rule(r) == "TAINT_SINK", str(r)[:120])
         code = s.close()
         check("policy session exits cleanly", code == 0, str(code))
-        audit = open(os.path.join(d, "audit-p.jsonl"), encoding="utf-8").read()
+        audit = open(os.path.join(state, "audit-p.jsonl"), encoding="utf-8").read()
         check("audit records policy_loaded", "policy_loaded" in audit)
         check("audit holds no argument values", "secret.txt" not in audit and "ok.md" not in audit)
 
@@ -322,6 +323,7 @@ servers:
 def case_flag_precedence():
     print("explicit flags override the policy file")
     with tempfile.TemporaryDirectory() as d:
+        state = os.path.join(d, "state")
         out1 = os.path.join(d, "policy-out")
         out2 = os.path.join(d, "flag-out")
         os.mkdir(out1)
@@ -338,9 +340,9 @@ servers:
         class: write
         allow_paths: [{q(out1)}]
 """)
-        s = Session(d, flags=("--policy", policy, "--readonly", "other",
-                              "--approve", "deny", "--allow-write-under", out2,
-                              "--trust", "big", "--no-spotlight"), name="f")
+        s = Session(state, flags=("--policy", policy, "--readonly", "other",
+                                "--approve", "deny", "--allow-write-under", out2,
+                                "--trust", "big", "--no-spotlight"), name="f")
         s.start()
         first = s.call("read_ticket")
         check("--no-spotlight overrides policy spotlight",
@@ -465,6 +467,7 @@ servers:
 def case_trust_and_spotlight():
     print("policy trust and spotlight")
     with tempfile.TemporaryDirectory() as d:
+        state = os.path.join(d, "state")
         out = os.path.join(d, "out")
         os.mkdir(out)
         policy = os.path.join(d, "policy.yaml")
@@ -480,7 +483,7 @@ servers:
         class: write
         allow_paths: [{q(out)}]
 """)
-        s = Session(d, flags=("--policy", policy), name="s")
+        s = Session(state, flags=("--policy", policy), name="s")
         s.start()
         r = s.call("read_ticket")
         text = r["result"]["content"][0]["text"]

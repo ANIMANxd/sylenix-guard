@@ -401,10 +401,12 @@ def case_server_request_taint():
 def case_scratch_writes():
     print("--allow-write-under: tainted writes inside a scratch root")
     with tempfile.TemporaryDirectory() as d:
+        state = os.path.join(d, "state")
         out = os.path.join(d, "out")
+        os.mkdir(state)
         os.mkdir(out)
         log = os.path.join(d, "calls.log")
-        s = Session(d, extra_flags=("--allow-write-under", out), env={"FAKE_CALL_LOG": log})
+        s = Session(state, extra_flags=("--allow-write-under", out), env={"FAKE_CALL_LOG": log})
         s.start()
         s.call("read_ticket")  # taint the session
         r = s.call("write_file", {"path": os.path.join(out, "ok.md")})
@@ -441,9 +443,11 @@ def case_scratch_writes():
         check("other tainted writes still get TAINT_SINK", rule(r) == "TAINT_SINK", str(r))
         s.close()
     with tempfile.TemporaryDirectory() as d:  # TOOL=DIR scopes the fast path
+        state = os.path.join(d, "state")
         out = os.path.join(d, "out")
+        os.mkdir(state)
         os.mkdir(out)
-        s = Session(d, extra_flags=("--allow-write-under", "write_file=" + out))
+        s = Session(state, extra_flags=("--allow-write-under", "write_file=" + out))
         s.start()
         s.call("read_ticket")
         r = s.call("write_file", {"path": os.path.join(out, "ok.md")})
@@ -456,9 +460,11 @@ def case_scratch_writes():
 def case_grants():
     print("time-bounded grants")
     with tempfile.TemporaryDirectory() as d:
+        state = os.path.join(d, "state")
         out = os.path.join(d, "out")
+        os.mkdir(state)
         os.mkdir(out)
-        s = Session(d, extra_flags=("--grant", "write_file:" + out + "=2s"))
+        s = Session(state, extra_flags=("--grant", "write_file:" + out + "=2s"))
         s.start()
         s.call("read_ticket")
         r = s.call("write_file", {"path": os.path.join(out, "a.md")})

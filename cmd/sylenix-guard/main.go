@@ -170,6 +170,8 @@ type Guard struct {
 	spotlight bool
 	scratch   []scratchRule // --allow-write-under or policy allow_paths, fixed after startup
 
+	protectedDirs []string // resolved Guard state/key directories, protected like the built-in table
+
 	classes           map[string]string          // policy class for non-read tools
 	toolPathKeys      map[string]map[string]bool // per-tool extra path argument keys
 	egressAllow       map[string]bool            // policy host allowlist
@@ -504,6 +506,28 @@ func prepareGuard(opts guardOptions) (*Guard, error) {
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
 		return nil, err
 	}
+	stateDirAbs, err := filepath.Abs(stateDir)
+	if err != nil {
+		return nil, fmt.Errorf("cannot resolve state directory: %w", err)
+	}
+	stateDirReal, err := filepath.EvalSymlinks(stateDirAbs)
+	if err != nil {
+		return nil, fmt.Errorf("cannot resolve state directory: %w", err)
+	}
+	// Protect the state directory actually in use, plus the default state and
+	// key directories when they exist as symlinks. The built-in table covers
+	// the literal names; this covers custom --state-dir paths and symlinks.
+	protectedDirs := []string{filepath.Clean(stateDirReal)}
+	if home, err := os.UserHomeDir(); err == nil {
+		for _, dir := range []string{
+			filepath.Join(home, ".sylenix-poc"),
+			filepath.Join(home, ".sylenix-keys"),
+		} {
+			if real, err := filepath.EvalSymlinks(dir); err == nil {
+				protectedDirs = append(protectedDirs, filepath.Clean(real))
+			}
+		}
+	}
 	logf, err := os.OpenFile(filepath.Join(stateDir, "audit-"+name+".jsonl"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		return nil, err
@@ -516,18 +540,19 @@ func prepareGuard(opts guardOptions) (*Guard, error) {
 	}
 
 	g := &Guard{
-		name:        name,
-		stateDir:    stateDir,
-		approve:     "deny",
-		spotlight:   true,
-		pending:     map[string]pendingReq{},
-		pins:        map[string]string{},
-		quarantined: map[string]string{},
-		grants:      seeded,
-		out:         os.Stdout,
-		log:         logf,
-		verifyKey:   verifyKey,
-		signKey:     signKey,
+		name:          name,
+		stateDir:      stateDir,
+		protectedDirs: protectedDirs,
+		approve:       "deny",
+		spotlight:     true,
+		pending:       map[string]pendingReq{},
+		pins:          map[string]string{},
+		quarantined:   map[string]string{},
+		grants:        seeded,
+		out:           os.Stdout,
+		log:           logf,
+		verifyKey:     verifyKey,
+		signKey:       signKey,
 	}
 	pf, source, resolvedPath, err := loadPolicyForRun(opts.PolicyPath, visited["policy"], stateDir, name, nameExplicit, g.verifyKey)
 	if err != nil {
@@ -600,6 +625,7 @@ type proxyHandler struct {
 	g        *Guard
 	upstream *url.URL
 	client   *http.Client
+	listen   string // normalized --listen address, accepted as an exact Host value
 }
 
 var hopHeaders = map[string]bool{
@@ -715,7 +741,7 @@ func runProxyCommand(args []string) int {
 		"grants":            []string(vals.GrantSpecs),
 	})
 
-	handler := &proxyHandler{g: g, upstream: upstream, client: newProxyClient()}
+	handler := &proxyHandler{g: g, upstream: upstream, client: newProxyClient(), listen: listenAddr}
 	srv := &http.Server{
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
@@ -820,7 +846,7 @@ func newProxyClient() *http.Client {
 }
 
 func (p *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if !originAllowed(r) {
+	if !originAllowed(r, p.listen) {
 		writeMCPError(w, http.StatusForbidden, nil, -32600, "Forbidden", "ORIGIN_FORBIDDEN", r.Header.Get("Mcp-Session-Id"))
 		return
 	}
@@ -840,7 +866,13 @@ func (p *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func originAllowed(r *http.Request) bool {
+func originAllowed(r *http.Request, listen string) bool {
+	// The Host header must name this listener. A browser or a rebinding
+	// attacker can set Origin freely, so the Host check is the part that
+	// binds the request to the address the operator actually asked for.
+	if !hostHeaderAllowed(r.Host, listen) {
+		return false
+	}
 	origin := strings.TrimSpace(r.Header.Get("Origin"))
 	if origin == "" {
 		return true
@@ -850,10 +882,33 @@ func originAllowed(r *http.Request) bool {
 		return false
 	}
 	host := strings.ToLower(u.Hostname())
-	if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+	if isLoopbackHost(host) {
 		return true
 	}
 	return host == strings.ToLower(stripHostPort(r.Host))
+}
+
+func isLoopbackHost(host string) bool {
+	host = strings.ToLower(host)
+	return host == "localhost" || host == "127.0.0.1" || host == "::1"
+}
+
+func hostHeaderAllowed(h, listen string) bool {
+	h = strings.TrimSpace(h)
+	host := strings.ToLower(stripHostPort(h))
+	if isLoopbackHost(host) {
+		return true
+	}
+	if listen == "" {
+		return false
+	}
+	if host != strings.ToLower(stripHostPort(listen)) {
+		return false
+	}
+	// A non-loopback address is accepted only as the exact --listen address.
+	_, reqPort, reqErr := net.SplitHostPort(h)
+	_, listenPort, listenErr := net.SplitHostPort(listen)
+	return reqErr == nil && listenErr == nil && reqPort == listenPort
 }
 
 func stripHostPort(h string) string {
@@ -3980,7 +4035,7 @@ func (g *Guard) fromHost(line []byte) (forward bool, reply []byte) {
 	// first, then protected persistence targets, then grants/scratch, then the
 	// dialog or default deny. A fast path can never reach a hard-blocked or
 	// protected target.
-	scan := scanArgs(p.Arguments, g.toolPathKeys[p.Name])
+	scan := scanArgs(p.Arguments, g.toolPathKeys[p.Name], g.protectedDirs)
 	egressAllowed := false
 	if scan.egress {
 		egressAllowed = len(scan.egressHosts) > 0
@@ -4539,6 +4594,10 @@ var protectedTargets = []protectedTarget{
 	{category: "agent instructions", parts: []string{".cursorrules"}},
 	{category: "agent instructions", parts: []string{".windsurfrules"}},
 	{category: "agent instructions", parts: []string{".cursor", "rules"}, subtree: true},
+	{category: "agent instructions", parts: []string{".claude"}, subtree: true},
+	{category: "agent instructions", parts: []string{".codex"}, subtree: true},
+	{category: "agent instructions", parts: []string{".gemini"}, subtree: true},
+	{category: "agent instructions", parts: []string{".continue"}, subtree: true},
 
 	{category: "mcp and editor config", parts: []string{".mcp.json"}},
 	{category: "mcp and editor config", parts: []string{"mcp.json"}},
@@ -4551,10 +4610,23 @@ var protectedTargets = []protectedTarget{
 	{category: "ci and hooks", parts: []string{".git", "hooks"}, subtree: true},
 	{category: "ci and hooks", parts: []string{".husky"}, subtree: true},
 
+	{category: "git config", parts: []string{".gitconfig"}},
+	{category: "git config", parts: []string{".git", "config"}},
+
+	{category: "credentials", parts: []string{".ssh"}, subtree: true},
+	{category: "credentials", parts: []string{".npmrc"}},
+	{category: "credentials", parts: []string{".pypirc"}},
+	{category: "credentials", parts: []string{".netrc"}},
+
 	{category: "shell startup", parts: []string{".bashrc"}},
 	{category: "shell startup", parts: []string{".zshrc"}},
 	{category: "shell startup", parts: []string{".profile"}},
 	{category: "shell startup", parts: []string{".bash_profile"}},
+	{category: "shell startup", parts: []string{".bash_login"}},
+	{category: "shell startup", parts: []string{".zshenv"}},
+	{category: "shell startup", parts: []string{".zprofile"}},
+	{category: "shell startup", parts: []string{".zlogin"}},
+	{category: "shell startup", parts: []string{".config", "fish"}, subtree: true},
 	{category: "shell startup", parts: []string{"Microsoft.PowerShell_profile.ps1"}},
 	{category: "shell startup", parts: []string{"Microsoft.PowerShellISE_profile.ps1"}},
 	{category: "shell startup", parts: []string{"Microsoft.VSCode_profile.ps1"}},
@@ -4582,6 +4654,11 @@ var protectedTargets = []protectedTarget{
 
 	{category: "windows startup", parts: []string{"Start Menu", "Programs", "Startup"}, subtree: true},
 	{category: "windows startup", parts: []string{"Startup"}, subtree: true},
+
+	{category: "desktop autostart", parts: []string{".config", "autostart"}, subtree: true},
+
+	{category: "guard state", parts: []string{".sylenix-poc"}, subtree: true},
+	{category: "guard state", parts: []string{".sylenix-keys"}, subtree: true},
 }
 
 var keyNormalizer = strings.NewReplacer("_", "", "-", "")
@@ -4648,11 +4725,40 @@ func protectedTargetPath(p string) bool {
 	return protectedCanonicalPath(filepath.Clean(strings.ReplaceAll(p, `\`, "/")))
 }
 
+// protectedCanonicalPathWithDirs adds Guard's resolved state/key directories
+// to the compiled-in table. The active --state-dir can have any name, so it
+// cannot be a static entry; resolving it also catches a symlinked directory.
+func protectedCanonicalPathWithDirs(p string, extraDirs []string) bool {
+	if protectedCanonicalPath(p) {
+		return true
+	}
+	for _, dir := range extraDirs {
+		if dir != "" && insideDir(dir, p) {
+			return true
+		}
+	}
+	return false
+}
+
+func protectedTargetPathWithDirs(p string, extraDirs []string) bool {
+	if canonical, ok := canonicalPath(p); ok {
+		return protectedCanonicalPathWithDirs(canonical, extraDirs)
+	}
+	// Even when a host would expand an environment variable or the path is
+	// otherwise unresolvable, an obvious protected shape must not be missed.
+	// The path itself is still refused by the normal canonicalisation rules.
+	return protectedCanonicalPathWithDirs(filepath.Clean(strings.ReplaceAll(p, `\`, "/")), extraDirs)
+}
+
+func (g *Guard) protectedCanonicalPath(p string) bool {
+	return protectedCanonicalPathWithDirs(p, g.protectedDirs)
+}
+
 // protectedCall also checks relative names against the approved roots, so a
 // symlink inside a scratch or grant directory cannot hide a protected target.
 func (g *Guard) protectedCall(tool string, paths []string) bool {
 	for _, p := range paths {
-		if protectedTargetPath(p) {
+		if protectedTargetPathWithDirs(p, g.protectedDirs) {
 			return true
 		}
 		if isExplicitlyRooted(p) {
@@ -4662,7 +4768,7 @@ func (g *Guard) protectedCall(tool string, paths []string) bool {
 			if rule.tool != "" && rule.tool != tool {
 				continue
 			}
-			if canonical, ok := canonicalPath(rule.dir + string(os.PathSeparator) + p); ok && protectedCanonicalPath(canonical) {
+			if canonical, ok := canonicalPath(rule.dir + string(os.PathSeparator) + p); ok && g.protectedCanonicalPath(canonical) {
 				return true
 			}
 		}
@@ -4673,7 +4779,7 @@ func (g *Guard) protectedCall(tool string, paths []string) bool {
 			if gr.tool != tool || gr.dir == "" {
 				continue
 			}
-			if canonical, ok := canonicalPath(gr.dir + string(os.PathSeparator) + p); ok && protectedCanonicalPath(canonical) {
+			if canonical, ok := canonicalPath(gr.dir + string(os.PathSeparator) + p); ok && g.protectedCanonicalPath(canonical) {
 				return true
 			}
 		}
@@ -4697,8 +4803,9 @@ type callScan struct {
 // scanArgs classifies every string inside a call's arguments. Paths are drawn
 // only from known path keys: a filename-shaped value under an unknown key is
 // not a path we can safely compare, so it disqualifies the fast paths instead.
-// extraPathKeys are the per-tool path_keys from the policy file.
-func scanArgs(args map[string]any, extraPathKeys map[string]bool) callScan {
+// extraPathKeys are the per-tool path_keys from the policy file. extraDirs are
+// Guard's resolved state/key directories, which are protected like the table.
+func scanArgs(args map[string]any, extraPathKeys map[string]bool, extraDirs []string) callScan {
 	var s callScan
 	var walk func(key string, v any)
 	walk = func(key string, v any) {
@@ -4723,9 +4830,9 @@ func scanArgs(args map[string]any, extraPathKeys map[string]bool) callScan {
 				// turn "link/../x" into a path the server never opens.
 				s.paths = append(s.paths, t)
 				resolved, resolvedOK := canonicalPath(t)
-				protected := resolvedOK && protectedCanonicalPath(resolved)
+				protected := resolvedOK && protectedCanonicalPathWithDirs(resolved, extraDirs)
 				if !protected {
-					protected = protectedTargetPath(t)
+					protected = protectedTargetPathWithDirs(t, extraDirs)
 				}
 				if protected {
 					// Agent-instruction and persistence targets are the one
@@ -4747,7 +4854,7 @@ func scanArgs(args map[string]any, extraPathKeys map[string]bool) callScan {
 				if h := hostFromArgument(t); h != "" {
 					s.egressHosts = append(s.egressHosts, h)
 				}
-			case protectedTargetPath(t):
+			case protectedTargetPathWithDirs(t, extraDirs):
 				s.protected = true
 				if isSensitivePathWithoutGit(t) {
 					s.sensitive = true

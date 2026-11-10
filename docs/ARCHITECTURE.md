@@ -44,10 +44,11 @@ before parsing proxy flags (`:225-244`).
   logs and audit events (`redactURL`, `:795-804`).
 - `POST` carries one JSON-RPC message. `GET` opens the optional server-to-client
   SSE stream. `DELETE` terminates the upstream session. `OPTIONS` answers
-  locally (`ServeHTTP`, `:822-841`).
-- `Origin` is checked before any request is forwarded. Missing Origin is
-  allowed; loopback origins and the request host are allowed; anything else
-  gets HTTP 403 (`originAllowed`, `:843-864`).
+  locally (`ServeHTTP`, `:848-867`).
+- `Origin` and `Host` are checked before any request is forwarded. The request
+  `Host` must be `127.0.0.1`, `localhost`, `::1` or the exact `--listen` address.
+  Missing Origin is allowed; loopback origins and the request host are allowed;
+  anything else gets HTTP 403 (`originAllowed`, `hostHeaderAllowed`, `:869-912`).
 - Request headers are copied end to end except hop-by-hop headers, `Host`,
   `Content-Length`, `Accept-Encoding`, and `Origin` (`copyRequestHeaders`,
   `:1063-1073`). `Authorization`, `Cookie`, `Mcp-Session-Id`,
@@ -390,13 +391,16 @@ Sensitive matching:
 - `isSensitivePathParts` (`:5021-5054`) checks every path component and the
   basename, normalizes both slash directions, and strips invisible characters
   before matching.
-- Protected agent-instruction and persistence targets are a separate table
-  (`:4535-4585`): `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, Cursor/Windsurf rules,
-  MCP/editor config, CI workflows, `.git/hooks`, shell startup, cron, launchd,
-  systemd user units, and Windows Startup.
-- `protectedTargetPath` / `protectedCall` (`:4627-4681`) also check relative
-  names against scratch roots and grant directories, so a symlink inside an
-  approved root cannot hide a protected target.
+- Protected agent-instruction, credential and persistence targets are a separate
+  table (`:4590-4662`): `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, Cursor/Windsurf
+  rules, `.claude`, `.codex`, `.gemini`, `.continue`, MCP/editor config, CI
+  workflows, `.git/hooks`, `.ssh`, `.gitconfig`/`.git/config`, shell startup,
+  fish, desktop autostart, `.npmrc`/`.pypirc`/`.netrc`, cron, launchd, systemd
+  user units, Windows Startup, and Guard's state/key directories.
+- `protectedTargetPathWithDirs` / `protectedCall` (`:4718-4801`) also check
+  relative names against scratch roots and grant directories, so a symlink inside
+  an approved root cannot hide a protected target; the active `--state-dir` is
+  resolved at startup and added to the table.
 
 Path comparison uses `canonicalPath` (`:5206-5212`), which makes the path
 absolute without cleaning `..` before symlink resolution (`:5093-5135`), then
@@ -629,10 +633,11 @@ scope limits; some are worth fixing.
    replace it. Only the configured `--upstream` sees it.
 7. **The HTTP listener is loopback-only by default, but `--listen` can expose
    it.** `normalizeListenAddr` maps an empty host or `localhost` to
-   `127.0.0.1` (`main.go:753-767`), but an explicit `0.0.0.0` or LAN address is
+   `127.0.0.1` (`main.go:779-799`), but an explicit `0.0.0.0` or LAN address is
    accepted. The listener itself is plain HTTP; use a loopback address or a
-   trusted tunnel/reverse proxy for anything else. Origin checking is not a
-   substitute for authentication (`originAllowed`, `:843-864`).
+   trusted tunnel/reverse proxy for anything else. Origin and Host checking are
+   not a substitute for authentication (`originAllowed`, `hostHeaderAllowed`,
+   `:869-912`).
 8. **Session IDs are passed through, not mapped per client.** A client that
    presents another client's `Mcp-Session-Id` is forwarded with that ID; the
    proxy adds no session isolation of its own (`copyRequestHeaders`,

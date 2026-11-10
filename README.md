@@ -41,13 +41,19 @@ requires authorization that the agent cannot grant itself.
    files, or known config names (`go.mod`, `package.json`, `Makefile`, …) are
    refused with `EGRESS_TARGET` and `SENSITIVE_TARGET`. These cannot be approved
    through a dialog or a grant.
-2. **Protected agent-instruction and persistence files.** Agent instruction files
-   (`AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, Cursor/Windsurf rules), MCP/editor config
-   (`.mcp.json`, `mcp.json`, `claude_desktop_config.json`, `.vscode`, `.idea`), CI
-   and hooks (`.github/workflows`, `.gitlab-ci.yml`, `.git/hooks`, `.husky`), shell
-   startup files, cron, launchd, systemd user units and Windows Startup are
-   `SENSITIVE_TARGET` after taint. They never use a grant or scratch shortcut; with
-   `--approve dialog` they require a human decision.
+2. **Protected agent-instruction, credential and persistence files.** Agent
+   instruction files (`AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, Cursor/Windsurf rules),
+   agent config directories (`.claude`, `.codex`, `.gemini`, `.continue`),
+   MCP/editor config (`.mcp.json`, `mcp.json`, `claude_desktop_config.json`,
+   `.vscode`, `.idea`), CI and hooks (`.github/workflows`, `.gitlab-ci.yml`,
+   `.git/hooks`, `.husky`), shell startup files (including `.zshenv`, `.zprofile`,
+   `.zlogin`, `.bash_login`, fish), `.ssh`, `.gitconfig`/`.git/config`, desktop
+   autostart, package-manager credentials (`.npmrc`, `.pypirc`, `.netrc`), cron,
+   launchd, systemd user units, Windows Startup, and Guard's own state/key
+   directories (including the active `--state-dir`) are `SENSITIVE_TARGET` after
+   taint. They never use a grant or scratch shortcut; with `--approve dialog` they
+   require a human decision, except `.git` paths outside `.git/hooks`, which stay
+   hard-blocked.
 3. **Scratch fast path.** With `--allow-write-under DIR` (or `TOOL=DIR`), calls whose
    every path argument stays inside `DIR` are forwarded without a prompt.
 4. **Authorization.** Everything else is denied (`-32000 TAINT_SINK`), or, with
@@ -184,8 +190,10 @@ transport from 2024-11-05 is not implemented.
 Client `Authorization`, `Cookie`, `Mcp-Session-Id`, `MCP-Protocol-Version` and
 `Last-Event-ID` headers are forwarded to the configured upstream. Guard never
 logs header values, never writes tokens or session IDs to disk, and does not
-follow redirects. It checks `Origin` and rejects non-loopback browser origins.
-The server-command allowlist remains a stdio launch control; it is not applied to
+follow redirects. It checks `Origin` and rejects non-loopback browser origins,
+and requires the request `Host` to be `127.0.0.1`, `localhost`, `::1` or the
+exact `--listen` address; anything else gets `403 ORIGIN_FORBIDDEN`. The
+server-command allowlist remains a stdio launch control; it is not applied to
 `--upstream`.
 
 ### Sign policy and pins
@@ -367,6 +375,10 @@ auth headers. Summaries with prompts-per-active-hour metrics:
   public-key-only team mode.
 - Built-in profiles: `python tests/probes/test_profiles.py` exercises all ten
   profiles, one allowed read and one blocked write/egress each.
+- Protected targets: `python tests/probes/test_protected_targets.py` checks agent
+  config directories, SSH, shell, git, autostart, credential and Guard state/key
+  paths under `--allow-write-under` and `--grant`, including a configured
+  `--state-dir`.
 - Server allowlist: `python tests/probes/test_allowlist.py` checks refusal,
   approval, changed binary/lockfile hashes, `allow` and install pre-population.
 - Doctor: `python tests/probes/test_doctor.py` covers a clean setup, every
@@ -386,12 +398,16 @@ auth headers. Summaries with prompts-per-active-hour metrics:
   tests (the most recent is the null-pin startup bug, AUD-10). AUD-09 is mitigated for
   terminated frames and remains an availability residual on an unterminated oversize
   line; AUD-08 (grandchild processes) is a confirmed, documented limitation.
-- Measurement runs on qwen3.5-9b (local, temperature 0): unshielded, injected content
-  produced exfiltration attempts in 11 of 20 harness runs and 56 of 70 sweep runs.
-  Guarded, 0 secrets left through the tool channel across 110 runs. On
-  gemma-4-31b-it and gemma-4-26b-a4b-it the injection never fired (0 of 20 unshielded
-  runs attempted it), so the pain is model-dependent: the guard is not the variable
-  that decides whether a model obeys.
+- Measurement runs on qwen3.5-9b (local, temperature 0). **October 2026:**
+  unshielded, injected content produced exfiltration attempts in 11 of 20 harness
+  runs and 56 of 70 sweep runs; guarded, 0 secrets left through the tool channel
+  across 110 runs. **November 2026:** unshielded 10 of 20 harness runs and 48 of
+  70 sweep runs; guarded 0 of 110 runs, including 0 of 70 guarded sweep runs in
+  the file-channel rescore. Full results, raw data and limits:
+  [`results/2026-11-launch.md`](results/2026-11-launch.md). On gemma-4-31b-it and
+  gemma-4-26b-a4b-it the injection never fired (0 of 20 unshielded runs attempted
+  it), so the pain is model-dependent: the guard is not the variable that decides
+  whether a model obeys.
 - Policy comparisons (default deny, write-allowed, scratch-directory writes) with raw
   data: [`docs/qwen-guarded-data/`](docs/qwen-guarded-data/),
   [`docs/qwen-scratch-data/`](docs/qwen-scratch-data/),
@@ -436,7 +452,7 @@ bypass, response expectations and safe harbour.
   client, and does not apply the server-command allowlist to `--upstream`.
 - Proxy auth headers are forwarded to the configured upstream and never logged or
   persisted. A `--listen` address other than loopback exposes a plain-HTTP endpoint;
-  Origin checking is not authentication.
+  Origin and Host checking are not authentication.
 - SSE event IDs and `Last-Event-ID` are forwarded, but the proxy keeps no replay
   buffer or persistent stream state. A dropped stream loses in-flight events unless
   the upstream can replay them.
@@ -459,8 +475,9 @@ bypass, response expectations and safe harbour.
 - The scratch policy governs where writes land, not what they write.
 - `--allow-write-under` interprets relative names against the scratch directory; the
   guarantee is literal only for servers that resolve paths the same way. Symlinks are
-  resolved on the deepest existing part of the path. This is a policy layer, not a
-  sandbox.
+  resolved on the deepest existing part of the path. A scratch root inside Guard's
+  state or key directory is protected as well, so use a separate workspace root. This
+  is a policy layer, not a sandbox.
 - Argument classification (path vs. network target vs. content) is a heuristic over
   argument key names and value shapes.
 - Approvals are held in memory, expire after 15 minutes, and an agent acting inside a

@@ -132,11 +132,50 @@ def categories(out):
             "AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Startup/evil.lnk",
             "Startup/evil.lnk",
         ]),
+        ("agent config directories", [
+            ".claude/settings.json", ".claude/settings.local.json",
+            ".claude/commands/run.md", ".claude/agents/reviewer.md",
+            ".claude/hooks/pre-tool.sh",
+        ]),
+        ("codex config", [
+            ".codex/config.toml", ".codex/prompts/run.md",
+        ]),
+        ("gemini config", [
+            ".gemini/settings.json", ".gemini/commands/run.toml",
+        ]),
+        ("continue config", [
+            ".continue/config.json", ".continue/rules/run.md",
+        ]),
+        ("ssh config", [
+            ".ssh/authorized_keys", ".ssh/config",
+        ]),
+        ("shell login files", [
+            ".zshenv", ".zprofile", ".zlogin", ".bash_login",
+        ]),
+        ("fish config", [
+            ".config/fish/config.fish", ".config/fish/functions/run.fish",
+        ]),
+        ("git config", [
+            ".gitconfig", ".git/config",
+        ]),
+        ("desktop autostart", [
+            ".config/autostart/evil.desktop",
+        ]),
+        ("package manager credentials", [
+            ".npmrc", ".pypirc", ".netrc",
+        ]),
+        ("guard state and keys", [
+            ".sylenix-poc/audit-protect.jsonl",
+            ".sylenix-poc/pins-protect.json",
+            ".sylenix-keys/policy-signing.key",
+            ".sylenix-keys/README.txt",
+        ]),
     ]
 
 
 def run_mode(label, mode):
     with tempfile.TemporaryDirectory() as d:
+        state = os.path.join(d, "state")
         out = os.path.join(d, "out")
         os.mkdir(out)
         if mode == "scratch":
@@ -145,7 +184,7 @@ def run_mode(label, mode):
             flags = ("--grant", "write_file:" + out + "=5m")
         # Keep write_file results from latching taint during the pre-taint
         # phase; the explicit read_ticket below is the only taint source.
-        s = Session(d, flags=(*flags, "--trust", "write_file"))
+        s = Session(state, flags=(*flags, "--trust", "write_file"))
         s.start()
 
         for category, rels in categories(out):
@@ -168,6 +207,38 @@ def run_mode(label, mode):
         check(f"{label}: clean exit", s.close() == 0)
 
 
+def state_dir_test():
+    """The configured --state-dir is protected even when it is inside a scratch root."""
+    with tempfile.TemporaryDirectory() as d:
+        out = os.path.join(d, "out")
+        os.mkdir(out)
+        state = os.path.join(out, "guard-state")
+        s = Session(state, flags=("--allow-write-under", out, "--trust", "write_file"))
+        s.start()
+
+        target = os.path.join(state, "guard-owned.json")
+        r = s.call("write_file", {"path": target})
+        check("state dir: configured --state-dir is allowed before taint",
+              "result" in r, str(r)[:120])
+
+        s.call("read_ticket")
+        r = s.call("write_file", {"path": target})
+        check("state dir: configured --state-dir is blocked after taint",
+              "result" not in r and rule(r) == "SENSITIVE_TARGET", f"rule={rule(r)}")
+
+        r = s.call("write_file", {"path": os.path.join("guard-state", "relative.json")})
+        check("state dir: relative path under the scratch root is blocked",
+              "result" not in r and rule(r) == "SENSITIVE_TARGET", f"rule={rule(r)}")
+
+        r = s.call("write_file", {"path": os.path.join(state, "sub", "new.json")})
+        check("state dir: a new file below the state dir is blocked",
+              "result" not in r and rule(r) == "SENSITIVE_TARGET", f"rule={rule(r)}")
+
+        r = s.call("write_file", {"path": os.path.join(out, "ok.md")})
+        check("state dir: a sibling scratch write stays allowed", "result" in r, str(r)[:120])
+        check("state dir: clean exit", s.close() == 0)
+
+
 def dialog_approval_test():
     if not sys.platform.startswith("linux"):
         print("  skip dialog approval: fake zenity is Linux-only")
@@ -180,10 +251,11 @@ def dialog_approval_test():
             fh.write("#!/bin/sh\necho 'Allow Tool for 15m'\nexit 0\n")
         os.chmod(zenity, 0o755)
 
+        state = os.path.join(d, "state")
         out = os.path.join(d, "out")
         os.mkdir(out)
         env = {"PATH": bindir + os.pathsep + os.environ.get("PATH", "")}
-        s = Session(d, flags=("--allow-write-under", out, "--approve", "dialog"), env=env)
+        s = Session(state, flags=("--allow-write-under", out, "--approve", "dialog"), env=env)
         s.start()
         s.call("read_ticket")
         r = s.call("write_file", {"path": os.path.join(out, "AGENTS.md")})
@@ -201,6 +273,7 @@ def main():
         sys.exit("build first: CGO_ENABLED=0 go build -o bin/sylenix-guard ./cmd/sylenix-guard")
     run_mode("scratch", "scratch")
     run_mode("grant", "grant")
+    state_dir_test()
     dialog_approval_test()
 
     print(f"\n{passed} passed, {len(failed)} failed")
