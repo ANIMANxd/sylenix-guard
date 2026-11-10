@@ -115,7 +115,7 @@ func runServe(args []string) int {
 			MinVersion: tls.VersionTLS12,
 		},
 	}
-	fmt.Fprintf(os.Stderr, "[sylenix-teams] serving %s and %s on https://%s\n", policyserver.APIPath, policyserver.EventsAPI, *listen)
+	fmt.Fprintf(os.Stderr, "[sylenix-teams] serving %s, %s and %s on https://%s\n", policyserver.APIPath, policyserver.EventsAPI, policyserver.DashboardAPI, *listen)
 	if err := httpSrv.ListenAndServeTLS(*certPath, *keyPath); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		fmt.Fprintln(os.Stderr, "sylenix-teams serve:", err)
 		return 1

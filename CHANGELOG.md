@@ -2,6 +2,19 @@
 
 ## 2026-11-10
 
+### Server-rendered audit dashboard
+
+- Added `GET /dashboard` to the collector. It requires a login with the team
+  token, issues an HMAC-signed `HttpOnly`/`Secure`/`SameSite=Strict` 12-hour
+  session cookie, and renders one HTML page with inline CSS.
+- The page shows 24-hour and 7-day blocks, approvals, prompts and per-hour
+  rates; per-developer/machine counts; top blocked tools; and machines that have
+  not reported in 24 hours. There is no JavaScript framework, external font or
+  CDN dependency, and a restrictive CSP blocks external resources.
+- Only sanitized event fields are rendered. Added dashboard tests for login,
+  cookie flags, aggregation from test data, stale-machine detection, HTML
+  escaping, absence of external resources and absence of argument values.
+
 ### Audit event shipping and team collector
 
 - Added sanitized audit event shipping from Guard to the team collector. Events

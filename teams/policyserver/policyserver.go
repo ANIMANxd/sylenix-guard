@@ -38,6 +38,8 @@ const (
 	EventsAPI = "/v1/events"
 	// SyslogAPI exposes the caller team's events as RFC 5424 lines.
 	SyslogAPI = "/v1/events/syslog"
+	// DashboardAPI is the server-rendered audit page and token login.
+	DashboardAPI = "/dashboard"
 
 	maxEnvelope  = 4 << 20
 	maxEventBody = 2 << 20
@@ -57,10 +59,11 @@ type Config struct {
 
 // Server serves signed per-team policies over HTTPS.
 type Server struct {
-	dataDir string
-	pub     ed25519.PublicKey
-	tokens  map[string][sha256.Size]byte
-	logger  *log.Logger
+	dataDir    string
+	pub        ed25519.PublicKey
+	tokens     map[string][sha256.Size]byte
+	logger     *log.Logger
+	sessionKey []byte
 
 	eventsMu sync.Mutex
 }
@@ -94,11 +97,16 @@ func New(cfg Config) (*Server, error) {
 	if logger == nil {
 		logger = log.New(io.Discard, "", 0)
 	}
+	sessionKey, err := newSessionKey()
+	if err != nil {
+		return nil, err
+	}
 	return &Server{
-		dataDir: filepath.Clean(cfg.DataDir),
-		pub:     append(ed25519.PublicKey(nil), cfg.PublicKey...),
-		tokens:  tokens,
-		logger:  logger,
+		dataDir:    filepath.Clean(cfg.DataDir),
+		pub:        append(ed25519.PublicKey(nil), cfg.PublicKey...),
+		tokens:     tokens,
+		logger:     logger,
+		sessionKey: sessionKey,
 	}, nil
 }
 
@@ -457,6 +465,15 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.handleEventsSyslog(w, team)
+	case DashboardAPI:
+		s.handleDashboard(w, r)
+	case "/":
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", "GET")
+			s.fail(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "use GET")
+			return
+		}
+		http.Redirect(w, r, DashboardAPI, http.StatusFound)
 	default:
 		s.fail(w, http.StatusNotFound, "NOT_FOUND", "unknown endpoint")
 	}
@@ -477,7 +494,10 @@ func (s *Server) authenticate(r *http.Request) (string, bool) {
 	if !strings.HasPrefix(header, "Bearer ") {
 		return "", false
 	}
-	token := strings.TrimSpace(strings.TrimPrefix(header, "Bearer "))
+	return s.teamForToken(strings.TrimSpace(strings.TrimPrefix(header, "Bearer ")))
+}
+
+func (s *Server) teamForToken(token string) (string, bool) {
 	if token == "" || len(token) > 4096 || strings.ContainsAny(token, " \t\r\n") {
 		return "", false
 	}

@@ -45,6 +45,7 @@ policy endpoint and the audit collector:
 - `POST /v1/events` accepts a batch of sanitized audit events.
 - `GET /v1/events` exports those events as JSON.
 - `GET /v1/events/syslog` exports them as RFC 5424 lines.
+- `GET /dashboard` serves the token-login, server-rendered audit page.
 
 There is no plaintext HTTP mode.
 
@@ -67,10 +68,10 @@ beta:41c0...
 Blank lines and `#` comments are allowed. Duplicate teams, plaintext tokens and
 malformed hashes are rejected. Token comparison is constant-time.
 
-The same per-team token authorizes policy `GET`/`PUT` and event
-`POST`/`GET`/syslog export. Treat it as an admin credential: do not put it on a
-machine where a developer can read it. Separate pull-only, publish-only and
-audit-read tokens are not implemented yet.
+The same per-team token authorizes policy `GET`/`PUT`, event
+`POST`/`GET`/syslog export and dashboard login. Treat it as an admin credential:
+do not put it on a machine where a developer can read it. Separate pull-only,
+publish-only and audit-read tokens are not implemented yet.
 
 ## Publish
 
@@ -155,6 +156,27 @@ outbox is truncated can resend it.
 Syslog export uses `local0.info` (`PRI 134`) for normal events and
 `local0.warning` (`PRI 132`) for blocks/denials, with the event fields in a
 `sylenix@32473` structured-data element.
+
+## Audit dashboard
+
+Open `https://policy.example.com/dashboard` in a browser and sign in with the
+team token. The session is an HMAC-signed, `HttpOnly`, `Secure`,
+`SameSite=Strict` cookie valid for 12 hours; the raw token is not stored in the
+cookie. The page is served as one server-rendered HTML document with inline CSS,
+no JavaScript framework, no external fonts and no CDN references.
+
+It shows, for both the last 24 hours and the last 7 days:
+
+- block, approval and prompt counts, plus per-hour rates;
+- per-developer/machine counts and last event;
+- the top blocked tools;
+- machines with no event in the last 24 hours.
+
+Only the sanitized event fields are rendered. Argument values, content, URLs and
+tool output never reach the dashboard. Blocks count `decision: block`; approvals
+count `APPROVAL_GRANTED`; prompts count both `APPROVAL_GRANTED` and
+`APPROVAL_DENIED`. Rates are counts divided by the window length (24 or 168
+hours), not by active-session time.
 
 ## Guard flags
 

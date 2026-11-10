@@ -15,6 +15,7 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -811,6 +812,47 @@ func TestAuditEventsFromThreeGuardsAndOfflineBuffer(t *testing.T) {
 		if strings.Contains(string(raw), marker) {
 			t.Fatalf("guard %d outbox leaked an argument value: %s", i, raw)
 		}
+	}
+
+	// The server-rendered dashboard logs in with the team token, renders the
+	// three Guards, and still contains none of the argument text.
+	dashboardClient := &http.Client{
+		Transport: httpsSrv.Client().Transport,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	dashboardURL := httpsSrv.URL + policyserver.DashboardAPI
+	loginResp, err := dashboardClient.PostForm(dashboardURL, url.Values{"token": {token}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	loginResp.Body.Close()
+	if loginResp.StatusCode != http.StatusSeeOther || len(loginResp.Cookies()) != 1 {
+		t.Fatalf("dashboard login: code=%d cookies=%v", loginResp.StatusCode, loginResp.Cookies())
+	}
+	dashReq, _ := http.NewRequest(http.MethodGet, dashboardURL, nil)
+	dashReq.AddCookie(loginResp.Cookies()[0])
+	dashResp, err := dashboardClient.Do(dashReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pageRaw, _ := io.ReadAll(dashResp.Body)
+	dashResp.Body.Close()
+	page := string(pageRaw)
+	if dashResp.StatusCode != http.StatusOK {
+		t.Fatalf("dashboard: code=%d body=%s", dashResp.StatusCode, page)
+	}
+	for _, want := range []string{"guard-0", "guard-1", "guard-2", `data-tool="write_file"`} {
+		if !strings.Contains(page, want) {
+			t.Fatalf("dashboard missing %q", want)
+		}
+	}
+	if strings.Contains(page, marker) {
+		t.Fatalf("dashboard leaked an argument value: %s", page)
+	}
+	if strings.Contains(page, "<script") || strings.Contains(page, "http://") || strings.Contains(page, "https://") {
+		t.Fatal("dashboard references an external script or resource")
 	}
 
 	// Offline: the collector returns 503, the Guard must keep the event on disk
