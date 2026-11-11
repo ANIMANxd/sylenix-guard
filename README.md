@@ -37,9 +37,9 @@ scoop bucket add sylenix https://github.com/ANIMANxd/scoop-bucket
 scoop install sylenix/sylenix-guard
 ```
 
-Release binaries are also available from v0.1.0 on the
-[releases page](https://github.com/ANIMANxd/sylenix-guard/releases). Until that
-release is published, build from source with Go 1.22+:
+Release binaries for v0.1.0 are on the
+[releases page](https://github.com/ANIMANxd/sylenix-guard/releases). If you
+prefer to build from source, use Go 1.22+:
 
 ```bash
 git clone https://github.com/ANIMANxd/sylenix-guard.git
@@ -49,8 +49,7 @@ make build
 # Windows: bin\sylenix-guard.exe
 ```
 
-Once the v0.1.0 archives exist, download the matching archive and put the
-binary on `PATH`:
+Or download the matching release archive and put the binary on `PATH`:
 
 ```bash
 # macOS/Linux

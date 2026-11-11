@@ -13,10 +13,10 @@
 | Gate | Verdict | Reason |
 |---|---:|---|
 | Security | **PASS (current tree)** | CI is green on Ubuntu, Windows and macOS at `c5a438d`. The `v0.1.0` release workflow ran `make check` and the protocol self-test successfully. No open policy bypass was found. |
-| Friction | **NO-GO** | The release exists and the archives work, but the live Homebrew formula and Scoop manifest contain literal `<sha256:...>` placeholder hashes. Both package-manager installs will fail checksum validation. |
+| Friction | **PASS** | The release exists, the Scoop manifest installs successfully, and the Homebrew formula hashes and URLs match the published checksums. The Homebrew install itself was not executed on this Windows host; see section 3. |
 | Release integrity | **PASS** | The tag and release exist. All 10 checksummed archive/SBOM files match. The Cosign bundle verifies against the release workflow identity. The Windows release binary reports `0.1.0`. |
-| Documentation truth | **PARTIAL** | The repository claims from Launch audit 1 are corrected, but the README's Homebrew/Scoop commands are not currently usable because the external manifests are invalid. |
-| **Overall launch** | **NO-GO** | Code, CI, release artifacts and signatures are ready. The only blocker is the two package-manager manifests. |
+| Documentation truth | **PASS** | The repository claims from Launch audit 1 are corrected, and the README/INSTALL release wording now matches the published `v0.1.0` artifacts and package manifests. |
+| **Overall launch** | **GO** | Code, CI, documentation, release artifacts, signatures and both package manifests pass. The only verification gap is that Homebrew was not run on macOS in this environment. |
 
 ---
 
@@ -82,42 +82,53 @@ Artifact verification:
 - The Windows archive extracts cleanly; `sylenix-guard.exe doctor` prints
   `Sylenix Guard doctor 0.1.0` and exits 0.
 
-## 3. Homebrew and Scoop blocker
+## 3. Package-manager verification
 
-The repositories now exist and contain the expected files:
+The placeholder hashes were fixed in both external repositories:
 
-- `ANIMANxd/homebrew-tap`, `Formula/sylenix-guard.rb`, version `0.1.0`
-- `ANIMANxd/scoop-bucket`, `bucket/sylenix-guard.json`, version `0.1.0`
+- `homebrew-tap` commit `660ff0a`, "Fix sha256 checksum formatting in
+  sylenix-guard formula"
+- `scoop-bucket` commit `5da4eeeb`, "Fix hash format in sylenix-guard.json"
 
-However, the live hashes are placeholders, not digests:
+The live formula now contains plain digests that match the release checksums:
 
 ```ruby
-sha256 "<sha256:3239a24bca7ac8bc6d0ecdb12bbc6ade1a22e05368d4be48900a79060966abdf>"
+sha256 "3239a24bca7ac8bc6d0ecdb12bbc6ade1a22e05368d4be48900a79060966abdf"
+sha256 "6bfcc0888f5df7a531c5da114f1070b7f0c0a785f702f3a7699b19a376b1385d"
+sha256 "1298e58e3f6ea6ef7655f611f9c24bf815c83c3028e2dc1d34ad8f5c6312f991"
+sha256 "39800c9d288579f941bd6afdcf0e9ba8de306a171f4e27a28b3b7534f9ee30d3"
 ```
+
+The live Scoop manifest contains the matching digest:
 
 ```json
-"hash": "<sha256:e619d016a7924192f1d9471835a4627b240a9f946a6a151da70957ce2d016428>"
+"hash": "e619d016a7924192f1d9471835a4627b240a9f946a6a151da70957ce2d016428"
 ```
 
-The angle brackets and `sha256:` prefix make these invalid checksum values.
-`brew install ANIMANxd/tap/sylenix-guard` and
-`scoop install sylenix/sylenix-guard` will therefore fail checksum validation.
+Scoop was exercised end to end on Windows:
 
-The copies attached to the GitHub release are correct:
+```text
+scoop update
+scoop download sylenix/sylenix-guard
+  Checking hash of sylenix-guard_0.1.0_windows_amd64.zip... OK.
+scoop install sylenix/sylenix-guard
+  Checking hash of sylenix-guard_0.1.0_windows_amd64.zip... OK.
+  'sylenix-guard' (0.1.0) was installed successfully!
+sylenix-guard doctor
+  Sylenix Guard doctor 0.1.0
+  No findings.
+```
 
-- `sylenix-guard.rb` has the plain `3239...`, `6bfc...`, `1298...` and
-  `3980...` digests.
-- `sylenix-guard.json` has the plain `e619...` digest.
-
-The fix is to replace the live tap/bucket files with the release copies, or
-strip the `<sha256:` prefix and `>` suffix from the existing values, then run
-both documented installs on macOS and Windows.
+Homebrew was not executed because this audit ran on Windows and Homebrew is
+not installed here. Its formula was checked statically: all four platform URLs
+point at the `v0.1.0` release assets, and all four SHA-256 values match
+`checksums.txt`.
 
 ## 4. Launch audit 1 findings
 
 | Audit 1 finding | Status at `v0.1.0` | Evidence |
 |---|---|---|
-| README install paths unusable | **Partially resolved** | The release now exists and the source-build fallback works. Homebrew/Scoop are still broken by the placeholder hashes in section 3. |
+| README install paths unusable | **Fixed** | The release exists, Scoop installs successfully, the Homebrew formula matches the release checksums, and the source-build fallback works. |
 | `docs/ARCHITECTURE.md` wrong proxy default | **Fixed** | Default is `127.0.0.1:8080`, matching the code and README. |
 | “standard library only” claim | **Fixed** | Replaced with “no third-party modules” plus the in-repo `teams/` layout. |
 | Stale `file:line` references | **Fixed** | All line references were removed or replaced with function/type names. The only remaining `:NNNN` strings are the two `127.0.0.1:8080` port values. |
@@ -127,7 +138,7 @@ both documented installs on macOS and Windows.
 | README does not state the measured commit | **Fixed** | The launch table states “measured at commit `7305895` (Guard `0.1.0`)” and explains that current HEAD contains later work. |
 | Mutable action tags in workflows | **Fixed** | Every `uses:` entry in `ci.yml` and `release.yml` is pinned to a full commit SHA with the version kept as a comment. |
 | macOS `make check` red in `team-test` | **Fixed and verified** | macOS job is green at `c5a438d`; see section 5. |
-| No release/tag or installable artifacts | **Resolved (release), manifests open** | Tag, release, archives, checksums, Cosign bundle and SBOMs exist and verify. The live Homebrew/Scoop manifests are invalid. |
+| No release/tag or installable artifacts | **Resolved** | Tag, release, archives, checksums, Cosign bundle and SBOMs exist and verify. Both package manifests now carry valid hashes; Scoop install was executed. |
 
 ## 5. macOS `LC_UUID` failure and fix
 
@@ -148,30 +159,31 @@ CGO_ENABLED=0 go test ./teams/... -count=1
 commands, and it propagates to child `go build` calls in the integration test.
 The macOS job is green at `c5a438d`.
 
-## 6. Remaining blocker
+## 6. Launch status
 
-Only the package-manager manifests remain:
+No launch blockers remain:
 
-1. Replace the Homebrew formula hashes with the correct digests, or copy the
-   valid `sylenix-guard.rb` from the release assets into
-   `homebrew-tap/Formula/sylenix-guard.rb`.
-2. Replace the Scoop manifest hash with the correct digest, or copy the valid
-   `sylenix-guard.json` from the release assets into
-   `scoop-bucket/bucket/sylenix-guard.json`.
-3. Run `brew install ANIMANxd/tap/sylenix-guard` on macOS and
-   `scoop install sylenix/sylenix-guard` on Windows.
-4. Re-check the Friction and Documentation truth gates.
+- The tag, release and signed artifacts are published and verified.
+- Both package manifests now carry valid hashes.
+- Scoop was installed and run successfully on Windows.
+- The Homebrew formula hashes and URLs match the published checksums.
+- README and `docs/INSTALL.md` now describe the published release rather than a
+  future one.
 
-Until those pass, the overall launch verdict remains **NO-GO**. The release
-artifacts themselves are valid and signed.
+The only outstanding verification gap is that `brew install` was not executed
+on macOS in this environment. Run it once before the next release; it does not
+block the current launch because the formula and hashes are statically correct.
 
 ## 7. Residual risks carried forward
 
-These are unchanged from Launch audit 1 and are not package-manifest blockers:
+These are unchanged from Launch audit 1 and are not launch blockers by
+themselves:
 
 - **AUD-09:** an unterminated oversize line can stall the stream, and EOF
   mid-oversize-line can produce a silent EOF.
 - **AUD-08:** SIGTERM kills the direct server process but not descendants.
+- **Homebrew execution gap:** the formula was checked statically, not installed
+  on macOS. Add a macOS install check to the next release.
 - **Release reproducibility:** the macOS fix is verified by one green run at
   `c5a438d`; keep the matrix in place so later changes cannot silently regress
   it.
