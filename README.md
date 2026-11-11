@@ -21,25 +21,25 @@ need manual `proxy` mode; see [`docs/INSTALL.md`](docs/INSTALL.md).
 
 ### 1. Install
 
-Homebrew and Scoop installs are available from **v0.1.0**.
+Homebrew and Scoop installs are available from **v0.1.1**.
 
-macOS (Homebrew, from v0.1.0):
+macOS (Homebrew, from v0.1.1):
 
 ```bash
 brew tap ANIMANxd/tap
 brew install ANIMANxd/tap/sylenix-guard
 ```
 
-Windows (Scoop, from v0.1.0):
+Windows (Scoop, from v0.1.1):
 
 ```powershell
 scoop bucket add sylenix https://github.com/ANIMANxd/scoop-bucket
 scoop install sylenix/sylenix-guard
 ```
 
-Release binaries for v0.1.0 are on the
+Release binaries for v0.1.1 are on the
 [releases page](https://github.com/ANIMANxd/sylenix-guard/releases). If you
-prefer to build from source, use Go 1.22+:
+prefer to build from source, use Go 1.27.4+:
 
 ```bash
 git clone https://github.com/ANIMANxd/sylenix-guard.git
@@ -65,6 +65,14 @@ $zip = Get-ChildItem .\sylenix-guard_*_windows_amd64.zip | Select-Object -First 
 Expand-Archive $zip.FullName -DestinationPath $env:LOCALAPPDATA\sylenix-guard -Force
 $env:Path += ";$env:LOCALAPPDATA\sylenix-guard"
 ```
+
+Verify the binary:
+
+```bash
+sylenix-guard --version
+```
+
+It prints `sylenix-guard 0.1.1 (<commit>, <go version>)`.
 
 Checksums, Cosign verification and SBOMs are in [`docs/INSTALL.md`](docs/INSTALL.md).
 

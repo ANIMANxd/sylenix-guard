@@ -38,6 +38,7 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -78,7 +79,29 @@ const auditMinActive = 300 // below this, prompts/hour is not meaningful
 
 // version is the Guard build version. Release builds set it with
 // -ldflags "-X main.version=<tag>"; local builds keep this default.
-var version = "0.1.0"
+var version = "0.1.1"
+
+// commit is the source revision. Release builds set it with
+// -ldflags "-X main.commit=<sha>"; local builds fall back to VCS build info.
+var commit = ""
+
+func versionString() string {
+	c := commit
+	if c == "" {
+		if info, ok := debug.ReadBuildInfo(); ok {
+			for _, s := range info.Settings {
+				if s.Key == "vcs.revision" && s.Value != "" {
+					c = s.Value
+					break
+				}
+			}
+		}
+	}
+	if c == "" {
+		c = "unknown"
+	}
+	return fmt.Sprintf("sylenix-guard %s (%s, %s)", version, c, runtime.Version())
+}
 
 // policyFile is the on-disk policy schema. It is decoded strictly: any field
 // this struct does not name is an error, never silently ignored.
@@ -378,6 +401,9 @@ type guardOptions struct {
 func main() {
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
+		case "version", "--version", "-version":
+			fmt.Println(versionString())
+			return
 		case "install":
 			os.Exit(runConfigCommand("install", os.Args[2:]))
 		case "uninstall":
@@ -692,7 +718,7 @@ func prepareGuard(opts guardOptions) (*Guard, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cannot resolve state directory: %w", err)
 	}
-	stateDirReal, err := filepath.EvalSymlinks(stateDirAbs)
+	stateDirReal, err := evalSymlinks(stateDirAbs)
 	if err != nil {
 		return nil, fmt.Errorf("cannot resolve state directory: %w", err)
 	}
@@ -705,7 +731,7 @@ func prepareGuard(opts guardOptions) (*Guard, error) {
 			filepath.Join(home, ".sylenix-poc"),
 			filepath.Join(home, ".sylenix-keys"),
 		} {
-			if real, err := filepath.EvalSymlinks(dir); err == nil {
+			if real, err := evalSymlinks(dir); err == nil {
 				protectedDirs = append(protectedDirs, filepath.Clean(real))
 			}
 		}
@@ -6591,7 +6617,7 @@ func hasDotDotComponent(p string) bool {
 }
 
 func resolveExistingPrefix(abs string) (string, bool) {
-	real, err := filepath.EvalSymlinks(abs)
+	real, err := evalSymlinks(abs)
 	if err == nil {
 		return filepath.Clean(real), true
 	}
@@ -6617,7 +6643,7 @@ func resolveExistingPrefix(abs string) (string, bool) {
 			prefix, tail = abs[:i+1], abs[i+1:]
 		}
 		if prefix != "" {
-			real, err := filepath.EvalSymlinks(prefix)
+			real, err := evalSymlinks(prefix)
 			if err == nil {
 				if tail == "" {
 					return filepath.Clean(real), true
@@ -6636,6 +6662,31 @@ func resolveExistingPrefix(abs string) (string, bool) {
 		pos = i
 	}
 	return "", false
+}
+
+// evalSymlinks resolves symlinks and Windows junctions. On Windows, a
+// directory junction is not always reported as a symlink by os.Lstat, so
+// filepath.EvalSymlinks can return the junction path unchanged. os.Readlink
+// still returns the junction target, so resolve that explicitly.
+func evalSymlinks(p string) (string, error) {
+	for i := 0; i < 255; i++ {
+		real, err := filepath.EvalSymlinks(p)
+		if err != nil {
+			return "", err
+		}
+		if runtime.GOOS != "windows" {
+			return real, nil
+		}
+		target, err := os.Readlink(p)
+		if err != nil {
+			return real, nil
+		}
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(filepath.Dir(p), target)
+		}
+		p = target
+	}
+	return "", fmt.Errorf("too many links")
 }
 
 // canonicalPath returns an absolute, symlink-resolved path. Failure means the
@@ -9527,8 +9578,8 @@ func sameExecutablePath(a, b string) bool {
 	if sameCommandPath(a, b) {
 		return true
 	}
-	aa, err1 := filepath.EvalSymlinks(a)
-	bb, err2 := filepath.EvalSymlinks(b)
+	aa, err1 := evalSymlinks(a)
+	bb, err2 := evalSymlinks(b)
 	if err1 == nil && err2 == nil {
 		return sameCommandPath(aa, bb)
 	}

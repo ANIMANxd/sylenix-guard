@@ -30,6 +30,7 @@ probe-test: build
 	python3 tests/probes/test_policy.py
 	python3 tests/probes/test_allowlist.py
 	python3 tests/probes/test_install.py
+	python3 tests/probes/test_version.py
 
 proxy-test: build
 	python3 tests/probes/test_http_proxy.py

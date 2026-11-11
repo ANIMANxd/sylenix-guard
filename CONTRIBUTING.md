@@ -33,6 +33,7 @@ make check
 `make check` runs gofmt, the SPDX check, `go vet`, the protocol self-test, the
 stdio, Streamable HTTP and signing probe suites, the profile/replay/doctor/
 clear-taint/stats probes, the audit summarizer fixture and the `teams/` Go tests.
+CI also runs `go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...`.
 On Windows, `make check` needs a POSIX shell (Git Bash or WSL), as described in
 `README.md`.
 

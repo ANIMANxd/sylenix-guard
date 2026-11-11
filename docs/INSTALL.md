@@ -81,6 +81,14 @@ Restart the client after installing or uninstalling so it reloads the config.
 
 ## Check the installation
 
+Confirm the binary runs and reports its build:
+
+```bash
+sylenix-guard --version
+```
+
+It prints `sylenix-guard <version> (<commit>, <go version>)`.
+
 `sylenix-guard doctor` audits the supported client configs and reports wrapped
 and unwrapped servers, allowlist gaps, risky scratch/trust/approval settings,
 unverified policy/pin signatures (with `--require-signatures`) and outdated
@@ -98,7 +106,7 @@ file, or prints command arguments or environment values. See
 
 ## Release artifacts and verification
 
-The **v0.1.0** release is published. The artifact names, checksums, signatures
+The **v0.1.1** release is published. The artifact names, checksums, signatures
 and manifests below describe its contents. The source-build instructions remain
 in the [README](../README.md#build-from-source-and-manual-setup).
 

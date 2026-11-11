@@ -1,3 +1,5 @@
 module sylenix-guard-poc
 
-go 1.22
+go 1.27.3
+
+toolchain go1.27.4

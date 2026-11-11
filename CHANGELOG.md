@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-11-11
+
+### v0.1.1
+
+- Bumped the module to Go 1.27 and pinned the Go 1.27.4 toolchain; added a
+  pinned `govulncheck` gate to CI and the release test job.
+- Added `sylenix-guard --version` and `sylenix-guard version`. Both print
+  `sylenix-guard <version> (<commit>, <go version>)` and exit 0 before any
+  server launch path.
+- README and INSTALL now use `sylenix-guard --version` as the post-install
+  check.
+- No enforcement behaviour changed.
+
 ## 2026-11-10
 
 ### Five-minute README and terminal demo

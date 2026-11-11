@@ -33,8 +33,9 @@ protocol version. The stdio self-test uses `2025-06-18` in its handshake
 (`demo/selftest.py`); the HTTP probes use `2025-11-25`.
 
 The same binary also contains the non-proxy subcommands: `install`, `uninstall`,
-`policy`, `allow`, `doctor`, `clear-taint`, and `stats`. `main` dispatches those
-before parsing proxy flags.
+`policy`, `allow`, `doctor`, `clear-taint`, `stats`, and `version`. `main`
+dispatches those before parsing proxy flags. `--version` and `version` print the
+build string and return before any server-launch path.
 
 ### 1.1 Streamable HTTP proxy mode
 
@@ -116,8 +117,9 @@ machine account; there is no HSM or remote signer.
 
 `main` is at `cmd/sylenix-guard/main.go`.
 
-1. Subcommand dispatch. If `os.Args[1]` is a known subcommand, run
-   it and exit. Otherwise fall through to proxy mode.
+1. Subcommand dispatch. If `os.Args[1]` is a known subcommand, run it and exit.
+   `version`, `--version`, and `-version` print the build string and return
+   before any server launch. Otherwise fall through to proxy mode.
 2. Proxy flag parsing. `flag.Visit` records which flags were
    explicitly supplied, so flags can override policy only when the
    operator actually set them.
@@ -451,6 +453,7 @@ same names through `registerGuardFlags` and `runProxyCommand`.
 | `allow` | `--policy` | `main.go` | `policyWritePath`, `loadPolicyForUpdate`, `writePolicyFile`. |
 | `allow` | `--state-dir` | `main.go` | Default policy location. |
 | `allow` | `--yes` | `main.go` | Skips the confirmation prompt. |
+| `version`, `--version`, `-version` | none | `main.go` | Prints `sylenix-guard <version> (<commit>, <go version>)` and exits 0 before flag parsing or server launch. |
 | `policy` | none | `main.go` | Positional `validate <file>`, `sign`, `verify` or `print-default`. |
 | `keys` | `init --out`, `--key`, `--force`, `--state-dir` | `main.go` | Generates the Ed25519 keypair; refuses a private key inside the state dir; warns that the private key can loosen Guard. |
 | `pins` | `sign/verify --name`, `--state-dir`, `--key`, `--pubkey` | `main.go` | Signs or verifies `pins-<name>.json` with a detached `.sig`. |
@@ -514,7 +517,8 @@ It runs, in order:
    `python3 demo/selftest.py` and `python3 demo/selftest.py --policy`.
 5. **`probe-test`** (`Makefile`): builds and runs the regression probes:
    `test_scratch_grant_bypass.py`, `test_protected_targets.py`,
-   `test_policy.py`, `test_allowlist.py`, `test_install.py`.
+   `test_policy.py`, `test_allowlist.py`, `test_install.py`,
+   `test_version.py`.
 6. **`proxy-test`** (`Makefile`): `tests/probes/test_http_proxy.py`, the
    stdio/HTTP parity, SSE, session, auth-header and pin-quarantine probes.
 7. **`signing-test`** (`Makefile`): `tests/probes/test_signing.py`, key
@@ -539,6 +543,9 @@ It runs, in order:
 `team-test` sets `CGO_ENABLED=0` so the test binaries use Go's internal linker.
 That avoids the dyld `missing LC_UUID` failure seen when those binaries are
 externally linked by cgo on newer macOS SDKs.
+
+CI also runs `go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...` as a
+separate gate before `make check`.
 
 `make check` does not run the agent harness, sweep, or the `gif` target.
 `make harness-scripted` (`Makefile`) uses
