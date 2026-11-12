@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Added `tests/probes/test_redteam_2026_11.py`, which drives the real Guard over
+  raw stdio JSON-RPC and Streamable HTTP and marks the F1-F9 red-team findings
+  as XFAIL until each fix lands.
+
 ## 2026-11-11
 
 ### v0.1.1
