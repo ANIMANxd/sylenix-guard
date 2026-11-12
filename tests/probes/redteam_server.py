@@ -130,9 +130,12 @@ for line in sys.stdin:
         name = resolve_name(params)
         args = resolve_arguments(params)
         if CALL_LOG:
+            row = {"name": name, "arguments": args,
+                   "parameter_keys": sorted(params.keys())}
+            if "_meta" in params:
+                row["meta"] = params["_meta"]
             with open(CALL_LOG, "a", encoding="utf-8") as fh:
-                fh.write(json.dumps({"name": name, "arguments": args},
-                                    ensure_ascii=False) + "\n")
+                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
         if not name:
             send({"jsonrpc": "2.0", "id": rid, "error": {
                 "code": -32602, "message": "missing tool name"}})

@@ -578,8 +578,8 @@ func main() {
 			if reply != nil {
 				g.write(reply)
 			}
-			if forward {
-				_, _ = childIn.Write(append(line, '\n'))
+			if forward != nil {
+				_, _ = childIn.Write(append(forward, '\n'))
 			}
 		}
 		// Host closed stdin (or the stream can no longer be framed): let the server finish.
@@ -1319,20 +1319,20 @@ func (p *proxyHandler) handlePost(w http.ResponseWriter, r *http.Request) {
 		writeJSONRPC(w, http.StatusOK, reply, r.Header.Get("Mcp-Session-Id"))
 		return
 	}
-	if !forward {
+	if forward == nil {
 		w.Header().Set("Mcp-Session-Id", r.Header.Get("Mcp-Session-Id"))
 		w.WriteHeader(http.StatusAccepted)
 		return
 	}
 
-	resp, ok := p.doUpstream(w, r, http.MethodPost, body)
+	resp, ok := p.doUpstream(w, r, http.MethodPost, forward)
 	if !ok {
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
 	copyResponseHeaders(w.Header(), resp.Header)
 
-	reqID := idFromBody(body)
+	reqID := idFromBody(forward)
 	if isEventStream(resp.Header.Get("Content-Type")) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache, no-transform")
@@ -5273,74 +5273,99 @@ func (p *yamlFlowParser) plain() (any, error) {
 
 // ---------------------------------------------------------------- host -> server
 
-func (g *Guard) fromHost(line []byte) (forward bool, reply []byte) {
+// fromHost inspects one host frame. A non-nil forward slice is the exact frame
+// to send to the server: original bytes for pass-through frames, or a frame
+// rebuilt from the tools/call name and arguments the Guard checked.
+func (g *Guard) fromHost(line []byte) (forward []byte, reply []byte) {
 	trim := bytes.TrimSpace(line)
 	if len(trim) > 0 && trim[0] == '[' {
 		g.event("batch_dropped", nil)
-		return false, errorFrame(nil, -32600, "Batch frames are not supported", "BATCH_UNSUPPORTED")
+		return nil, errorFrame(nil, -32600, "Batch frames are not supported", "BATCH_UNSUPPORTED")
 	}
 	var f frame
 	if err := json.Unmarshal(trim, &f); err != nil {
 		g.event("unparseable_host_frame", map[string]any{"bytes": len(line)})
-		return false, errorFrame(nil, -32700, "Parse error", "UNPARSEABLE")
+		return nil, errorFrame(nil, -32700, "Parse error", "UNPARSEABLE")
 	}
-	if hasDuplicateKeys(trim) {
+	if hasDuplicateKeys(trim) || hasFoldCollidingKeys(trim) {
 		g.event("block", map[string]any{"rule": "DUPLICATE_KEYS"})
-		return false, errorFrame(nil, -32600, "Invalid request", "DUPLICATE_KEYS")
+		return nil, errorFrame(nil, -32600, "Invalid request", "DUPLICATE_KEYS")
 	}
 	var method string
 	_ = json.Unmarshal(f["method"], &method)
 	id := f["id"]
 	if method == "" {
-		return true, nil // a response from the host to a server request
+		return line, nil // a response from the host to a server request
 	}
 	if g.serverGone.Load() {
-		return false, replyIfRequest(id, -32000, "Server stream closed", "SERVER_STREAM_CLOSED")
+		return nil, replyIfRequest(id, -32000, "Server stream closed", "SERVER_STREAM_CLOSED")
 	}
 	if len(id) > 0 && g.isPending(id) {
 		// A response must only ever carry the identity of the request it answers.
 		// The reply uses id null so it cannot be mistaken for the answer to the first request.
 		g.event("block", map[string]any{"rule": "DUPLICATE_ID", "method": method})
-		return false, errorFrame(nil, -32600, "Invalid request", "DUPLICATE_ID")
+		return nil, errorFrame(nil, -32600, "Invalid request", "DUPLICATE_ID")
 	}
 	if method != "tools/call" {
 		g.track(id, method, "")
-		return true, nil
+		return line, nil
 	}
 
-	var p struct {
-		Name      string         `json:"name"`
-		Arguments map[string]any `json:"arguments"`
-	}
-	if err := json.Unmarshal(f["params"], &p); err != nil || p.Name == "" {
+	// Only the exact lower-case keys are the call the Guard evaluates. A
+	// case-insensitive struct decode used to let a decoy key win here while an
+	// exact-matching MCP server executed the other value.
+	unparseable := func() ([]byte, []byte) {
 		g.event("block", map[string]any{"rule": "UNPARSEABLE_CALL"})
-		return false, replyIfRequest(id, -32000, "Blocked by Sylenix Guard", "UNPARSEABLE_CALL")
+		return nil, replyIfRequest(id, -32000, "Blocked by Sylenix Guard", "UNPARSEABLE_CALL")
+	}
+	var params map[string]json.RawMessage
+	if err := json.Unmarshal(f["params"], &params); err != nil || params == nil {
+		return unparseable()
+	}
+	nameRaw, ok := params["name"]
+	if !ok {
+		return unparseable()
+	}
+	var name string
+	if err := json.Unmarshal(nameRaw, &name); err != nil || name == "" {
+		return unparseable()
+	}
+	var args map[string]any
+	argsRaw, argsPresent := params["arguments"]
+	if argsPresent && !bytes.Equal(bytes.TrimSpace(argsRaw), []byte("null")) {
+		if err := json.Unmarshal(argsRaw, &args); err != nil || args == nil {
+			return unparseable()
+		}
+	}
+	forwardFrame, ok := rebuildCallFrame(f, params, name, argsRaw, argsPresent)
+	if !ok {
+		return unparseable()
 	}
 
 	g.mu.Lock()
-	reason, quarantined := g.quarantined[p.Name]
+	reason, quarantined := g.quarantined[name]
 	tainted, origin := g.tainted, g.taintOrigin
 	g.mu.Unlock()
 	pol := g.currentPolicy()
 
 	if quarantined {
-		g.event("block", map[string]any{"tool": p.Name, "rule": "MANIFEST_QUARANTINE", "detail": reason})
-		alert("tool %q blocked: %s", p.Name, reason)
-		return false, replyIfRequest(id, -32001, "Blocked by Sylenix Guard", "MANIFEST_QUARANTINE")
+		g.event("block", map[string]any{"tool": name, "rule": "MANIFEST_QUARANTINE", "detail": reason})
+		alert("tool %q blocked: %s", name, reason)
+		return nil, replyIfRequest(id, -32001, "Blocked by Sylenix Guard", "MANIFEST_QUARANTINE")
 	}
-	class := pol.classFor(p.Name)
+	class := pol.classFor(name)
 	if !tainted || class == "read" {
-		g.event("allow", map[string]any{"tool": p.Name, "tainted": tainted, "class": class, "arg_keys": argKeys(p.Arguments)})
-		g.track(id, method, p.Name)
-		return true, nil
+		g.event("allow", map[string]any{"tool": name, "tainted": tainted, "class": class, "arg_keys": argKeys(args)})
+		g.track(id, method, name)
+		return forwardFrame, nil
 	}
 
 	// Tainted session, tool is not read-only: this is a sink. Hard blocks go
 	// first, then protected persistence targets, then grants/scratch, then the
 	// dialog or default deny. A fast path can never reach a hard-blocked or
 	// protected target.
-	scan := scanArgs(p.Arguments, pol.toolPathKeys[p.Name], g.protectedDirs)
-	if !scan.sensitive && g.hardSensitiveCall(p.Name, scan.paths, pol.scratch) {
+	scan := scanArgs(args, pol.toolPathKeys[name], g.protectedDirs)
+	if !scan.sensitive && g.hardSensitiveCall(name, scan.paths, pol.scratch) {
 		scan.sensitive = true
 	}
 	egressAllowed := false
@@ -5352,37 +5377,37 @@ func (g *Guard) fromHost(line []byte) (forward bool, reply []byte) {
 			}
 		}
 		if !egressAllowed {
-			g.event("block", map[string]any{"tool": p.Name, "rule": "EGRESS_TARGET", "origin": origin, "class": class, "arg_keys": argKeys(p.Arguments)})
-			alert("tool %q blocked: network target in a session tainted by %q", p.Name, origin)
-			return false, replyIfRequest(id, -32000, "Blocked by Sylenix Guard", "EGRESS_TARGET")
+			g.event("block", map[string]any{"tool": name, "rule": "EGRESS_TARGET", "origin": origin, "class": class, "arg_keys": argKeys(args)})
+			alert("tool %q blocked: network target in a session tainted by %q", name, origin)
+			return nil, replyIfRequest(id, -32000, "Blocked by Sylenix Guard", "EGRESS_TARGET")
 		}
 	}
 	if scan.sensitive {
-		g.event("block", map[string]any{"tool": p.Name, "rule": "SENSITIVE_TARGET", "origin": origin, "class": class, "arg_keys": argKeys(p.Arguments)})
-		alert("tool %q blocked: sensitive path in a session tainted by %q", p.Name, origin)
-		return false, replyIfRequest(id, -32000, "Blocked by Sylenix Guard", "SENSITIVE_TARGET")
+		g.event("block", map[string]any{"tool": name, "rule": "SENSITIVE_TARGET", "origin": origin, "class": class, "arg_keys": argKeys(args)})
+		alert("tool %q blocked: sensitive path in a session tainted by %q", name, origin)
+		return nil, replyIfRequest(id, -32000, "Blocked by Sylenix Guard", "SENSITIVE_TARGET")
 	}
-	if !scan.protected && g.protectedCall(p.Name, scan.paths, pol.scratch) {
+	if !scan.protected && g.protectedCall(name, scan.paths, pol.scratch) {
 		scan.protected = true
 	}
 	if scan.protected && pol.approve != "dialog" {
-		g.event("block", map[string]any{"tool": p.Name, "rule": "SENSITIVE_TARGET", "origin": origin, "class": class, "arg_keys": argKeys(p.Arguments)})
-		alert("tool %q blocked: protected persistence path in a session tainted by %q", p.Name, origin)
-		return false, replyIfRequest(id, -32000, "Blocked by Sylenix Guard", "SENSITIVE_TARGET")
+		g.event("block", map[string]any{"tool": name, "rule": "SENSITIVE_TARGET", "origin": origin, "class": class, "arg_keys": argKeys(args)})
+		alert("tool %q blocked: protected persistence path in a session tainted by %q", name, origin)
+		return nil, replyIfRequest(id, -32000, "Blocked by Sylenix Guard", "SENSITIVE_TARGET")
 	}
 	// An egress-class tool whose every destination is on the policy allowlist
 	// is the one place an allowlist authorizes a tainted call without a prompt.
 	// Ambiguous values still fail closed; protected targets still ask a human.
 	if class == "egress" && scan.egress && egressAllowed {
 		if scan.ambiguous {
-			g.event("block", map[string]any{"tool": p.Name, "rule": "EGRESS_TARGET", "origin": origin, "class": class, "arg_keys": argKeys(p.Arguments)})
-			alert("tool %q blocked: ambiguous network target in a session tainted by %q", p.Name, origin)
-			return false, replyIfRequest(id, -32000, "Blocked by Sylenix Guard", "EGRESS_TARGET")
+			g.event("block", map[string]any{"tool": name, "rule": "EGRESS_TARGET", "origin": origin, "class": class, "arg_keys": argKeys(args)})
+			alert("tool %q blocked: ambiguous network target in a session tainted by %q", name, origin)
+			return nil, replyIfRequest(id, -32000, "Blocked by Sylenix Guard", "EGRESS_TARGET")
 		}
 		if !scan.protected {
-			g.event("allow", map[string]any{"tool": p.Name, "tainted": true, "class": class, "rule": "EGRESS_ALLOW", "arg_keys": argKeys(p.Arguments)})
-			g.track(id, method, p.Name)
-			return true, nil
+			g.event("allow", map[string]any{"tool": name, "tainted": true, "class": class, "rule": "EGRESS_ALLOW", "arg_keys": argKeys(args)})
+			g.track(id, method, name)
+			return forwardFrame, nil
 		}
 	}
 	// A grant or scratch rule may only short-cut a call whose path arguments
@@ -5390,33 +5415,69 @@ func (g *Guard) fromHost(line []byte) (forward bool, reply []byte) {
 	// and every protected target without a human dialog grant, falls through
 	// to denial or a fresh human decision. An allow-listed egress destination
 	// on a non-egress tool still needs a fresh human decision, never a fast path.
-	if !scan.egress && !scan.ambiguous && g.grantAllows(p.Name, scan.paths, scan.protected) {
-		g.event("allow", map[string]any{"tool": p.Name, "tainted": true, "class": class, "rule": "GRANT", "arg_keys": argKeys(p.Arguments)})
-		g.track(id, method, p.Name)
-		return true, nil
+	if !scan.egress && !scan.ambiguous && g.grantAllows(name, scan.paths, scan.protected) {
+		g.event("allow", map[string]any{"tool": name, "tainted": true, "class": class, "rule": "GRANT", "arg_keys": argKeys(args)})
+		g.track(id, method, name)
+		return forwardFrame, nil
 	}
-	if !scan.egress && !scan.protected && !scan.ambiguous && pol.scratchAllows(p.Name, scan.paths) {
-		g.event("allow", map[string]any{"tool": p.Name, "tainted": true, "class": class, "rule": "SCRATCH", "arg_keys": argKeys(p.Arguments)})
-		g.track(id, method, p.Name)
-		return true, nil
+	if !scan.egress && !scan.protected && !scan.ambiguous && pol.scratchAllows(name, scan.paths) {
+		g.event("allow", map[string]any{"tool": name, "tainted": true, "class": class, "rule": "SCRATCH", "arg_keys": argKeys(args)})
+		g.track(id, method, name)
+		return forwardFrame, nil
 	}
 	if pol.approve == "dialog" {
 		scope := scopeDir(scan.paths)
-		decision, note := askHuman(p.Name, p.Arguments, origin, grantScopeNote(p.Name, scope))
-		g.event("approval", map[string]any{"tool": p.Name, "granted": decision != "deny", "decision": decision, "class": class, "note": note, "arg_keys": argKeys(p.Arguments)})
+		decision, note := askHuman(name, args, origin, grantScopeNote(name, scope))
+		g.event("approval", map[string]any{"tool": name, "granted": decision != "deny", "decision": decision, "class": class, "note": note, "arg_keys": argKeys(args)})
 		if decision == "grant" {
-			g.addGrant(p.Name, scope, grantTTL, scan.protected)
-			g.event("grant_recorded", map[string]any{"tool": p.Name, "scope": scopeKind(scope), "ttl_seconds": int(grantTTL.Seconds())})
+			g.addGrant(name, scope, grantTTL, scan.protected)
+			g.event("grant_recorded", map[string]any{"tool": name, "scope": scopeKind(scope), "ttl_seconds": int(grantTTL.Seconds())})
 		}
 		if decision != "deny" {
-			g.track(id, method, p.Name)
-			return true, nil
+			g.track(id, method, name)
+			return forwardFrame, nil
 		}
-		return false, replyIfRequest(id, -32002, "Authorization denied", "APPROVAL_DENIED")
+		return nil, replyIfRequest(id, -32002, "Authorization denied", "APPROVAL_DENIED")
 	}
-	g.event("block", map[string]any{"tool": p.Name, "rule": "TAINT_SINK", "origin": origin, "class": class, "arg_keys": argKeys(p.Arguments)})
-	alert("tool %q blocked: session tainted by %q", p.Name, origin)
-	return false, replyIfRequest(id, -32000, "Blocked by Sylenix Guard", "TAINT_SINK")
+	g.event("block", map[string]any{"tool": name, "rule": "TAINT_SINK", "origin": origin, "class": class, "arg_keys": argKeys(args)})
+	alert("tool %q blocked: session tainted by %q", name, origin)
+	return nil, replyIfRequest(id, -32000, "Blocked by Sylenix Guard", "TAINT_SINK")
+}
+
+// rebuildCallFrame returns the tools/call frame the server may receive. It
+// keeps the parsed top-level frame, replaces params with the exact checked
+// name, the checked arguments, and every other params key copied unchanged
+// (for example _meta).
+func rebuildCallFrame(f frame, params map[string]json.RawMessage, name string, argsRaw json.RawMessage, argsPresent bool) ([]byte, bool) {
+	rebuiltParams := make(map[string]json.RawMessage, len(params))
+	for k, v := range params {
+		if k == "name" || k == "arguments" {
+			continue
+		}
+		rebuiltParams[k] = v
+	}
+	nameJSON, err := json.Marshal(name)
+	if err != nil {
+		return nil, false
+	}
+	rebuiltParams["name"] = nameJSON
+	if argsPresent {
+		rebuiltParams["arguments"] = argsRaw
+	}
+	paramsJSON, err := json.Marshal(rebuiltParams)
+	if err != nil {
+		return nil, false
+	}
+	rebuilt := make(map[string]json.RawMessage, len(f))
+	for k, v := range f {
+		rebuilt[k] = v
+	}
+	rebuilt["params"] = paramsJSON
+	out, err := json.Marshal(rebuilt)
+	if err != nil {
+		return nil, false
+	}
+	return out, true
 }
 
 // ---------------------------------------------------------------- server -> host
@@ -7135,7 +7196,8 @@ func isInvisible(r rune) bool {
 
 // hasDuplicateKeys reports whether any JSON object inside b repeats a key.
 // Parsers disagree about which duplicate wins, so the guard refuses such frames
-// instead of guessing which value the server will act on.
+// instead of guessing which value the server will act on. Case variants are
+// handled by hasFoldCollidingKeys.
 func hasDuplicateKeys(b []byte) bool {
 	type level struct {
 		isObj     bool
@@ -7233,6 +7295,82 @@ func stripAll(v any) any {
 		return t
 	}
 	return v
+}
+
+// hasFoldCollidingKeys reports whether any JSON object inside b contains two
+// keys that are equal under Unicode simple folding. encoding/json matches
+// struct fields that way, while MCP servers match object keys exactly, so a
+// case variant gives the same frame two meanings. Every host frame is checked
+// at every depth, next to hasDuplicateKeys.
+func hasFoldCollidingKeys(b []byte) bool {
+	type level struct {
+		isObj     bool
+		expectKey bool
+		keys      map[string]string
+	}
+	dec := json.NewDecoder(bytes.NewReader(b))
+	var stack []level
+	valueDone := func() {
+		if n := len(stack); n > 0 && stack[n-1].isObj {
+			stack[n-1].expectKey = true
+		}
+	}
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			return false // io.EOF, or malformed input that json.Unmarshal already rejected
+		}
+		switch t := tok.(type) {
+		case json.Delim:
+			switch t {
+			case '{':
+				stack = append(stack, level{isObj: true, expectKey: true, keys: map[string]string{}})
+			case '[':
+				stack = append(stack, level{})
+			default: // '}' or ']'
+				stack = stack[:len(stack)-1]
+				valueDone()
+			}
+		default: // string, number, bool or null
+			n := len(stack)
+			if n == 0 || !stack[n-1].isObj {
+				continue
+			}
+			if stack[n-1].expectKey {
+				key, _ := t.(string)
+				folded := simpleFoldKey(key)
+				if seen, ok := stack[n-1].keys[folded]; ok {
+					if strings.EqualFold(seen, key) {
+						return true
+					}
+					// A fold-index collision that EqualFold does not confirm is
+					// still a frame we cannot classify safely.
+					return true
+				}
+				stack[n-1].keys[folded] = key
+				stack[n-1].expectKey = false
+			} else {
+				stack[n-1].expectKey = true
+			}
+		}
+	}
+}
+
+// simpleFoldKey maps every rune to the smallest rune in its Unicode
+// simple-fold orbit. That is the canonical form strings.EqualFold compares, so
+// two keys collide here exactly when EqualFold reports them equal.
+func simpleFoldKey(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		min := r
+		for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
+			if f < min {
+				min = f
+			}
+		}
+		b.WriteRune(min)
+	}
+	return b.String()
 }
 
 // readFrame reads one newline-terminated line of at most max bytes. A longer

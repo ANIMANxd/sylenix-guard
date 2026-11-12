@@ -3,8 +3,11 @@
 ## Unreleased
 
 - Added `tests/probes/test_redteam_2026_11.py`, which drives the real Guard over
-  raw stdio JSON-RPC and Streamable HTTP and marks the F1-F9 red-team findings
-  as XFAIL until each fix lands.
+  raw stdio JSON-RPC and Streamable HTTP and tracks the F1-F9 red-team findings.
+- Refused `tools/call` frames whose object keys collide under Unicode simple
+  folding (`DUPLICATE_KEYS`), and now forward only the exact checked `name` and
+  `arguments` plus other params such as `_meta`; audit events and the datamark
+  origin use the checked name.
 
 ## 2026-11-11
 

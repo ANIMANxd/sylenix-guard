@@ -7,10 +7,11 @@ cases write exact bytes, because an SDK client would normalise keys and hide
 the parser differentials these probes are about. The one HTTP case uses the
 repository's Streamable HTTP fake server.
 
-Each case is marked expected-fail by default (KNOWN_FAIL). A later fix removes
-its case from that set; until then a failing case prints XFAIL and does not
-fail `make check`. An unexpected pass prints XPASS and fails the run, because
-a fix landed without updating KNOWN_FAIL.
+Each vulnerability case is marked expected-fail by default (KNOWN_FAIL). A
+later fix removes its case from that set; until then a failing case prints
+XFAIL and does not fail `make check`. An unexpected pass prints XPASS and
+fails the run, because a fix landed without updating KNOWN_FAIL. Compatibility
+controls such as F3-meta run as ordinary passing checks.
 
 Run after building the guard:
 
@@ -36,10 +37,11 @@ REDTEAM_SERVER = os.path.join(ROOT, "tests", "probes", "redteam_server.py")
 PROFILE_SERVER = os.path.join(ROOT, "tests", "probes", "profile_server.py")
 
 # Cases that fail on the commit before the corresponding fix. Remove a case
-# from this set in the commit that fixes it.
+# from this set in the commit that fixes it. F3a-F3e were fixed by the exact-key
+# tools/call rewrite and no longer belong here. F3-meta is a compatibility
+# control, not an expected failure: it passes before and after the rewrite.
 KNOWN_FAIL = {
     "F1", "F2",
-    "F3a", "F3b", "F3c", "F3d", "F3e",
     "F4", "F5", "F6",
     "F7a", "F7b", "F7c",
     "F8", "F9",
@@ -461,12 +463,13 @@ def case_f3a():
             })
         finally:
             s.close()
-        if refused(resp):
+        if guard_rule(resp) == "DUPLICATE_KEYS":
             if any(row.get("name") == "write_file" for row in call_log(log)):
                 return False, "the guard refused the call but still forwarded write_file"
             return True, ""
-        return False, ("ambiguous tool name was forwarded; the server ran %r"
-                       % (last_call(log) or {}).get("name"))
+        return False, ("ambiguous tool name was not refused with DUPLICATE_KEYS "
+                       "(rule=%r); the server ran %r"
+                       % (guard_rule(resp), (last_call(log) or {}).get("name")))
 
 
 def case_f3b():
@@ -490,13 +493,14 @@ def case_f3b():
             })
         finally:
             s.close()
-        if refused(resp):
+        if guard_rule(resp) == "DUPLICATE_KEYS":
             if any(row.get("name") == "write_file" for row in call_log(log)):
                 return False, "the guard refused the call but still forwarded write_file"
             return True, ""
         row = last_call(log) or {}
-        return False, ("case-variant arguments were forwarded; the server used %r"
-                       % (row.get("arguments") or {}).get("path"))
+        return False, ("case-variant arguments were not refused with DUPLICATE_KEYS "
+                       "(rule=%r); the server used %r"
+                       % (guard_rule(resp), (row.get("arguments") or {}).get("path")))
 
 
 def case_f3c():
@@ -520,13 +524,14 @@ def case_f3c():
             })
         finally:
             s.close()
-        if refused(resp):
+        if guard_rule(resp) == "DUPLICATE_KEYS":
             if any(row.get("name") == "write_file" for row in call_log(log)):
                 return False, "the guard refused the call but still forwarded write_file"
             return True, ""
         row = last_call(log) or {}
-        return False, ("long-s argument key was forwarded; the server used %r"
-                       % (row.get("arguments") or {}).get("path"))
+        return False, ("long-s argument key was not refused with DUPLICATE_KEYS "
+                       "(rule=%r); the server used %r"
+                       % (guard_rule(resp), (row.get("arguments") or {}).get("path")))
 
 
 def case_f3d():
@@ -547,13 +552,14 @@ def case_f3d():
             })
         finally:
             s.close()
-        if refused(resp):
+        if guard_rule(resp) == "DUPLICATE_KEYS":
             if any(row.get("name") == "poisoned_tool" for row in call_log(log)):
                 return False, "the guard refused the call but poisoned_tool still ran"
             return True, ""
         row = last_call(log) or {}
-        return False, ("quarantined tool ran behind a clean decoy name; server ran %r"
-                       % row.get("name"))
+        return False, ("quarantined tool was not refused with DUPLICATE_KEYS "
+                       "(rule=%r); the server ran %r"
+                       % (guard_rule(resp), row.get("name")))
 
 
 def case_f3e():
@@ -577,16 +583,59 @@ def case_f3e():
             finally:
                 stop_process(proc)
                 proc = None
-            if refused(resp):
+            if guard_rule(resp) == "DUPLICATE_KEYS":
                 if "write_file" in fake.state.calls:
                     return False, "the proxy refused the call but still forwarded write_file"
                 return True, ""
             calls = list(fake.state.calls)
-            return False, ("proxy forwarded the ambiguous name; the upstream server ran %r"
-                           % (calls[-1] if calls else None))
+            return False, ("proxy did not refuse the ambiguous name with DUPLICATE_KEYS "
+                           "(rule=%r); the upstream server ran %r"
+                           % (guard_rule(resp), calls[-1] if calls else None))
     finally:
         stop_process(proc)
         fake.close()
+
+
+def case_f3_meta():
+    """Control for the re-marshalled forward: extra params keys must survive."""
+    with tempfile.TemporaryDirectory() as d:
+        ws = workspace(d)
+        target = os.path.join(ws, "notes.txt")
+        state = os.path.join(d, "state")
+        log = os.path.join(d, "calls.log")
+        env = redteam_env(log, "read_ticket,write_file")
+        s = Session(state, "rt-f3-meta", env=env)
+        try:
+            s.start()
+            meta = {"trace": "abc", "n": 1}
+            resp = s.call_params({
+                "name": "write_file",
+                "arguments": {"path": target},
+                "_meta": meta,
+            })
+        finally:
+            s.close()
+        problems = []
+        if "result" not in resp:
+            problems.append("the call was blocked: %s" % resp)
+        row = last_call(log) or {}
+        if row.get("name") != "write_file":
+            problems.append("the server resolved name %r" % row.get("name"))
+        if "_meta" not in (row.get("parameter_keys") or []):
+            problems.append("_meta did not reach the server")
+        if row.get("meta") != meta:
+            problems.append("_meta changed in transit: %r" % row.get("meta"))
+        if (row.get("arguments") or {}).get("path") != target:
+            problems.append("arguments changed in transit")
+        if 'origin="write_file"' not in result_text(resp):
+            problems.append("the datamark origin was not the checked name")
+        allowed = [event for event in audit_events(state, "rt-f3-meta")
+                   if event.get("event") == "allow"]
+        if not any(event.get("tool") == "write_file" for event in allowed):
+            problems.append("the audit event did not name the checked tool")
+        if problems:
+            return False, "; ".join(problems)
+        return True, ""
 
 
 # ---------------------------------------------------------------- F2: read-class sensitive reads
@@ -911,6 +960,7 @@ def main():
         check_case("F3c", "long-s arguments key is refused", case_f3c)
         check_case("F3d", "quarantined tool cannot hide behind a clean decoy name", case_f3d)
         check_case("F3e", "case-variant tool name through the HTTP proxy is refused", case_f3e)
+        check_case("F3-meta", "a normal call with _meta forwards and works", case_f3_meta)
         check_case("F2", "read-class tools cannot read sensitive targets after taint", case_f2)
         check_case("F4", "approval dialog names the full protected path and category",
                    lambda: case_f4(dialog_bin))
