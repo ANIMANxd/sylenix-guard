@@ -301,10 +301,19 @@ it returns the original line; taint has already been latched.
 
 ## 6. Taint lifecycle
 
-Taint is in memory only. It begins clean in each new guard process.
+Taint begins clean in each new guard process unless a shared session latch
+exists for its session key. The local latch is in memory; the shared latch is
+`session-<sha256(key)[:16]>.taint` in the state directory, mode `0600`.
 
-**Set** by `latch` / `latchReason`. The first latch records the
-origin and emits `taint_latched`; later latches only set the boolean.
+**Set** by `latch` / `latchReason`. The first local latch records the origin,
+emits `taint_latched`, and writes the shared latch (origin server, origin,
+timestamp, key hash). Later latches only set the boolean.
+
+**Adopted** by `sessionTainted` when the shared latch exists but this process is
+not locally tainted. Adoption sets the local latch and emits `taint_adopted`
+with `origin_server`. The shared file is cached by `os.Stat` mtime and size; a
+file that exists but is unreadable, corrupt or from a different key hash is
+treated as tainted.
 
 Triggers:
 
@@ -318,10 +327,13 @@ Triggers:
 | Oversize server frame | `readFrame` (server loop) |
 
 **Cleared** only by `clearTaint`, which is called only from the
-human-approved clear-taint control path. A successful clear emits
-`CLEAR_TAINT` with `who`, `method: dialog`, and a request id. It does not revoke
-grants, quarantines, or the server process. MCP tool calls, host methods, server
-messages, and environment variables cannot clear the latch.
+human-approved clear-taint control path. A successful clear removes the shared
+latch, writes a clear marker with the request id, and emits `CLEAR_TAINT` with
+`who`, `method: dialog`, and a request id. Every other Guard in the session sees
+the marker in its control loop, drops its local latch, and emits
+`clear_taint_adopted`. A Guard never deletes the shared latch on its own. The
+clear does not revoke grants, quarantines, or the server process. MCP tool calls,
+host methods, server messages, and environment variables cannot clear the latch.
 
 The `clear-taint` CLI writes a nonce- and guard-start-bound request
 file into the state directory and waits for the running guard's result. The
@@ -491,6 +503,8 @@ Default state directory: `~/.sylenix-poc`. It is created with
 | `control-<hash>.json` | JSON `{version,name,pid,nonce,started_at,heartbeat}`. `<hash>` is the first 16 bytes of SHA-256(name), hex. | `0600` | Created by `startGuardControl`; heartbeat every 2 s; stale after 15 s; removed on exit. |
 | `clear-taint-request-<hash>.json` | JSON `{version,nonce,guard_started,request_id,requested_at}`. | `0600` | Written by CLI; polled and removed by guard; TTL 2 min. |
 | `clear-taint-result-<hash>-<request_id>.json` | JSON `{version,request_id,status,who,at,note}`. | `0600` | Written by guard; read and removed by CLI; stale results removed at next guard start. |
+| `session-<hash>.taint` | JSON `{version,key_hash,origin_server,origin,ts,parent_pid?,parent_start?}`. `<hash>` is the first 16 bytes of SHA-256(session key), hex. | `0600` | Shared session latch written on the first local latch; read and cached by `sessionTainted`; removed only by a human-approved clear. |
+| `session-<hash>.cleared` | JSON `{version,key_hash,request_id,ts}`. | `0600` | Clear marker written by `clearTaint`; polled by other Guards in the session. |
 | `<config>.sylenix-backup-<UTC timestamp>` | Byte-for-byte copy of an MCP client config before `install`/`uninstall`. | Original file mode | `writeConfigBackup`. |
 | `policy.yaml` written by `install`/`allow` | Canonical YAML; comments/formatting not preserved. | `0600` | `writePolicyFile`. |
 

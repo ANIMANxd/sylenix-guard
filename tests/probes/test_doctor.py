@@ -198,6 +198,50 @@ def case_clean():
         check("clean: human shows allowlisted", "allowlisted" in human.stdout, human.stdout)
 
 
+def case_shared_taint_off():
+    print("shared session taint configuration")
+    with tempfile.TemporaryDirectory() as base:
+        home, project, state, env, server_py, policy = setup_server(base)
+        basic_policy(policy, server_py)
+        one = wrapper(policy, state, sys.executable, [server_py])
+        two = wrapper(policy, state, sys.executable, [server_py])
+        write_config(home, {"one": one, "two": two})
+        p, data = doctor_json(env, project)
+        check("shared taint: missing session is a finding",
+              p.returncode == 1 and "SHARED_TAINT_OFF" in codes(data), p.stdout)
+        detail = finding(data, "SHARED_TAINT_OFF") or {}
+        check("shared taint: finding names SYLENIX_SESSION",
+              "SYLENIX_SESSION" in detail.get("detail", ""), str(detail))
+        check("shared taint: fix says re-run install",
+              "install" in detail.get("fix", ""), str(detail))
+
+        installed = run(["install", "--yes"], env, project)
+        check("shared taint: re-running install succeeds", installed.returncode == 0, installed.stderr)
+        p, data = doctor_json(env, project)
+        check("shared taint: re-running install fixes the finding",
+              "SHARED_TAINT_OFF" not in codes(data), p.stdout)
+
+        one["env"] = {"SYLENIX_SESSION": "shared-client"}
+        write_config(home, {"one": one, "two": two})
+        p, data = doctor_json(env, project)
+        check("shared taint: one missing session still finds the gap",
+              p.returncode == 1 and "SHARED_TAINT_OFF" in codes(data), p.stdout)
+
+        two["env"] = {"SYLENIX_SESSION": "shared-client"}
+        write_config(home, {"one": one, "two": two})
+        p, data = doctor_json(env, project)
+        check("shared taint: both configured is clean",
+              "SHARED_TAINT_OFF" not in codes(data), p.stdout)
+
+        three = wrapper(policy, state, sys.executable, [server_py])
+        four = {"command": sys.executable, "args": [server_py]}
+        three["env"] = {"SYLENIX_SESSION": "shared-client"}
+        write_config(home, {"three": three, "four": four})
+        p, data = doctor_json(env, project)
+        check("shared taint: one wrapped and one unwrapped is not flagged",
+              "SHARED_TAINT_OFF" not in codes(data), p.stdout)
+
+
 def case_not_wrapped():
     print("unwrapped stdio server")
     with tempfile.TemporaryDirectory() as base:
@@ -609,6 +653,7 @@ def main():
     if not os.path.exists(GUARD):
         sys.exit("build first: CGO_ENABLED=0 go build -o bin/sylenix-guard ./cmd/sylenix-guard")
     case_clean()
+    case_shared_taint_off()
     case_not_wrapped()
     case_remote()
     case_not_allowlisted()

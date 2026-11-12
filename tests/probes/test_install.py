@@ -195,6 +195,7 @@ def round_trip_test():
         check("install exits successfully", installed.returncode == 0, installed.stderr)
         for path, parts in configs:
             obj = read_json(path)
+            session_values = []
             for name, entry in get_servers(obj, parts).items():
                 if name == "remote":
                     check(f"{os.path.basename(path)}/{name}: remote entry untouched",
@@ -207,6 +208,13 @@ def round_trip_test():
                       len(args) >= 2 and args[0] == "--", str(args))
                 check(f"{os.path.basename(path)}/{name}: Guard metadata present",
                       isinstance(entry.get("_sylenixGuard"), dict), str(entry))
+                entry_env = entry.get("env")
+                session = entry_env.get("SYLENIX_SESSION") if isinstance(entry_env, dict) else None
+                check(f"{os.path.basename(path)}/{name}: shared session env present",
+                      isinstance(session, str) and session.strip() != "", str(entry_env))
+                session_values.append(session)
+            check(f"{os.path.basename(path)}: wrapped servers share a session key",
+                  len(set(session_values)) <= 1, str(session_values))
             check(f"{os.path.basename(path)}: backup exists",
                   bool(glob.glob(path + ".sylenix-backup-*")))
 

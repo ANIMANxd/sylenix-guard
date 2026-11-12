@@ -204,6 +204,40 @@ requires authorization that the agent cannot grant itself.
    to the exact file(s) the approved call touched; other approvals are scoped to
    the directory. Grants are held in memory for the life of the process.
 
+### Shared taint across server processes
+
+The Guard still wraps one MCP server per process. `install` now gives every
+wrapped server in one client configuration the same `SYLENIX_SESSION` value, so
+content read through one server taints the others and a protected write cannot
+ride an untainted sibling.
+
+- Without an explicit session, a stdio Guard derives its key from its parent MCP
+  client process: `<ppid>-<parent start time>`. If the start time cannot be read,
+  it falls back to the PID alone and writes a `session_key_weak` audit event.
+- `--session NAME` or `SYLENIX_SESSION=NAME` overrides the key. Proxy mode has no
+  MCP host parent, so its default is per-process; set the flag or environment
+  variable to share with stdio Guards.
+- Guards in one session must use the same `--state-dir`. The shared latch is
+  `session-<sha256(key)[:16]>.taint`, mode `0600` inside the `0700` state
+  directory. It contains only a version, the key hash, the originating server and
+  tool/method, a timestamp and parent-process GC metadata. It never contains
+  content or argument values.
+- A Guard that starts while a valid latch exists for its live session starts
+  tainted. A latch whose recorded parent process is gone is garbage-collected at
+  startup; a corrupt or unreadable latch is treated as tainted. A human-approved
+  `clear-taint` removes the shared latch and clears every Guard in the session;
+  the Guards poll a request-id marker rather than deleting shared state
+  themselves.
+- A host that spawns servers through a launcher shim must set `SYLENIX_SESSION`
+  itself and keep the shim (the recorded parent process) alive for the server's
+  lifetime. Session files are garbage-collected at startup when their recorded
+  parent process is gone; use `clear-taint` to retire a session earlier.
+- `install` uses a stable client-config name, so two concurrently running
+  instances of the same client configuration intentionally share one session
+  latch. Set `--session` or `SYLENIX_SESSION` explicitly if you need per-instance
+  isolation. Same-user processes can read or tamper with local state; this is not
+  a privilege boundary.
+
 ## Current state
 
 The enforcement core above is implemented, tested and measured. The implementation is a
@@ -253,12 +287,14 @@ wraps one MCP server per process over stdio or Streamable HTTP.
 - JSON-lines audit log that never records argument values
 - Fail-closed handling of malformed, duplicate, batched and oversize frames
 
-**Not in this build** — OS sandboxing, credential brokering, a confidentiality latch,
-HSM/remote signing, remote or biometric approval, evidence ledgers, multi-server sessions,
-OAuth token storage/refresh, and the legacy HTTP+SSE transport from 2024-11-05. The full
-product architecture is specified in [`docs/SPEC_FULL.md`](docs/SPEC_FULL.md); those
-layers are deliberately left out of the current build. Scope and behavior are governed
-by [`POC_SPIKE.md`](POC_SPIKE.md).
+**Not in this build** - OS sandboxing, credential brokering, a confidentiality latch,
+HSM/remote signing, remote or biometric approval, evidence ledgers, multi-server
+routing (shared taint across separately wrapped servers is supported; each Guard
+still fronts one server), OAuth token storage/refresh, and the legacy HTTP+SSE
+transport from 2024-11-05. The full product architecture is specified in
+[`docs/SPEC_FULL.md`](docs/SPEC_FULL.md); those layers are deliberately left out
+of the current build. Scope and behavior are governed by
+[`POC_SPIKE.md`](POC_SPIKE.md).
 
 ## Build from source and manual setup
 
@@ -599,7 +635,8 @@ bypass, response expectations and safe harbour.
 ## Known limitations
 
 - Coverage is one MCP server per process. Host built-in tools, attachments and pasted
-  text never pass through the gateway.
+  text never pass through the gateway. Taint can be shared across the servers of one
+  client through `SYLENIX_SESSION`; that is not a multi-server router.
 - Proxy mode covers one Streamable HTTP endpoint. It targets MCP 2025-11-25 and
   tolerates the stateless 2026-07-28 shape; the legacy HTTP+SSE transport is not
   implemented. It passes `Mcp-Session-Id` through rather than mapping sessions per

@@ -18,6 +18,7 @@ Run after building the guard:
     python3 tests/probes/test_redteam_2026_11.py
 """
 import http.client
+import hashlib
 import json
 import os
 import queue
@@ -37,14 +38,13 @@ REDTEAM_SERVER = os.path.join(ROOT, "tests", "probes", "redteam_server.py")
 PROFILE_SERVER = os.path.join(ROOT, "tests", "probes", "profile_server.py")
 
 # Cases that fail on the commit before the corresponding fix. Remove a case
-# from this set in the commit that fixes it. F2, F3a-F3e, F4 and F6 were fixed
-# by the read-class scan, exact-key tools/call rewrite, structured dialog and
-# exact-file grants, so they no longer belong here. F2-read and F3-meta are
-# compatibility controls, not expected failures: they pass before and after the
-# fixes. F2-dialog and F4-github exercise new paths; they fail before the fix
-# and pass after.
+# from this set in the commit that fixes it. F1, F2, F3a-F3e, F4 and F6 were
+# fixed by session sharing, the read-class scan, exact-key tools/call rewrite,
+# structured dialog and exact-file grants, so they no longer belong here.
+# F2-read and F3-meta are compatibility controls, not expected failures: they
+# pass before and after the fixes. F2-dialog and F4-github exercise new paths;
+# they fail before the fix and pass after.
 KNOWN_FAIL = {
-    "F1",
     "F5",
     "F7a", "F7b", "F7c",
     "F8", "F9",
@@ -347,6 +347,12 @@ func main() {
 			_ = f.Close()
 		}
 	}
+	if strings.Contains(strings.ToLower(msg), "clear the taint") {
+		if os.Getenv("FAKE_DIALOG_CLEAR") == "allow" {
+			os.Exit(0)
+		}
+		os.Exit(1)
+	}
 	switch os.Getenv("FAKE_DIALOG_ANSWER") {
 	case "grant":
 		os.Exit(2)
@@ -371,9 +377,12 @@ log = os.environ.get("FAKE_DIALOG_LOG")
 if log:
     with open(log, "a", encoding="utf-8") as fh:
         fh.write(msg + "\\n")
-answer = os.environ.get("FAKE_DIALOG_ANSWER", "deny")
-print("button returned:" + {"grant": "Allow Tool for 15m",
-                            "once": "Allow Once"}.get(answer, "Deny"))
+if "clear the taint" in msg.lower():
+    print("button returned:" + ("Clear Taint" if os.environ.get("FAKE_DIALOG_CLEAR") == "allow" else "Deny"))
+else:
+    answer = os.environ.get("FAKE_DIALOG_ANSWER", "deny")
+    print("button returned:" + {"grant": "Allow Tool for 15m",
+                                "once": "Allow Once"}.get(answer, "Deny"))
 ''')
         os.chmod(script, 0o755)
     else:
@@ -390,8 +399,11 @@ log = os.environ.get("FAKE_DIALOG_LOG")
 if log:
     with open(log, "a", encoding="utf-8") as fh:
         fh.write(msg + "\\n")
-answer = os.environ.get("FAKE_DIALOG_ANSWER", "deny")
-print({"grant": "Allow Tool for 15m", "once": "Allow Once"}.get(answer, "Deny"))
+if "clear the taint" in msg.lower():
+    print("Clear Taint" if os.environ.get("FAKE_DIALOG_CLEAR") == "allow" else "Deny")
+else:
+    answer = os.environ.get("FAKE_DIALOG_ANSWER", "deny")
+    print({"grant": "Allow Tool for 15m", "once": "Allow Once"}.get(answer, "Deny"))
 ''')
         os.chmod(script, 0o755)
     return bin_dir
@@ -879,16 +891,147 @@ def case_f1():
             a.start()
             b.start()
             a.call("read_ticket")
-            resp = b.call("write_file", {"path": os.path.join(ws, "out.txt")})
+            first = b.call("write_file", {"path": os.path.join(ws, "out.txt")})
+            second = b.call("write_file", {"path": os.path.join(ws, "out.txt")})
         finally:
             a.close()
             b.close()
-        if "result" not in resp and guard_rule(resp) in ("TAINT_SINK", "EGRESS_TARGET"):
-            if any(row.get("name") == "write_file" for row in call_log(log_b)):
-                return False, "Guard B refused the call but still forwarded it"
-            return True, ""
-        return False, ("Guard B did not inherit Guard A's taint: rule=%r"
-                       % guard_rule(resp))
+        if "result" in first or guard_rule(first) != "TAINT_SINK":
+            return False, ("Guard B did not inherit Guard A's taint: rule=%r"
+                           % guard_rule(first))
+        if "result" in second or guard_rule(second) != "TAINT_SINK":
+            return False, "Guard B lost the adopted taint: rule=%r" % guard_rule(second)
+        if any(row.get("name") == "write_file" for row in call_log(log_b)):
+            return False, "Guard B refused the call but still forwarded it"
+        adopted = [event for event in audit_events(state, "rt-f1-b")
+                   if event.get("event") == "taint_adopted"]
+        if len(adopted) != 1:
+            return False, "expected one taint_adopted event on Guard B, got %d" % len(adopted)
+        if adopted[0].get("origin_server") != "rt-f1-a":
+            return False, ("taint_adopted named %r, expected 'rt-f1-a'"
+                           % adopted[0].get("origin_server"))
+        return True, ""
+
+
+def case_f1_clear(dialog_bin):
+    with tempfile.TemporaryDirectory() as d:
+        ws = workspace(d)
+        target = os.path.join(ws, "out.txt")
+        state = os.path.join(d, "state")
+        log = os.path.join(d, "dialog.log")
+        env = dialog_env(dialog_bin, log, "deny")
+        env["REDTEAM_TOOLS"] = "read_ticket,write_file"
+        env["FAKE_DIALOG_CLEAR"] = "allow"
+        a = Session(state, "rt-f1-clear-a", flags=("--trust", "write_file"), env=env)
+        b = Session(state, "rt-f1-clear-b", flags=("--trust", "write_file"), env=env)
+        try:
+            a.start()
+            b.start()
+            a.call("read_ticket")
+            blocked = b.call("write_file", {"path": target})
+            if "result" in blocked or guard_rule(blocked) != "TAINT_SINK":
+                return False, "Guard B was not tainted before the clear: rule=%r" % guard_rule(blocked)
+            p = subprocess.run(
+                [GUARD, "clear-taint", "--name", "rt-f1-clear-a", "--state-dir", state],
+                env=env, capture_output=True, text=True, timeout=30)
+            if p.returncode != 0:
+                return False, "clear-taint failed: %s %s" % (p.stdout.strip(), p.stderr.strip())
+            deadline = time.time() + 10
+            last = None
+            allowed = False
+            while time.time() < deadline:
+                last = b.call("write_file", {"path": target})
+                if "result" in last:
+                    allowed = True
+                    break
+                if guard_rule(last) != "TAINT_SINK":
+                    break
+                time.sleep(0.2)
+            if not allowed:
+                return False, "Guard B was not cleared: rule=%r" % guard_rule(last)
+            after_a = a.call("write_file", {"path": target})
+            if "result" not in after_a:
+                return False, "Guard A was not cleared: rule=%r" % guard_rule(after_a)
+        finally:
+            a.close()
+            b.close()
+        return True, ""
+
+
+def case_f1_isolated():
+    with tempfile.TemporaryDirectory() as d:
+        ws = workspace(d)
+        target = os.path.join(ws, "out.txt")
+        state = os.path.join(d, "state")
+        a = Session(state, "rt-f1-iso-a",
+                    env=redteam_env(None, "read_ticket,write_file",
+                                    SYLENIX_SESSION="rt-iso-a"))
+        b = Session(state, "rt-f1-iso-b",
+                    env=redteam_env(None, "read_ticket,write_file",
+                                    SYLENIX_SESSION="rt-iso-b"))
+        try:
+            a.start()
+            b.start()
+            a.call("read_ticket")
+            on_a = a.call("write_file", {"path": target})
+            on_b = b.call("write_file", {"path": target})
+        finally:
+            a.close()
+            b.close()
+        if "result" in on_a or guard_rule(on_a) != "TAINT_SINK":
+            return False, "Guard A was not tainted in its own session: rule=%r" % guard_rule(on_a)
+        if "result" not in on_b:
+            return False, "Guard B was tainted by Guard A's different session: rule=%r" % guard_rule(on_b)
+        return True, ""
+
+
+def case_f1_corrupt():
+    with tempfile.TemporaryDirectory() as d:
+        ws = workspace(d)
+        target = os.path.join(ws, "out.txt")
+        state = os.path.join(d, "state")
+        os.makedirs(state, exist_ok=True)
+        key = "rt-corrupt-session"
+        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
+        with open(os.path.join(state, "session-" + digest + ".taint"), "wb") as fh:
+            fh.write(b"this is not a session record")
+        env = redteam_env(None, "read_ticket,write_file", SYLENIX_SESSION=key)
+        s = Session(state, "rt-f1-corrupt", env=env)
+        try:
+            s.start()
+            resp = s.call("write_file", {"path": target})
+        finally:
+            s.close()
+        if "result" in resp or guard_rule(resp) != "TAINT_SINK":
+            return False, "a corrupt session file did not taint the session: rule=%r" % guard_rule(resp)
+        return True, ""
+
+
+def case_f1_restart():
+    with tempfile.TemporaryDirectory() as d:
+        ws = workspace(d)
+        target = os.path.join(ws, "out.txt")
+        state = os.path.join(d, "state")
+        env = redteam_env(None, "read_ticket,write_file",
+                          SYLENIX_SESSION="rt-restart-session")
+        a = Session(state, "rt-f1-restart-a", env=env)
+        first_b = Session(state, "rt-f1-restart-b", env=env)
+        second_b = None
+        try:
+            a.start()
+            first_b.start()
+            first_b.close()
+            a.call("read_ticket")
+            second_b = Session(state, "rt-f1-restart-b", env=env)
+            second_b.start()
+            resp = second_b.call("write_file", {"path": target})
+        finally:
+            a.close()
+            if second_b is not None:
+                second_b.close()
+        if "result" in resp or guard_rule(resp) != "TAINT_SINK":
+            return False, "a restarted Guard in a tainted session was not tainted: rule=%r" % guard_rule(resp)
+        return True, ""
 
 
 def case_f5():
@@ -1091,6 +1234,13 @@ def main():
         check_case("F6", "a protected-target grant does not cover another category",
                    lambda: case_f6(dialog_bin))
         check_case("F1", "Guard siblings with the same parent share taint", case_f1)
+        check_case("F1-clear", "clear-taint clears every Guard in the session",
+                   lambda: case_f1_clear(dialog_bin))
+        check_case("F1-isolated", "different SYLENIX_SESSION keys stay isolated",
+                   case_f1_isolated)
+        check_case("F1-corrupt", "a corrupt session file taints the session", case_f1_corrupt)
+        check_case("F1-restart", "a restarted Guard in a tainted session starts tainted",
+                   case_f1_restart)
         check_case("F5", "initialize instructions and tool description taint the session",
                    case_f5)
         check_case("F7a", "Unicode tag characters are stripped from embedded resources",

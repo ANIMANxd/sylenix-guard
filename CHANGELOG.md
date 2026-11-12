@@ -17,6 +17,10 @@
   human approved and stated that scope in the dialog, while non-protected grants
   keep their directory scope; a non-protected grant still never satisfies a
   protected call.
+- Shared taint across Guard processes in one client session through
+  `SYLENIX_SESSION` / `--session` and a 0600 session latch file; startup adoption
+  and `clear-taint` cover every Guard, `install` writes the session env, and
+  `doctor` reports `SHARED_TAINT_OFF` when wrappers do not share a session.
 
 ## 2026-11-11
 

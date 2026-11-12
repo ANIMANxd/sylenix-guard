@@ -63,6 +63,31 @@ const grantTTL = 15 * time.Minute // how long a "Allow Tool for 15m" click stays
 const guardMetaKey = "_sylenixGuard"
 const guardMetaVersion = 1
 
+const sessionEnvKey = "SYLENIX_SESSION"
+const sessionFileVersion = 1
+const sessionFileLimit = 1 << 20 // the shared latch is tiny; anything larger is corrupt
+
+// sessionTaintFile is the shared latch content. It never contains tool output,
+// argument values or file content.
+type sessionTaintFile struct {
+	Version      int    `json:"version"`
+	KeyHash      string `json:"key_hash"`
+	OriginServer string `json:"origin_server,omitempty"`
+	Origin       string `json:"origin,omitempty"`
+	TS           string `json:"ts,omitempty"`
+	ParentPID    int    `json:"parent_pid,omitempty"`
+	ParentStart  string `json:"parent_start,omitempty"`
+}
+
+// sessionClearFile tells running Guards that the shared latch was removed by a
+// human-approved clear-taint. It never contains content.
+type sessionClearFile struct {
+	Version   int    `json:"version"`
+	KeyHash   string `json:"key_hash"`
+	RequestID string `json:"request_id"`
+	TS        string `json:"ts"`
+}
+
 const policyVersion = 1
 const policyFileName = "policy.yaml"
 
@@ -348,10 +373,28 @@ type Guard struct {
 	mu          sync.Mutex
 	tainted     bool
 	taintOrigin string
+	taintSince  time.Time
 	pending     map[string]pendingReq
 	pins        map[string]string
 	quarantined map[string]string
 	grants      []grant // live time-bounded approvals
+
+	sessionKey      string
+	sessionHash     string
+	sessionFile     string
+	sessionClear    string
+	sessionWeak     bool
+	sessionExplicit bool
+	parentPID       int
+	parentStart     string
+
+	sessionMu                sync.Mutex
+	sessionCacheValid        bool
+	sessionCacheMod          time.Time
+	sessionCacheSize         int64
+	sessionCacheOriginServer string
+	sessionCacheOrigin       string
+	sessionLastClear         string
 
 	serverGone  atomic.Bool // set once the server's stdout has closed
 	taintedFlag atomic.Bool
@@ -398,6 +441,11 @@ type guardOptions struct {
 	AuditID         string
 	AuditInterval   string
 	AuditBatch      int
+	SessionKey      string
+	SessionWeak     bool
+	SessionExplicit bool
+	ParentPID       int
+	ParentStart     string
 }
 
 func main() {
@@ -430,6 +478,7 @@ func main() {
 	}
 	name := flag.String("name", "", "label for this server; names the pin and log files (default: command name)")
 	stateDir := flag.String("state-dir", "", "directory for pins and the audit log (default ~/.sylenix-poc)")
+	session := flag.String("session", "", "share taint with other Guard processes in this client session (default: parent process)")
 	policyPath := flag.String("policy", "", "path to a versioned policy file (default: <state-dir>/policy.yaml, else built-in defaults)")
 	policyPubKey := flag.String("policy-pubkey", "", "Ed25519 public key used to verify policy and pin signatures")
 	policyKey := flag.String("policy-key", "", "Ed25519 private key used to sign the pin store on write")
@@ -458,6 +507,7 @@ func main() {
 	visited := map[string]bool{}
 	flag.Visit(func(f *flag.Flag) { visited[f.Name] = true })
 
+	sessionKey, sessionParentPID, sessionParentStart, sessionWeak, sessionExplicit := resolveStdioSession(*session)
 	args := flag.Args()
 	if len(args) == 0 {
 		fmt.Fprintln(os.Stderr, "usage: sylenix-guard [flags] -- <server command> [args...]\n       sylenix-guard proxy --listen ADDR --upstream URL [flags]")
@@ -489,6 +539,11 @@ func main() {
 		AuditID:         *auditID,
 		AuditInterval:   *auditInterval,
 		AuditBatch:      *auditBatch,
+		SessionKey:      sessionKey,
+		SessionWeak:     sessionWeak,
+		SessionExplicit: sessionExplicit,
+		ParentPID:       sessionParentPID,
+		ParentStart:     sessionParentStart,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "sylenix-guard:", err)
@@ -528,7 +583,12 @@ func main() {
 	g.event("start", map[string]any{"command": args[0], "readonly": sortedKeys(g.readonly), "trust": sortedKeys(g.trust), "approve": g.approve,
 		"policy_source": g.policySource, "policy_version": g.policyVersion,
 		"profile": g.profileName, "profile_source": g.profileSource,
-		"allow_write_under": []string(allowWriteUnder), "grants": []string(grantSpecs)})
+		"allow_write_under": []string(allowWriteUnder), "grants": []string(grantSpecs),
+		"session_explicit": g.sessionExplicit})
+	if g.sessionWeak {
+		g.event("session_key_weak", map[string]any{"reason": "start time unavailable"})
+	}
+	g.sessionTainted()
 	g.startTeamPoller()
 	control, controlErr := startGuardControl(g)
 	if controlErr != nil {
@@ -640,6 +700,9 @@ func prepareGuard(opts guardOptions) (*Guard, error) {
 	visited := opts.Visited
 	if visited == nil {
 		visited = map[string]bool{}
+	}
+	if strings.TrimSpace(opts.SessionKey) == "" {
+		return nil, fmt.Errorf("session key is empty")
 	}
 	if visited["approve"] && opts.Approve != "deny" && opts.Approve != "dialog" {
 		return nil, fmt.Errorf("--approve must be deny or dialog")
@@ -763,7 +826,17 @@ func prepareGuard(opts guardOptions) (*Guard, error) {
 		log:           logf,
 		verifyKey:     verifyKey,
 		signKey:       signKey,
+
+		sessionKey:      opts.SessionKey,
+		sessionHash:     sessionKeyHash(opts.SessionKey),
+		sessionWeak:     opts.SessionWeak,
+		sessionExplicit: opts.SessionExplicit,
+		parentPID:       opts.ParentPID,
+		parentStart:     opts.ParentStart,
 	}
+	g.sessionFile = sessionTaintPath(stateDir, g.sessionHash)
+	g.sessionClear = sessionClearPath(stateDir, g.sessionHash)
+	g.gcStaleSessionFiles()
 	if err := g.startAuditShipper(opts); err != nil {
 		g.event("audit_config_invalid", map[string]any{"reason": "invalid_audit_configuration"})
 		_ = logf.Close()
@@ -831,6 +904,60 @@ func prepareGuard(opts guardOptions) (*Guard, error) {
 	g.event("policy_loaded", map[string]any{"source": source, "version": pf.Version, "approve": g.approve,
 		"profile": g.profileName, "profile_source": g.profileSource})
 	return g, nil
+}
+
+func sessionOverride(flagValue string) string {
+	if value := strings.TrimSpace(flagValue); value != "" {
+		return value
+	}
+	return strings.TrimSpace(os.Getenv(sessionEnvKey))
+}
+
+// resolveStdioSession uses the flag, then SYLENIX_SESSION, then the parent MCP
+// client process: "<ppid>-<parent start time>". The start time protects the key
+// from PID reuse. If it cannot be read, the key falls back to the PID alone and
+// the caller logs session_key_weak.
+func resolveStdioSession(flagValue string) (key string, parentPID int, parentStart string, weak, explicit bool) {
+	ppid := os.Getppid()
+	start, _ := processStartTime(ppid)
+	if value := sessionOverride(flagValue); value != "" {
+		return value, ppid, start, false, true
+	}
+	if ppid <= 0 {
+		return "0", 0, "", true, false
+	}
+	if start == "" {
+		return strconv.Itoa(ppid), ppid, "", true, false
+	}
+	return fmt.Sprintf("%d-%s", ppid, start), ppid, start, false, false
+}
+
+// resolveProxySession has no MCP host parent, so its default is a per-process
+// key. --session or SYLENIX_SESSION can share it with stdio Guards. The proxy
+// process itself owns the session file for garbage-collection purposes.
+func resolveProxySession(flagValue string) (key string, parentPID int, parentStart string, weak, explicit bool) {
+	pid := os.Getpid()
+	start, _ := processStartTime(pid)
+	if value := sessionOverride(flagValue); value != "" {
+		return value, pid, start, false, true
+	}
+	if start == "" {
+		return fmt.Sprintf("proxy-%d", pid), pid, "", true, false
+	}
+	return fmt.Sprintf("proxy-%d-%s", pid, start), pid, start, false, false
+}
+
+func sessionKeyHash(key string) string {
+	sum := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(sum[:])
+}
+
+func sessionTaintPath(stateDir, keyHash string) string {
+	return filepath.Join(stateDir, "session-"+keyHash[:32]+".taint")
+}
+
+func sessionClearPath(stateDir, keyHash string) string {
+	return filepath.Join(stateDir, "session-"+keyHash[:32]+".cleared")
 }
 
 func redactTeamURL(raw string) string {
@@ -951,6 +1078,7 @@ type guardFlagValues struct {
 	ResetPins       bool
 	AllowWriteUnder stringList
 	GrantSpecs      stringList
+	Session         string
 }
 
 func registerGuardFlags(fs *flag.FlagSet, v *guardFlagValues) {
@@ -977,6 +1105,7 @@ func registerGuardFlags(fs *flag.FlagSet, v *guardFlagValues) {
 	fs.BoolVar(&v.ResetPins, "reset-pins", false, "discard existing pins and trust every tool as new on first sight")
 	fs.Var(&v.AllowWriteUnder, "allow-write-under", "tainted calls need no prompt while every path argument stays inside DIR, or TOOL=DIR to scope it to one tool; repeatable")
 	fs.Var(&v.GrantSpecs, "grant", "pre-approved sink calls: TOOL[:DIR]=DURATION (for example write_file=15m); repeatable")
+	fs.StringVar(&v.Session, "session", "", "share taint with other Guard processes in this session (default: per-process for proxy)")
 }
 
 type sseEvent struct {
@@ -1056,6 +1185,7 @@ func runProxyCommand(args []string) int {
 		return 2
 	}
 
+	sessionKey, sessionParentPID, sessionParentStart, sessionWeak, sessionExplicit := resolveProxySession(vals.Session)
 	g, err := prepareGuard(guardOptions{
 		Name:            vals.Name,
 		DefaultName:     defaultProxyName(upstream),
@@ -1082,6 +1212,11 @@ func runProxyCommand(args []string) int {
 		GrantSpecs:      vals.GrantSpecs,
 		Visited:         visited,
 		ServerArgs:      []string{upstream.Hostname(), upstream.Path},
+		SessionKey:      sessionKey,
+		SessionWeak:     sessionWeak,
+		SessionExplicit: sessionExplicit,
+		ParentPID:       sessionParentPID,
+		ParentStart:     sessionParentStart,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "sylenix-guard proxy:", err)
@@ -1120,7 +1255,12 @@ func runProxyCommand(args []string) int {
 		"profile_source":    g.profileSource,
 		"allow_write_under": []string(vals.AllowWriteUnder),
 		"grants":            []string(vals.GrantSpecs),
+		"session_explicit":  g.sessionExplicit,
 	})
+	if g.sessionWeak {
+		g.event("session_key_weak", map[string]any{"reason": "start time unavailable"})
+	}
+	g.sessionTainted()
 	g.startTeamPoller()
 
 	handler := &proxyHandler{g: g, upstream: upstream, client: newProxyClient(), listen: listenAddr}
@@ -5346,8 +5486,8 @@ func (g *Guard) fromHost(line []byte) (forward []byte, reply []byte) {
 
 	g.mu.Lock()
 	reason, quarantined := g.quarantined[name]
-	tainted, origin := g.tainted, g.taintOrigin
 	g.mu.Unlock()
+	tainted, origin := g.taintState()
 	pol := g.currentPolicy()
 
 	if quarantined {
@@ -5642,6 +5782,7 @@ func (g *Guard) latchReason(origin, reason string) {
 	g.taintedFlag.Store(true)
 	if first {
 		g.taintOrigin = origin
+		g.taintSince = time.Now()
 	}
 	g.mu.Unlock()
 	if first {
@@ -5650,16 +5791,298 @@ func (g *Guard) latchReason(origin, reason string) {
 			fields["reason"] = reason
 		}
 		g.event("taint_latched", fields)
+		g.writeSessionTaint(origin)
 		alert("session tainted by %q; non-read-only tools now need approval", origin)
 	}
 }
 
+// sessionTainted returns the effective taint: the local latch or the shared
+// session latch. A remote taint is adopted once and audited. An unreadable or
+// corrupt shared file is treated as tainted.
+func (g *Guard) sessionTainted() bool {
+	if g.taintedFlag.Load() {
+		return true
+	}
+	info, err := os.Stat(g.sessionFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			g.sessionMu.Lock()
+			g.sessionCacheValid = false
+			g.sessionMu.Unlock()
+			return false
+		}
+		g.adoptSessionTaint("unknown", "session_unreadable", time.Now())
+		return true
+	}
+	if !info.Mode().IsRegular() || info.Size() > sessionFileLimit {
+		g.adoptSessionTaint("unknown", "session_unreadable", time.Now())
+		return true
+	}
+	g.sessionMu.Lock()
+	if g.sessionCacheValid && info.ModTime().Equal(g.sessionCacheMod) && info.Size() == g.sessionCacheSize {
+		originServer, origin := g.sessionCacheOriginServer, g.sessionCacheOrigin
+		g.sessionMu.Unlock()
+		g.adoptSessionTaint(originServer, origin, time.Now())
+		return true
+	}
+	g.sessionMu.Unlock()
+
+	b, err := os.ReadFile(g.sessionFile)
+	if err != nil {
+		g.adoptSessionTaint("unknown", "session_unreadable", time.Now())
+		return true
+	}
+	var rec sessionTaintFile
+	if json.Unmarshal(b, &rec) != nil || rec.Version != sessionFileVersion || rec.KeyHash != g.sessionHash {
+		g.cacheSessionTaint(info, "unknown", "session_unreadable")
+		g.adoptSessionTaint("unknown", "session_unreadable", time.Now())
+		return true
+	}
+	since, err := time.Parse(time.RFC3339Nano, rec.TS)
+	if err != nil {
+		since = time.Now()
+	}
+	g.cacheSessionTaint(info, rec.OriginServer, rec.Origin)
+	g.adoptSessionTaint(rec.OriginServer, rec.Origin, since)
+	return true
+}
+
+func (g *Guard) cacheSessionTaint(info os.FileInfo, originServer, origin string) {
+	g.sessionMu.Lock()
+	g.sessionCacheValid = true
+	g.sessionCacheMod = info.ModTime()
+	g.sessionCacheSize = info.Size()
+	g.sessionCacheOriginServer = originServer
+	g.sessionCacheOrigin = origin
+	g.sessionMu.Unlock()
+}
+
+func (g *Guard) adoptSessionTaint(originServer, origin string, since time.Time) {
+	if originServer == "" {
+		originServer = "unknown"
+	}
+	if origin == "" {
+		origin = originServer
+	}
+	g.mu.Lock()
+	first := !g.tainted
+	g.tainted = true
+	g.taintedFlag.Store(true)
+	if first {
+		g.taintOrigin = origin
+		g.taintSince = since
+	}
+	g.mu.Unlock()
+	if first {
+		g.event("taint_adopted", map[string]any{"origin_server": cleanForDialog(originServer, 80)})
+		alert("session tainted by another server (%q); non-read-only tools now need approval", originServer)
+	}
+}
+
+// taintState is the sink-decision view of the session.
+func (g *Guard) taintState() (bool, string) {
+	if !g.sessionTainted() {
+		return false, ""
+	}
+	g.mu.Lock()
+	origin := g.taintOrigin
+	g.mu.Unlock()
+	if origin == "" {
+		origin = "session"
+	}
+	return true, origin
+}
+
+// writeSessionTaint records the first local latch in the shared session file.
+// It never stores content or argument values.
+func (g *Guard) writeSessionTaint(origin string) {
+	if g.sessionFile == "" {
+		return
+	}
+	if _, err := os.Stat(g.sessionFile); err == nil {
+		return
+	}
+	if origin == "" {
+		origin = "unknown"
+	}
+	parentPID, parentStart := g.parentPID, g.parentStart
+	rec := sessionTaintFile{
+		Version:      sessionFileVersion,
+		KeyHash:      g.sessionHash,
+		OriginServer: g.name,
+		Origin:       origin,
+		TS:           time.Now().UTC().Format(time.RFC3339Nano),
+		ParentPID:    parentPID,
+		ParentStart:  parentStart,
+	}
+	b, err := json.Marshal(rec)
+	if err != nil {
+		g.event("session_taint_write_failed", map[string]any{"reason": "cannot encode shared session latch"})
+		return
+	}
+	if err := writeFileAtomic(g.sessionFile, b, 0o600); err != nil {
+		if _, statErr := os.Stat(g.sessionFile); statErr != nil {
+			g.event("session_taint_write_failed", map[string]any{"reason": "cannot write shared session latch"})
+		}
+	}
+}
+
+// gcStaleSessionFiles removes session files whose recorded parent process is
+// gone. This also handles a new client instance reusing an explicit session
+// key; a restarted server inside one client keeps the live parent and its
+// taint.
+func (g *Guard) gcStaleSessionFiles() {
+	matches, err := filepath.Glob(filepath.Join(g.stateDir, "session-*.taint"))
+	if err != nil {
+		return
+	}
+	for _, path := range matches {
+		info, err := os.Stat(path)
+		if err != nil || !info.Mode().IsRegular() || info.Size() > sessionFileLimit {
+			continue
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		var rec sessionTaintFile
+		if json.Unmarshal(b, &rec) != nil || rec.Version != sessionFileVersion || rec.ParentPID <= 0 {
+			continue
+		}
+		start, ok := processStartTime(rec.ParentPID)
+		if rec.ParentStart == "" {
+			// The key was weak when this latch was written; the best we can
+			// do is keep it while the parent PID is alive.
+			if processAlive(rec.ParentPID) {
+				continue
+			}
+		} else if ok && start == rec.ParentStart {
+			continue // same live parent process
+		} else if !ok && processAlive(rec.ParentPID) {
+			continue // ambiguous; keep rather than risk a live session
+		}
+		_ = os.Remove(path)
+		_ = os.Remove(strings.TrimSuffix(path, ".taint") + ".cleared")
+	}
+}
+
+func (g *Guard) readSessionClear() (sessionClearFile, bool) {
+	info, err := os.Stat(g.sessionClear)
+	if err != nil || !info.Mode().IsRegular() || info.Size() > sessionFileLimit {
+		return sessionClearFile{}, false
+	}
+	b, err := os.ReadFile(g.sessionClear)
+	if err != nil {
+		return sessionClearFile{}, false
+	}
+	var rec sessionClearFile
+	if json.Unmarshal(b, &rec) != nil || rec.Version != sessionFileVersion ||
+		rec.KeyHash != g.sessionHash || !validRequestID(rec.RequestID) {
+		return sessionClearFile{}, false
+	}
+	if _, err := time.Parse(time.RFC3339Nano, rec.TS); err != nil {
+		return sessionClearFile{}, false
+	}
+	return rec, true
+}
+
+// pollSharedClear drops the local latch when the shared file is gone and a new
+// human-approved clear marker is present. A missing file without a new marker
+// leaves the local latch alone.
+func (g *Guard) pollSharedClear() {
+	if g.sessionFile == "" {
+		return
+	}
+	if _, err := os.Stat(g.sessionFile); err == nil {
+		return
+	}
+	rec, ok := g.readSessionClear()
+	if !ok {
+		return
+	}
+	g.sessionMu.Lock()
+	if rec.RequestID == g.sessionLastClear {
+		g.sessionMu.Unlock()
+		return
+	}
+	g.sessionLastClear = rec.RequestID
+	g.sessionMu.Unlock()
+
+	if !g.taintedFlag.Load() {
+		return
+	}
+	since := g.taintContext()
+	markerTS, err := time.Parse(time.RFC3339Nano, rec.TS)
+	if err != nil || since.IsZero() || markerTS.Before(since) {
+		return
+	}
+	g.clearTaintLocal()
+	g.event("clear_taint_adopted", map[string]any{"request_id": rec.RequestID})
+}
+
+func (g *Guard) taintContext() time.Time {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.taintSince
+}
+
 // clearTaint is only called from the human-approved clear-taint control path.
-// It never clears a quarantine, a grant, or any other latch.
-func (g *Guard) clearTaint() {
+// It removes the shared session latch, writes a clear marker for the other
+// Guards, and clears this Guard's local latch. It never clears a quarantine,
+// a grant, or any other latch.
+func (g *Guard) clearTaint(requestID string) error {
+	var before os.FileInfo
+	var beforeExists bool
+	info, err := os.Stat(g.sessionFile)
+	if err == nil {
+		before, beforeExists = info, true
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("cannot inspect the shared session latch")
+	}
+	rec := sessionClearFile{
+		Version:   sessionFileVersion,
+		KeyHash:   g.sessionHash,
+		RequestID: requestID,
+		TS:        time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	b, err := json.Marshal(rec)
+	if err != nil {
+		return fmt.Errorf("cannot encode the clear marker")
+	}
+	if err := writeFileAtomic(g.sessionClear, b, 0o600); err != nil {
+		return fmt.Errorf("cannot write the clear marker")
+	}
+	if beforeExists {
+		after, err := os.Stat(g.sessionFile)
+		if err == nil {
+			if !after.ModTime().Equal(before.ModTime()) || after.Size() != before.Size() {
+				_ = os.Remove(g.sessionClear)
+				return fmt.Errorf("the session was tainted again during the clear")
+			}
+			if err := os.Remove(g.sessionFile); err != nil && !os.IsNotExist(err) {
+				_ = os.Remove(g.sessionClear)
+				return fmt.Errorf("cannot remove the shared session latch")
+			}
+		} else if !os.IsNotExist(err) {
+			_ = os.Remove(g.sessionClear)
+			return fmt.Errorf("cannot inspect the shared session latch")
+		}
+	}
+	g.sessionMu.Lock()
+	g.sessionLastClear = requestID
+	g.sessionMu.Unlock()
+	g.clearTaintLocal()
+	return nil
+}
+
+// clearTaintLocal drops only this process's latch. It never touches the shared
+// file or marker; only the human-approved clearTaint path removes the shared
+// latch.
+func (g *Guard) clearTaintLocal() {
 	g.mu.Lock()
 	g.tainted = false
 	g.taintOrigin = ""
+	g.taintSince = time.Time{}
 	g.taintedFlag.Store(false)
 	g.mu.Unlock()
 }
@@ -8127,6 +8550,7 @@ func (c *guardControl) pollLoop() {
 			return
 		case <-t.C:
 			last = c.pollRequest(last)
+			c.g.pollSharedClear()
 		}
 	}
 }
@@ -8206,10 +8630,7 @@ func (c *guardControl) rejectRequest(req clearRequest, reason string) {
 }
 
 func (c *guardControl) handleRequest(req clearRequest) {
-	c.g.mu.Lock()
-	tainted := c.g.tainted
-	origin := c.g.taintOrigin
-	c.g.mu.Unlock()
+	tainted, origin := c.g.taintState()
 	who := cleanForDialog(osUser(), 120)
 
 	if !tainted {
@@ -8229,7 +8650,21 @@ func (c *guardControl) handleRequest(req clearRequest) {
 	at := time.Now().UTC().Format(time.RFC3339Nano)
 	note = cleanForDialog(note, 160)
 	if allowed {
-		c.g.clearTaint()
+		if err := c.g.clearTaint(req.RequestID); err != nil {
+			c.g.event("CLEAR_TAINT_FAILED", map[string]any{
+				"request_id": req.RequestID,
+				"reason":     "cannot clear shared session state",
+			})
+			_ = c.writeResult(clearResult{
+				Version:   controlVersion,
+				RequestID: req.RequestID,
+				Status:    "rejected",
+				Who:       who,
+				At:        at,
+				Note:      "cannot clear shared session state",
+			})
+			return
+		}
 		c.g.event("CLEAR_TAINT", map[string]any{
 			"who":        who,
 			"method":     "dialog",
@@ -8778,6 +9213,8 @@ type doctorWrapperFlags struct {
 	ResetPins       bool
 	HasGrant        bool
 	Grants          []string
+	HasSession      bool
+	Session         string
 }
 
 type doctorServer struct {
@@ -8792,6 +9229,7 @@ type doctorServer struct {
 	OriginalCmd  string
 	OriginalArgs []string
 	Flags        doctorWrapperFlags
+	SessionSet   bool
 }
 
 type doctorPolicy struct {
@@ -8943,6 +9381,8 @@ func (d *doctorRun) inspectConfig(target configTarget, explicit *doctorPolicy) (
 	}
 
 	var findings []doctorFinding
+	wrappedCount := 0
+	var missingSession []string
 	for _, serverPath := range target.serverPaths {
 		serverMap, exists, err := lookupConfigMap(root, serverPath)
 		mapName := strings.Join(serverPath, ".")
@@ -8983,16 +9423,46 @@ func (d *doctorRun) inspectConfig(target configTarget, explicit *doctorPolicy) (
 				findings = append(findings, newDoctorFinding(code, "error", target.client, target.path, name, detail, doctorFixForCode(code)))
 				continue
 			}
+			if server.Wrapped {
+				wrappedCount++
+				if !server.SessionSet {
+					missingSession = append(missingSession, name)
+				}
+			}
 			serverFindings := d.inspectServer(&server, &view, explicit)
 			cfg.Servers = append(cfg.Servers, view)
 			findings = append(findings, serverFindings...)
 		}
 	}
+	if wrappedCount >= 2 && len(missingSession) > 0 {
+		sort.Strings(missingSession)
+		findings = append(findings, newDoctorFinding("SHARED_TAINT_OFF", "risk", target.client, target.path, "",
+			fmt.Sprintf("%d wrapped servers do not share a session key (missing %s on %s)",
+				wrappedCount, sessionEnvKey, strings.Join(missingSession, ", ")),
+			"re-run `sylenix-guard install` (or add SYLENIX_SESSION to each wrapper)"))
+	}
 	return cfg, findings
 }
 
+func entrySessionSet(entry *configObject) bool {
+	value, ok := entry.get("env")
+	if !ok {
+		return false
+	}
+	env, ok := value.(*configObject)
+	if !ok {
+		return false
+	}
+	value, ok = env.get(sessionEnvKey)
+	if !ok {
+		return false
+	}
+	text, ok := value.(string)
+	return ok && strings.TrimSpace(text) != ""
+}
+
 func inspectDoctorServer(entry *configObject, name, client, configPath string) (doctorServer, string, string) {
-	s := doctorServer{Name: name, Client: client, ConfigPath: configPath}
+	s := doctorServer{Name: name, Client: client, ConfigPath: configPath, SessionSet: entrySessionSet(entry)}
 	if remoteConfigEntry(entry) {
 		s.Remote = true
 		return s, "", ""
@@ -9077,6 +9547,7 @@ func inspectDoctorServer(entry *configObject, name, client, configPath string) (
 			return s, "WRAPPER_INVALID", "Guard wrapper has no server command after --"
 		}
 		s.Flags = flags
+		s.SessionSet = s.SessionSet || (flags.HasSession && strings.TrimSpace(flags.Session) != "")
 		s.OriginalCmd = args[sep+1]
 		s.OriginalArgs = append([]string(nil), args[sep+2:]...)
 		if strings.TrimSpace(s.OriginalCmd) == "" || strings.TrimSpace(s.OriginalCmd) != s.OriginalCmd {
@@ -9622,6 +10093,15 @@ func parseDoctorWrapperFlags(args []string) (doctorWrapperFlags, string) {
 				return f, "name contains a path separator, a reserved character or control characters"
 			}
 			f.HasName, f.Name = true, v
+		case "session":
+			v, detail := value()
+			if detail != "" {
+				return f, detail
+			}
+			if v == "" || strings.TrimSpace(v) != v || hasUnsafePolicyChars(v) {
+				return f, "session is empty or contains surrounding spaces/control characters"
+			}
+			f.HasSession, f.Session = true, v
 		case "state-dir":
 			v, detail := value()
 			if detail != "" {
@@ -10362,7 +10842,7 @@ func processConfigFile(action string, target configTarget, guardPath string, wra
 				continue
 			}
 			if action == "install" {
-				wrapped, report := wrapConfigEntry(entry, guardPath, wrapperFlags)
+				wrapped, report := wrapConfigEntry(entry, guardPath, wrapperFlags, target.client)
 				if wrapped {
 					changed = true
 					fmt.Printf("wrap %s [%s] %s\n", target.client, strings.Join(path, "."), name)
@@ -10621,8 +11101,22 @@ func remoteConfigEntry(entry *configObject) bool {
 	return false
 }
 
-func wrapConfigEntry(entry *configObject, guardPath string, wrapperFlags []string) (bool, string) {
-	if _, ok := entry.get(guardMetaKey); ok {
+func wrapConfigEntry(entry *configObject, guardPath string, wrapperFlags []string, sessionName string) (bool, string) {
+	if strings.TrimSpace(sessionName) == "" {
+		return false, "client name is empty"
+	}
+	if metaValue, ok := entry.get(guardMetaKey); ok {
+		meta, ok := metaValue.(*configObject)
+		if !ok {
+			return false, "already wrapped"
+		}
+		changed, report := ensureSessionEnv(entry, meta, sessionName)
+		if report != "" {
+			return false, report
+		}
+		if changed {
+			return true, ""
+		}
 		return false, "already wrapped"
 	}
 	if value, ok := entry.get("command"); ok {
@@ -10685,13 +11179,60 @@ func wrapConfigEntry(entry *configObject, guardPath string, wrapperFlags []strin
 	}
 	wrapperArgs = append(wrapperArgs, "--", command)
 	wrapperArgs = append(wrapperArgs, originalArgs...)
-	entry.set("command", guardPath)
-	entry.set("args", wrapperArgs)
 	meta := newConfigObject()
 	meta.set("version", guardMetaVersion)
 	meta.set("hadArgs", hadArgs)
 	meta.set("hadEnv", hadEnv)
+	if _, report := ensureSessionEnv(entry, meta, sessionName); report != "" {
+		return false, report
+	}
+	entry.set("command", guardPath)
+	entry.set("args", wrapperArgs)
 	entry.set(guardMetaKey, meta)
+	return true, ""
+}
+
+// ensureSessionEnv gives every wrapped server in one client config the same
+// SYLENIX_SESSION value. It records the original value so uninstall can restore
+// it exactly.
+func ensureSessionEnv(entry, meta *configObject, sessionName string) (bool, string) {
+	value, hasEnv := entry.get("env")
+	var env *configObject
+	if hasEnv {
+		var ok bool
+		env, ok = value.(*configObject)
+		if !ok {
+			return false, "env is not an object"
+		}
+		for _, key := range env.keys {
+			if _, ok := env.values[key].(string); !ok {
+				return false, "env contains a non-string value"
+			}
+		}
+	} else {
+		env = newConfigObject()
+	}
+	current, hasSession := env.get(sessionEnvKey)
+	currentText := ""
+	if hasSession {
+		var ok bool
+		currentText, ok = current.(string)
+		if !ok {
+			return false, "env contains a non-string value"
+		}
+	}
+	if hasSession && currentText == sessionName {
+		return false, ""
+	}
+	meta.set("sessionInstalled", true)
+	meta.set("sessionHad", hasSession)
+	if hasSession {
+		meta.set("sessionValue", currentText)
+	}
+	env.set(sessionEnvKey, sessionName)
+	if !hasEnv {
+		entry.set("env", env)
+	}
 	return true, ""
 }
 
@@ -10703,6 +11244,9 @@ func unwrapConfigEntry(entry *configObject, guardPath string) (bool, string) {
 	metaValue, hasMeta := entry.get(guardMetaKey)
 	hadArgs := false
 	hadEnv := false
+	sessionInstalled := false
+	sessionHad := false
+	sessionValue := ""
 	if hasMeta {
 		meta, ok := metaValue.(*configObject)
 		if !ok {
@@ -10720,6 +11264,27 @@ func unwrapConfigEntry(entry *configObject, guardPath string) (bool, string) {
 		hadEnvValue, _ := meta.get("hadEnv")
 		if hadEnv, ok = hadEnvValue.(bool); !ok {
 			return false, "Guard metadata hadEnv is invalid"
+		}
+		if value, ok := meta.get("sessionInstalled"); ok {
+			if sessionInstalled, ok = value.(bool); !ok {
+				return false, "Guard metadata sessionInstalled is invalid"
+			}
+		}
+		if sessionInstalled {
+			value, ok := meta.get("sessionHad")
+			if !ok {
+				return false, "Guard metadata sessionHad is missing"
+			}
+			if sessionHad, ok = value.(bool); !ok {
+				return false, "Guard metadata sessionHad is invalid"
+			}
+			if sessionHad {
+				if value, ok := meta.get("sessionValue"); ok {
+					if sessionValue, ok = value.(string); !ok {
+						return false, "Guard metadata sessionValue is invalid"
+					}
+				}
+			}
 		}
 	} else if !isGuardCommand(command, guardPath) {
 		return false, ""
@@ -10751,6 +11316,21 @@ func unwrapConfigEntry(entry *configObject, guardPath string) (bool, string) {
 	}
 	if hasMeta && hadEnv {
 		if _, ok := entry.get("env"); !ok {
+			return false, "cannot restore: original env is missing"
+		}
+	}
+	if hasMeta && sessionInstalled {
+		if value, ok := entry.get("env"); ok {
+			env, ok := value.(*configObject)
+			if !ok {
+				return false, "cannot restore: env is not an object"
+			}
+			if sessionHad {
+				env.set(sessionEnvKey, sessionValue)
+			} else {
+				env.del(sessionEnvKey)
+			}
+		} else if hadEnv {
 			return false, "cannot restore: original env is missing"
 		}
 	}
