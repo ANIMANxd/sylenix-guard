@@ -176,7 +176,9 @@ requires authorization that the agent cannot grant itself.
    whose paths touch `.git` (all paths, including hooks), `.env*`, key or
    certificate files, or known config names (`go.mod`, `package.json`, `Makefile`,
    …) are refused with `EGRESS_TARGET` and `SENSITIVE_TARGET`. These cannot be
-   approved through a dialog or a grant.
+   approved through a dialog or a grant. After taint, the same path blocks apply
+   to read-class tools, so a read of `.env*`, a key file, or another tier-1 path
+   is refused.
 2. **Protected agent-instruction, credential and persistence files.** Agent
    instruction files (`AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, Cursor/Windsurf rules),
    agent config directories (`.claude`, `.codex`, `.gemini`, `.continue`),
@@ -189,7 +191,10 @@ requires authorization that the agent cannot grant itself.
    directories (including the active `--state-dir`) are `SENSITIVE_TARGET` after
    taint. They never use a grant or scratch shortcut; with `--approve dialog` they
    require a human decision, except the hard-blocked `.git`, `.env`, key and Guard
-   state/key paths above.
+   state/key paths above. After taint, read-class tools may still read
+   non-credential protected files (agent instructions, CI files, shell rc files);
+   credential paths (`.ssh`, `.npmrc`, `.pypirc`, `.netrc`) are blocked or
+   prompted, and Guard state/key paths stay hard-blocked.
 3. **Scratch fast path.** With `--allow-write-under DIR` (or `TOOL=DIR`), calls whose
    every path argument stays inside `DIR` are forwarded without a prompt.
 4. **Authorization.** Everything else is denied (`-32000 TAINT_SINK`), or, with

@@ -5355,6 +5355,44 @@ func (g *Guard) fromHost(line []byte) (forward []byte, reply []byte) {
 	}
 	class := pol.classFor(name)
 	if !tainted || class == "read" {
+		if tainted && class == "read" {
+			// Read-class tools stay prompt-free only for non-credential,
+			// non-sensitive targets. A tainted read must not become a way to
+			// read credentials that a write would refuse.
+			scan := scanArgs(args, pol.toolPathKeys[name], g.protectedDirs)
+			if !scan.sensitive && g.hardSensitiveCall(name, scan.paths, pol.scratch) {
+				scan.sensitive = true
+			}
+			if scan.sensitive {
+				g.event("block", map[string]any{"tool": name, "rule": "SENSITIVE_TARGET", "origin": origin, "class": class, "arg_keys": argKeys(args)})
+				alert("tool %q blocked: sensitive path in a session tainted by %q", name, origin)
+				return nil, replyIfRequest(id, -32000, "Blocked by Sylenix Guard", "SENSITIVE_TARGET")
+			}
+			if scan.protected && scan.credential {
+				if g.grantAllows(name, scan.paths, scan.protected) {
+					g.event("allow", map[string]any{"tool": name, "tainted": true, "class": class, "rule": "GRANT", "arg_keys": argKeys(args)})
+					g.track(id, method, name)
+					return forwardFrame, nil
+				}
+				if pol.approve == "dialog" {
+					scope := scopeDir(scan.paths)
+					decision, note := askHuman(name, args, origin, grantScopeNote(name, scope))
+					g.event("approval", map[string]any{"tool": name, "granted": decision != "deny", "decision": decision, "class": class, "note": note, "arg_keys": argKeys(args)})
+					if decision == "grant" {
+						g.addGrant(name, scope, grantTTL, scan.protected)
+						g.event("grant_recorded", map[string]any{"tool": name, "scope": scopeKind(scope), "ttl_seconds": int(grantTTL.Seconds())})
+					}
+					if decision != "deny" {
+						g.track(id, method, name)
+						return forwardFrame, nil
+					}
+					return nil, replyIfRequest(id, -32002, "Authorization denied", "APPROVAL_DENIED")
+				}
+				g.event("block", map[string]any{"tool": name, "rule": "SENSITIVE_TARGET", "origin": origin, "class": class, "arg_keys": argKeys(args)})
+				alert("tool %q blocked: credential path in a session tainted by %q", name, origin)
+				return nil, replyIfRequest(id, -32000, "Blocked by Sylenix Guard", "SENSITIVE_TARGET")
+			}
+		}
 		g.event("allow", map[string]any{"tool": name, "tainted": tainted, "class": class, "arg_keys": argKeys(args)})
 		g.track(id, method, name)
 		return forwardFrame, nil
@@ -6132,6 +6170,47 @@ func protectedTargetPathWithDirs(p string, extraDirs []string) bool {
 	return protectedCanonicalPathWithDirs(filepath.Clean(strings.ReplaceAll(p, `\`, "/")), extraDirs)
 }
 
+// credentialProtectedCanonicalPath reports whether p matches a protected
+// target in the credential or Guard-state category. Reads of these paths are
+// blocked or dialog-approved after taint; other protected targets stay readable.
+func credentialProtectedCanonicalPath(p string) bool {
+	components := pathComponents(p)
+	if len(components) == 0 {
+		return false
+	}
+	fold := caseInsensitiveFS(filepath.Dir(p))
+	for _, target := range protectedTargets {
+		if target.category != "credentials" && target.category != "guard state" {
+			continue
+		}
+		if target.matches(components, fold) {
+			return true
+		}
+	}
+	return false
+}
+
+func credentialProtectedCanonicalPathWithDirs(p string, extraDirs []string) bool {
+	if credentialProtectedCanonicalPath(p) {
+		return true
+	}
+	// The active --state-dir and key directory can have any name, so they
+	// cannot be static table entries.
+	for _, dir := range extraDirs {
+		if dir != "" && insideDir(dir, p) {
+			return true
+		}
+	}
+	return false
+}
+
+func credentialProtectedTargetPathWithDirs(p string, extraDirs []string) bool {
+	if canonical, ok := canonicalPath(p); ok {
+		return credentialProtectedCanonicalPathWithDirs(canonical, extraDirs)
+	}
+	return credentialProtectedCanonicalPathWithDirs(filepath.Clean(strings.ReplaceAll(p, `\`, "/")), extraDirs)
+}
+
 func (g *Guard) protectedCanonicalPath(p string) bool {
 	return protectedCanonicalPathWithDirs(p, g.protectedDirs)
 }
@@ -6239,6 +6318,7 @@ type callScan struct {
 	egressHosts []string
 	sensitive   bool
 	protected   bool
+	credential  bool
 	ambiguous   bool
 }
 
@@ -6280,6 +6360,10 @@ func scanArgs(args map[string]any, extraPathKeys map[string]bool, extraDirs []st
 					// Protected targets are dialog-approvable unless they are
 					// hard-sensitive: .git, .env, key files, or Guard state.
 					s.protected = true
+					if credentialProtectedTargetPathWithDirs(t, extraDirs) ||
+						(resolvedOK && credentialProtectedCanonicalPathWithDirs(resolved, extraDirs)) {
+						s.credential = true
+					}
 					if isHardSensitivePath(t, extraDirs) ||
 						(resolvedOK && isHardSensitivePath(resolved, extraDirs)) {
 						s.sensitive = true
@@ -6298,6 +6382,9 @@ func scanArgs(args map[string]any, extraPathKeys map[string]bool, extraDirs []st
 				}
 			case protectedTargetPathWithDirs(t, extraDirs):
 				s.protected = true
+				if credentialProtectedTargetPathWithDirs(t, extraDirs) {
+					s.credential = true
+				}
 				if isHardSensitivePath(t, extraDirs) {
 					s.sensitive = true
 				}

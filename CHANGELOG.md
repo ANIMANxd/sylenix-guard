@@ -8,6 +8,8 @@
   folding (`DUPLICATE_KEYS`), and now forward only the exact checked `name` and
   `arguments` plus other params such as `_meta`; audit events and the datamark
   origin use the checked name.
+- Applied tier-1 sensitive-path and credential-target checks to read-class tools
+  after taint; ordinary reads still forward.
 
 ## 2026-11-11
 

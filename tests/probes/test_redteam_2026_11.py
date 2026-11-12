@@ -37,11 +37,13 @@ REDTEAM_SERVER = os.path.join(ROOT, "tests", "probes", "redteam_server.py")
 PROFILE_SERVER = os.path.join(ROOT, "tests", "probes", "profile_server.py")
 
 # Cases that fail on the commit before the corresponding fix. Remove a case
-# from this set in the commit that fixes it. F3a-F3e were fixed by the exact-key
-# tools/call rewrite and no longer belong here. F3-meta is a compatibility
-# control, not an expected failure: it passes before and after the rewrite.
+# from this set in the commit that fixes it. F2 and F3a-F3e were fixed by the
+# read-class scan and exact-key tools/call rewrite, so they no longer belong
+# here. F2-read and F3-meta are compatibility controls, not expected failures:
+# they pass before and after the fixes. F2-dialog exercises the new approved-read
+# path; it fails before the fix and passes after.
 KNOWN_FAIL = {
-    "F1", "F2",
+    "F1",
     "F4", "F5", "F6",
     "F7a", "F7b", "F7c",
     "F8", "F9",
@@ -671,6 +673,73 @@ def case_f2():
         return True, ""
 
 
+def case_f2_read():
+    """Control: tainted reads of ordinary and non-credential protected files forward."""
+    with tempfile.TemporaryDirectory() as d:
+        ws = workspace(d)
+        targets = [os.path.join(ws, "docs", "readme.md"),
+                   os.path.join(ws, "AGENTS.md")]
+        for target in targets:
+            write_text(target, "readable fixture\n")
+        log = os.path.join(d, "calls.log")
+        env = redteam_env(log, "read_ticket,read_text_file")
+        s = Session(os.path.join(d, "state"), "rt-f2-read",
+                    flags=("--readonly", "read_text_file"), env=env)
+        responses = []
+        try:
+            s.start()
+            s.call("read_ticket")
+            for target in targets:
+                responses.append((target, s.call("read_text_file", {"path": target})))
+        finally:
+            s.close()
+        problems = []
+        reached = {(row.get("arguments") or {}).get("path")
+                   for row in call_log(log) if row.get("name") == "read_text_file"}
+        for target, resp in responses:
+            if "result" not in resp:
+                problems.append("%s was blocked: %s" % (target, resp))
+            if target not in reached:
+                problems.append("%s did not reach the server" % target)
+        if problems:
+            return False, "; ".join(problems)
+        return True, ""
+
+
+def case_f2_dialog(dialog_bin):
+    """A credential read may use the approval dialog instead of a hard block."""
+    with tempfile.TemporaryDirectory() as d:
+        ws = workspace(d)
+        target = os.path.join(ws, ".ssh", "config")
+        write_text(target, "Host example\n")
+        log = os.path.join(d, "dialog.log")
+        calls = os.path.join(d, "calls.log")
+        env = dialog_env(dialog_bin, log, "once")
+        env["REDTEAM_TOOLS"] = "read_ticket,read_text_file"
+        env["REDTEAM_CALL_LOG"] = calls
+        s = Session(os.path.join(d, "state"), "rt-f2-dialog",
+                    flags=("--approve", "dialog", "--readonly", "read_text_file"),
+                    env=env)
+        try:
+            s.start()
+            s.call("read_ticket")
+            resp = s.call("read_text_file", {"path": target})
+        finally:
+            s.close()
+        problems = []
+        if "result" not in resp:
+            problems.append("the approved credential read was blocked: %s" % resp)
+        if not dialog_messages(log):
+            problems.append("no dialog was shown for the credential read")
+        if not any(row.get("name") == "read_text_file"
+                   and (row.get("arguments") or {}).get("path") == target
+                   for row in call_log(calls)):
+            problems.append("the approved read did not reach the server")
+        if problems:
+            return False, "; ".join(problems)
+        return True, ""
+
+
 # ---------------------------------------------------------------- F4/F6: dialogs and grants
 
 
@@ -962,6 +1031,9 @@ def main():
         check_case("F3e", "case-variant tool name through the HTTP proxy is refused", case_f3e)
         check_case("F3-meta", "a normal call with _meta forwards and works", case_f3_meta)
         check_case("F2", "read-class tools cannot read sensitive targets after taint", case_f2)
+        check_case("F2-read", "a tainted read of a normal file still forwards", case_f2_read)
+        check_case("F2-dialog", "a credential read can be approved through the dialog",
+                   lambda: case_f2_dialog(dialog_bin))
         check_case("F4", "approval dialog names the full protected path and category",
                    lambda: case_f4(dialog_bin))
         check_case("F6", "a protected-target grant does not cover another category",
