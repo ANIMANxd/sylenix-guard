@@ -10,6 +10,9 @@
   origin use the checked name.
 - Applied tier-1 sensitive-path and credential-target checks to read-class tools
   after taint; ordinary reads still forward.
+- Restructured the approval dialog to show the tool, every path/destination
+  target with its protected category, short remaining arguments, and content
+  byte counts with previews; padded content can no longer hide a target.
 
 ## 2026-11-11
 

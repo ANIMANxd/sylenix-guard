@@ -5376,7 +5376,7 @@ func (g *Guard) fromHost(line []byte) (forward []byte, reply []byte) {
 				}
 				if pol.approve == "dialog" {
 					scope := scopeDir(scan.paths)
-					decision, note := askHuman(name, args, origin, grantScopeNote(name, scope))
+					decision, note := askHuman(name, args, scan, origin, grantScopeNote(name, scope))
 					g.event("approval", map[string]any{"tool": name, "granted": decision != "deny", "decision": decision, "class": class, "note": note, "arg_keys": argKeys(args)})
 					if decision == "grant" {
 						g.addGrant(name, scope, grantTTL, scan.protected)
@@ -5465,7 +5465,7 @@ func (g *Guard) fromHost(line []byte) (forward []byte, reply []byte) {
 	}
 	if pol.approve == "dialog" {
 		scope := scopeDir(scan.paths)
-		decision, note := askHuman(name, args, origin, grantScopeNote(name, scope))
+		decision, note := askHuman(name, args, scan, origin, grantScopeNote(name, scope))
 		g.event("approval", map[string]any{"tool": name, "granted": decision != "deny", "decision": decision, "class": class, "note": note, "arg_keys": argKeys(args)})
 		if decision == "grant" {
 			g.addGrant(name, scope, grantTTL, scan.protected)
@@ -6211,6 +6211,44 @@ func credentialProtectedTargetPathWithDirs(p string, extraDirs []string) bool {
 	return credentialProtectedCanonicalPathWithDirs(filepath.Clean(strings.ReplaceAll(p, `\`, "/")), extraDirs)
 }
 
+// protectedCategory returns the first protectedTargets category for p, or an
+// empty string when p is not a protected target. Guard's configured state/key
+// directories are reported as "guard state" by protectedCategoryWithDirs.
+func protectedCategory(p string) string {
+	return protectedCategoryCanonical(canonicalOrClean(p))
+}
+
+func protectedCategoryWithDirs(p string, extraDirs []string) string {
+	canonical := canonicalOrClean(p)
+	for _, dir := range extraDirs {
+		if dir != "" && insideDir(dir, canonical) {
+			return "guard state"
+		}
+	}
+	return protectedCategoryCanonical(canonical)
+}
+
+func protectedCategoryCanonical(p string) string {
+	components := pathComponents(p)
+	if len(components) == 0 {
+		return ""
+	}
+	fold := caseInsensitiveFS(filepath.Dir(p))
+	for _, target := range protectedTargets {
+		if target.matches(components, fold) {
+			return target.category
+		}
+	}
+	return ""
+}
+
+func canonicalOrClean(p string) string {
+	if resolved, ok := canonicalPath(p); ok {
+		return resolved
+	}
+	return filepath.Clean(strings.ReplaceAll(p, `\`, "/"))
+}
+
 func (g *Guard) protectedCanonicalPath(p string) bool {
 	return protectedCanonicalPathWithDirs(p, g.protectedDirs)
 }
@@ -6308,12 +6346,18 @@ func (g *Guard) hardSensitiveCall(tool string, paths []string, scratch []scratch
 	return false
 }
 
+type callTarget struct {
+	value    string
+	category string
+}
+
 // callScan is the classification of one tools/call's arguments. Only values
 // under a known path key are paths. ambiguous means the call contains a
 // non-content value that could be a path or destination but is not under a
 // known path key; such a call must never take a grant or scratch shortcut.
 type callScan struct {
 	paths       []string
+	targets     []callTarget
 	egress      bool
 	egressHosts []string
 	sensitive   bool
@@ -6343,6 +6387,8 @@ func scanArgs(args map[string]any, extraPathKeys map[string]bool, extraDirs []st
 			case keyMatches(urlKeys, kl) || keyMatches(destinationKeys, kl) ||
 				isURLValue(t) || hasEgressScheme(t) || isIPAddress(t):
 				s.egress = true
+				s.targets = append(s.targets, callTarget{
+					value: t, category: protectedCategoryWithDirs(t, extraDirs)})
 				if h := hostFromArgument(t); h != "" {
 					s.egressHosts = append(s.egressHosts, h)
 				}
@@ -6352,6 +6398,8 @@ func scanArgs(args map[string]any, extraPathKeys map[string]bool, extraDirs []st
 				// turn "link/../x" into a path the server never opens.
 				s.paths = append(s.paths, t)
 				resolved, resolvedOK := canonicalPath(t)
+				s.targets = append(s.targets, callTarget{
+					value: t, category: protectedCategoryWithDirs(t, extraDirs)})
 				protected := resolvedOK && protectedCanonicalPathWithDirs(resolved, extraDirs)
 				if !protected {
 					protected = protectedTargetPathWithDirs(t, extraDirs)
@@ -6377,11 +6425,15 @@ func scanArgs(args map[string]any, extraPathKeys map[string]bool, extraDirs []st
 				}
 			case isHostPort(t):
 				s.egress = true
+				s.targets = append(s.targets, callTarget{
+					value: t, category: protectedCategoryWithDirs(t, extraDirs)})
 				if h := hostFromArgument(t); h != "" {
 					s.egressHosts = append(s.egressHosts, h)
 				}
 			case protectedTargetPathWithDirs(t, extraDirs):
 				s.protected = true
+				s.targets = append(s.targets, callTarget{
+					value: t, category: protectedCategoryWithDirs(t, extraDirs)})
 				if credentialProtectedTargetPathWithDirs(t, extraDirs) {
 					s.credential = true
 				}
@@ -7044,12 +7096,127 @@ func (g *Guard) grantAllows(tool string, paths []string, protected bool) bool {
 
 // ---------------------------------------------------------------- approval dialog
 
+// dialogTargets lists every path and destination value in full, one per line.
+// Each value gets its own 300-character budget and is never dropped. A
+// protected value is prefixed with the category that made it protected.
+func dialogTargets(scan callScan) string {
+	if len(scan.targets) == 0 {
+		return "Targets: none"
+	}
+	var b strings.Builder
+	b.WriteString("Targets:")
+	for _, target := range scan.targets {
+		b.WriteString("\n")
+		if target.category != "" {
+			fmt.Fprintf(&b, "[%s] ", target.category)
+		}
+		b.WriteString(cleanForDialog(target.value, 300))
+	}
+	return b.String()
+}
+
+// dialogOtherArguments shows non-target, non-content arguments as short
+// key/value lines. Each value has its own budget.
+func dialogOtherArguments(args map[string]any, scan callScan) string {
+	targets := make(map[string]bool, len(scan.targets))
+	for _, target := range scan.targets {
+		targets[target.value] = true
+	}
+	var lines []string
+	for _, key := range argKeys(args) {
+		kl := strings.ToLower(key)
+		if keyMatches(contentKeys, kl) {
+			continue
+		}
+		if keyMatches(pathKeys, kl) || keyMatches(urlKeys, kl) || keyMatches(destinationKeys, kl) {
+			continue
+		}
+		value := args[key]
+		if dialogTargetLikeValue(value, targets) {
+			continue
+		}
+		raw, err := json.Marshal(value)
+		if err != nil {
+			continue
+		}
+		lines = append(lines, cleanForDialog(key, 80)+": "+cleanForDialog(string(raw), 120))
+	}
+	if len(lines) == 0 {
+		return "Other arguments: none"
+	}
+	return "Other arguments:\n" + strings.Join(lines, "\n")
+}
+
+func dialogTargetLikeValue(v any, targets map[string]bool) bool {
+	switch t := v.(type) {
+	case string:
+		return targets[t]
+	case []any:
+		if len(t) == 0 {
+			return false
+		}
+		for _, x := range t {
+			if !dialogTargetLikeValue(x, targets) {
+				return false
+			}
+		}
+		return true
+	case map[string]any:
+		if len(t) == 0 {
+			return false
+		}
+		for _, x := range t {
+			if !dialogTargetLikeValue(x, targets) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// dialogContent summarizes each content-key value by byte count and its first
+// 120 characters, so a padded body cannot hide another field or a payload.
+func dialogContent(args map[string]any) string {
+	var lines []string
+	for _, key := range argKeys(args) {
+		kl := strings.ToLower(key)
+		if !keyMatches(contentKeys, kl) {
+			continue
+		}
+		value := args[key]
+		var text string
+		switch v := value.(type) {
+		case string:
+			text = v
+		default:
+			raw, err := json.Marshal(v)
+			if err != nil {
+				continue
+			}
+			text = string(raw)
+		}
+		lines = append(lines, fmt.Sprintf("%s: %d bytes, starts: %s",
+			cleanForDialog(key, 80), len(text), cleanForDialog(text, 120)))
+	}
+	if len(lines) == 0 {
+		return "Content: none"
+	}
+	return "Content:\n" + strings.Join(lines, "\n")
+}
+
 // askHuman shows one OS dialog with three outcomes: deny, allow this one call,
 // or allow this tool (scoped to the call's directory when it has one) for 15m.
-func askHuman(tool string, args map[string]any, origin, scopeNote string) (decision, note string) {
-	raw, _ := json.Marshal(args)
-	msg := fmt.Sprintf("Sylenix Guard: the agent wants to run %s, but this session read untrusted content (%s). Arguments: %s. Deny blocks the call. Allow Once permits this one call. Allow Tool for 15m permits %s",
-		cleanForDialog(tool, 80), cleanForDialog(origin, 80), cleanForDialog(string(raw), 300), scopeNote)
+// The message keeps classified targets in full and summarizes content, so one
+// padded field cannot hide the field a human needs to see.
+func askHuman(tool string, args map[string]any, scan callScan, origin, scopeNote string) (decision, note string) {
+	originText := cleanForDialog(origin, 80)
+	if originText == "" {
+		originText = "unknown"
+	}
+	msg := fmt.Sprintf("Tool: %s\n%s\n%s\n%s\nThis session read untrusted content (%s).\nDeny blocks the call. Allow Once permits this one call. Allow Tool for 15m permits %s",
+		cleanForDialog(tool, 80), dialogTargets(scan), dialogOtherArguments(args, scan),
+		dialogContent(args), originText, scopeNote)
 	switch runtime.GOOS {
 	case "darwin":
 		script := fmt.Sprintf(`display dialog "%s" with title "Sylenix Guard" buttons {"Deny","Allow Once","Allow Tool for 15m"} default button "Deny" with icon caution giving up after 60`, escapeAppleScript(msg))
@@ -7059,9 +7226,10 @@ func askHuman(tool string, args map[string]any, origin, scopeNote string) (decis
 		}
 		return appleScriptChoice(string(out)), "osascript"
 	case "linux":
-		// A list, because zenity --question can only offer two buttons.
+		// A list, because zenity --question can only offer two buttons. The
+		// message is deliberately long, so give it room.
 		out, err := exec.Command("zenity", "--list", "--no-markup", "--hide-header",
-			"--title=Sylenix Guard", "--width=520", "--height=240", "--timeout=60",
+			"--title=Sylenix Guard", "--width=520", "--height=600", "--timeout=60",
 			"--text="+msg, "--column=Decision", "Deny", "Allow Once", "Allow Tool for 15m").Output()
 		if err != nil {
 			return "deny", "zenity: denied, timed out, or unavailable"
