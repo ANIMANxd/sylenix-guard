@@ -162,11 +162,29 @@ requires authorization that the agent cannot grant itself.
 
 | Component | Mechanism |
 |---|---|
-| Manifest guard | Tool definitions are pinned on first sight. A changed definition, or one containing hidden characters, quarantines the tool (`-32001`). |
-| Ingress sanitizer | Tool results are wrapped in `<untrusted_tool_result>` markers and stripped of zero-width, bidi and other invisible characters. |
-| Taint tracking | Any result from a non-trusted tool, resource read, prompt fetch, non-JSON server output, unmatched response, or server-to-client request/notification carrying text or resource content marks the session as tainted. |
+| Manifest guard | Tool, resource, prompt and resource-template definitions are pinned on first sight. A changed tool definition, or one containing hidden characters, quarantines the tool. |
+| Ingress sanitizer | Tool results are wrapped in `<untrusted_tool_result>` markers; instructions and definition descriptions/titles are stripped of zero-width, bidi and other invisible characters before the host sees them. |
+| Taint tracking | Any result from a non-trusted tool, resource read, prompt fetch, non-JSON server output, unmatched response, or server-to-client request/notification carrying text or resource content marks the session as tainted. So do initialize instructions, first-sight descriptions/titles on tools, resources, templates and prompts, and completion values. |
 | Flow control | While a session is tainted, only explicitly read-only tools run freely. Every other call is evaluated against the policy tiers below. |
 | Fail-closed framing | Batch frames, duplicate keys, duplicate ids, and unparseable or oversize frames are refused with a JSON-RPC error. Whatever can survive does; whatever cannot is refused. |
+
+### Server instructions and definition metadata
+
+Non-empty `initialize` instructions latch `TAINT_SERVER_INSTRUCTIONS`; non-empty
+descriptions or titles on a first-sight tool, resource, prompt or resource-template
+definition latch `TAINT_SERVER_METADATA`; `completion/complete` values latch
+`TAINT_SERVER_COMPLETION`. The latch happens before the host sees the result, and
+the shared-session latch carries it to other Guards in the same session. Invisible
+characters are removed from instructions and from description/title fields on the
+way through.
+
+Pins record each definition's description, so a human can inspect it with
+`sylenix-guard pins review --name <server>`. Approved pins are stored with
+`"reviewed": true`; reviewing a signed store requires `--policy-key` and re-signs
+it. Already-pinned, unchanged definitions do not re-taint. Pins written before
+metadata was recorded taint once until reviewed. A server you deliberately trust
+can set `servers.<name>.trust_metadata: true` in the policy to skip these
+metadata latches; the default is false.
 
 ### Policy tiers for a tainted call
 
@@ -251,9 +269,12 @@ wraps one MCP server per process over stdio or Streamable HTTP.
   including POST and GET SSE, `Mcp-Session-Id` pass-through, and auth-header pass-through
   without logging or persisting tokens
 - `install`/`uninstall` wrappers for Claude Desktop, Claude Code, Cursor and VS Code configs, with backups, diffs, confirmation and dry-run
-- Tool-definition pinning (trust on first use) with quarantine on change or hidden characters
+- Tool, resource, prompt and resource-template pinning (trust on first use),
+  tool quarantine on change or hidden characters, metadata taint on first sight,
+  and `pins review` for human-approved definitions
 - Ed25519 signing for `policy.yaml` and the pin store, with `keys init`, `policy sign`,
-  `pins sign`, and fail-closed startup on an unsigned or modified file
+  `pins sign`, `pins review --policy-key`, and fail-closed startup on an unsigned
+  or modified file
 - Optional paid-tier team policy service (`teams/`, `bin/sylenix-teams`): HTTPS
   pull every 15 minutes, team-signature verification, last-good cache, and local
   policy that can only tighten the team policy; see [`teams/README.md`](teams/README.md)
@@ -691,12 +712,16 @@ bypass, response expectations and safe harbour.
   known fields survive, but comments and original formatting do not.
 - Egress host matching is textual on the argument value. It does not resolve DNS,
   follow redirects, inspect the actual connection or pin the resolved IP.
-- Manifest pinning is trust on first use. When signing is enabled, pin files are
-  signed on write and verified on load; signing detects modification, not a
-  rollback to an older signed pair or deletion of both the pin file and its
-  signature (which is treated as first use). Deleting a signed policy file fails
-  closed. The private key is only as safe as its file permissions and the
-  machine account; HSM/remote signing is not implemented.
+- Manifest pinning is trust on first use. Non-empty instructions and definition
+  descriptions/titles taint the first sight, but an unchanged pin does not
+  re-taint on every start; review is a human decision, not an automatic content
+  check. `trust_metadata: true` disables these metadata latches for that server.
+  When signing is enabled, pin files are signed on write and verified on load;
+  signing detects modification, not a rollback to an older signed pair or
+  deletion of both the pin file and its signature (which is treated as first
+  use). Deleting a signed policy file fails closed. The private key is only as
+  safe as its file permissions and the machine account; HSM/remote signing is
+  not implemented.
 - `doctor` only reads the config paths it knows. It recognizes hand-written
   wrappers by the `sylenix-guard` executable name (or the `_sylenixGuard`
   metadata), resolves relative wrapper paths against its own working directory,

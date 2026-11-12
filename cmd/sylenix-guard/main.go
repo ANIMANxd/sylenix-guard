@@ -158,7 +158,8 @@ type policyEgress struct {
 }
 
 type policyServer struct {
-	Tools map[string]policyTool `json:"tools"`
+	TrustMetadata bool                  `json:"trust_metadata"`
+	Tools         map[string]policyTool `json:"tools"`
 }
 
 type policyTool struct {
@@ -183,6 +184,25 @@ type pendingReq struct {
 	method string
 	tool   string
 }
+
+// pinEntry is one reviewed-or-first-sight definition. Kind separates tools,
+// resources, prompts and resource templates inside one signed pin file.
+type pinEntry struct {
+	Kind        string `json:"kind"`
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	SHA256      string `json:"sha256"`
+	Reviewed    bool   `json:"reviewed,omitempty"`
+}
+
+type pinStoreFile struct {
+	Version int                 `json:"version"`
+	Pins    map[string]pinEntry `json:"pins"`
+}
+
+const pinStoreVersion = 2
+
+func pinKey(kind, name string) string { return kind + ":" + name }
 
 // scratchRule is one --allow-write-under entry: tainted calls to tool (any tool
 // when tool is empty) need no prompt while every path argument stays inside dir.
@@ -223,6 +243,7 @@ func (l *stringList) Set(v string) error { *l = append(*l, v); return nil }
 type policyState struct {
 	readonly          map[string]bool
 	trust             map[string]bool
+	trustMetadata     bool
 	approve           string
 	spotlight         bool
 	scratch           []scratchRule
@@ -250,6 +271,7 @@ func (s *policyState) clone() *policyState {
 	out := &policyState{
 		readonly:          cloneBoolMap(s.readonly),
 		trust:             cloneBoolMap(s.trust),
+		trustMetadata:     s.trustMetadata,
 		approve:           s.approve,
 		spotlight:         s.spotlight,
 		scratch:           append([]scratchRule(nil), s.scratch...),
@@ -347,13 +369,14 @@ type teamApplyOptions struct {
 }
 
 type Guard struct {
-	name      string
-	stateDir  string
-	readonly  map[string]bool // tools allowed even when the session is tainted
-	trust     map[string]bool // tools whose results do not taint the session
-	approve   string          // "deny" or "dialog"
-	spotlight bool
-	scratch   []scratchRule // --allow-write-under or policy allow_paths, fixed after startup
+	name          string
+	stateDir      string
+	readonly      map[string]bool // tools allowed even when the session is tainted
+	trust         map[string]bool // tools whose results do not taint the session
+	trustMetadata bool            // server instructions/definition metadata do not latch taint
+	approve       string          // "deny" or "dialog"
+	spotlight     bool
+	scratch       []scratchRule // --allow-write-under or policy allow_paths, fixed after startup
 
 	protectedDirs []string // resolved Guard state/key directories, protected like the built-in table
 
@@ -375,7 +398,7 @@ type Guard struct {
 	taintOrigin string
 	taintSince  time.Time
 	pending     map[string]pendingReq
-	pins        map[string]string
+	pins        map[string]pinEntry
 	quarantined map[string]string
 	grants      []grant // live time-bounded approvals
 
@@ -819,7 +842,7 @@ func prepareGuard(opts guardOptions) (*Guard, error) {
 		approve:       "deny",
 		spotlight:     true,
 		pending:       map[string]pendingReq{},
-		pins:          map[string]string{},
+		pins:          map[string]pinEntry{},
 		quarantined:   map[string]string{},
 		grants:        seeded,
 		out:           os.Stdout,
@@ -2071,11 +2094,14 @@ func runKeysCommand(args []string) int {
 }
 
 func runPinsCommand(args []string) int {
-	if len(args) == 0 || (args[0] != "sign" && args[0] != "verify") {
-		fmt.Fprintln(os.Stderr, "usage: sylenix-guard pins sign|verify --name NAME [--state-dir DIR] [--key PATH|--pubkey PATH]")
+	if len(args) == 0 || (args[0] != "sign" && args[0] != "verify" && args[0] != "review") {
+		fmt.Fprintln(os.Stderr, "usage: sylenix-guard pins sign|verify|review --name NAME [--state-dir DIR] [--key PATH|--pubkey PATH|--policy-key PATH]")
 		return 2
 	}
 	action := args[0]
+	if action == "review" {
+		return runPinsReview(args[1:])
+	}
 	fs := flag.NewFlagSet("pins "+action, flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	name := fs.String("name", "", "guard session name used for pins-<name>.json")
@@ -2149,6 +2175,157 @@ func runPinsCommand(args []string) int {
 	}
 	fmt.Printf("signature valid: %s\n", path)
 	return 0
+}
+
+func runPinsReview(args []string) int {
+	fs := flag.NewFlagSet("pins review", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	name := fs.String("name", "", "guard session name used for pins-<name>.json")
+	stateDir := fs.String("state-dir", "", "state directory (default ~/.sylenix-poc)")
+	policyKey := fs.String("policy-key", "", "Ed25519 private key used to re-sign the reviewed pin store")
+	keyPath := fs.String("key", "", "alias for --policy-key")
+	if err := fs.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(os.Stderr, "sylenix-guard pins review: unexpected arguments")
+		return 2
+	}
+	if strings.TrimSpace(*name) == "" || !validDoctorName(*name) {
+		fmt.Fprintln(os.Stderr, "sylenix-guard pins review: --name is required and must be a simple name")
+		return 2
+	}
+	state := *stateDir
+	if state == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "sylenix-guard pins review: cannot find home directory; pass --state-dir")
+			return 2
+		}
+		state = filepath.Join(home, ".sylenix-poc")
+	}
+	path := filepath.Join(state, "pins-"+*name+".json")
+	sigPath := path + signatureSuffix
+	data, err := os.ReadFile(path)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "sylenix-guard pins review:", err)
+		return 2
+	}
+	keyFile := *policyKey
+	if keyFile == "" {
+		keyFile = *keyPath
+	}
+	_, sigErr := os.Stat(sigPath)
+	signed := sigErr == nil
+	var signKey ed25519.PrivateKey
+	if signed {
+		if keyFile == "" {
+			fmt.Fprintln(os.Stderr, "sylenix-guard pins review: the pin file is signed; pass --policy-key to review and re-sign it")
+			return 2
+		}
+		priv, err := loadPrivateKeyFile(keyFile)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "sylenix-guard pins review:", err)
+			return 2
+		}
+		pub, ok := priv.Public().(ed25519.PublicKey)
+		if !ok {
+			fmt.Fprintln(os.Stderr, "sylenix-guard pins review: cannot derive the public key")
+			return 2
+		}
+		if err := verifyDetachedSignature(path, data, pub); err != nil {
+			fmt.Fprintln(os.Stderr, "sylenix-guard pins review:", err)
+			return 2
+		}
+		signKey = priv
+	} else if keyFile != "" {
+		priv, err := loadPrivateKeyFile(keyFile)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "sylenix-guard pins review:", err)
+			return 2
+		}
+		signKey = priv
+	}
+	pins, err := parsePinStore(data)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "sylenix-guard pins review:", err)
+		return 2
+	}
+	if len(pins) == 0 {
+		fmt.Println("no pins to review")
+		return 0
+	}
+
+	keys := make([]string, 0, len(pins))
+	for key := range pins {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	reader := bufio.NewReader(os.Stdin)
+	changed := false
+	for i, key := range keys {
+		entry := pins[key]
+		fmt.Printf("\n[%d/%d] %s %q\n", i+1, len(keys), entry.Kind, entry.Name)
+		if entry.Description != "" {
+			fmt.Printf("description:\n%s\n", reviewText(entry.Description))
+		} else {
+			fmt.Println("description: (none recorded)")
+		}
+		if entry.Reviewed {
+			fmt.Println("status: already reviewed")
+		}
+		fmt.Print("Approve this definition? [y/N] ")
+		answer, _ := reader.ReadString('\n')
+		answer = strings.ToLower(strings.TrimSpace(answer))
+		approved := answer == "y" || answer == "yes"
+		if entry.Reviewed != approved {
+			entry.Reviewed = approved
+			pins[key] = entry
+			changed = true
+		}
+	}
+	if !changed {
+		fmt.Println("\nno pin changes")
+		return 0
+	}
+
+	out := marshalPinStore(pins)
+	if signKey == nil {
+		if err := writeFileAtomic(path, out, 0o600); err != nil {
+			fmt.Fprintln(os.Stderr, "sylenix-guard pins review: cannot write pin file:", err)
+			return 2
+		}
+		_ = os.Remove(sigPath)
+	} else {
+		sig := ed25519.Sign(signKey, out)
+		if err := writeFileAtomic(path, out, 0o600); err != nil {
+			fmt.Fprintln(os.Stderr, "sylenix-guard pins review: cannot write pin file:", err)
+			return 2
+		}
+		if err := writeFileAtomic(sigPath, sig, 0o600); err != nil {
+			_ = os.Remove(path)
+			_ = os.Remove(sigPath)
+			fmt.Fprintln(os.Stderr, "sylenix-guard pins review: cannot write pin signature:", err)
+			return 2
+		}
+	}
+	fmt.Printf("updated %s\n", path)
+	return 0
+}
+
+func reviewText(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if unicode.IsControl(r) || isInvisible(r) {
+			fmt.Fprintf(&b, "\\u%04X", r)
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }
 
 // ---------------------------------------------------------------- policy file
@@ -2702,6 +2879,7 @@ func tightenPolicyState(floor, candidate *policyState) *policyState {
 			out.trust[name] = true
 		}
 	}
+	out.trustMetadata = floor.trustMetadata && candidate.trustMetadata
 	out.toolPathKeys = map[string]map[string]bool{}
 	for name, keys := range floor.toolPathKeys {
 		out.toolPathKeys[name] = cloneBoolMap(keys)
@@ -2840,7 +3018,7 @@ func clonePolicyFile(pf *policyFile) *policyFile {
 	}
 	out.Servers = make(map[string]policyServer, len(pf.Servers))
 	for sname, srv := range pf.Servers {
-		ns := policyServer{Tools: make(map[string]policyTool, len(srv.Tools))}
+		ns := policyServer{TrustMetadata: srv.TrustMetadata, Tools: make(map[string]policyTool, len(srv.Tools))}
 		for tname, tool := range srv.Tools {
 			nt := tool
 			nt.PathKeys = append([]string(nil), tool.PathKeys...)
@@ -3006,6 +3184,11 @@ func tightenPolicy(remote, local *policyFile) (*policyFile, []string) {
 		if rsrv.Tools == nil {
 			rsrv.Tools = map[string]policyTool{}
 		}
+		if lsrv.TrustMetadata && !rsrv.TrustMetadata {
+			ignored = append(ignored, "servers."+sname+".trust_metadata")
+		} else if !lsrv.TrustMetadata && rsrv.TrustMetadata {
+			rsrv.TrustMetadata = false
+		}
 		localTools := make([]string, 0, len(lsrv.Tools))
 		for name := range lsrv.Tools {
 			localTools = append(localTools, name)
@@ -3092,6 +3275,14 @@ func (s *policyServer) UnmarshalJSON(data []byte) error {
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(trim, &raw); err != nil {
 		return err
+	}
+	if trustRaw, ok := raw["trust_metadata"]; ok {
+		var trust bool
+		if err := decodePolicyJSON(trustRaw, &trust); err != nil {
+			return fmt.Errorf("trust_metadata: %w", err)
+		}
+		s.TrustMetadata = trust
+		delete(raw, "trust_metadata")
 	}
 	if toolsRaw, ok := raw["tools"]; ok {
 		if len(raw) != 1 {
@@ -3431,6 +3622,7 @@ func (g *Guard) applyPolicy(pf *policyFile, profile *policyProfile, visited map[
 	} else if len(pf.Servers) > 1 {
 		srv = pf.Servers[g.name] // loadPolicyForRun already required this entry
 	}
+	g.trustMetadata = srv.TrustMetadata
 	for tname, tool := range srv.Tools {
 		// A policy entry is an explicit override, even when it only changes
 		// allow_paths or path_keys, so clear any profile classification first.
@@ -3474,6 +3666,7 @@ func (g *Guard) stateFromFields() *policyState {
 	st := &policyState{
 		readonly:          cloneBoolMap(g.readonly),
 		trust:             cloneBoolMap(g.trust),
+		trustMetadata:     g.trustMetadata,
 		approve:           g.approve,
 		spotlight:         g.spotlight,
 		scratch:           append([]scratchRule(nil), g.scratch...),
@@ -3498,6 +3691,7 @@ func (g *Guard) assignPolicyState(st *policyState) {
 	st = st.clone()
 	g.readonly = cloneBoolMap(st.readonly)
 	g.trust = cloneBoolMap(st.trust)
+	g.trustMetadata = st.trustMetadata
 	g.approve = st.approve
 	g.spotlight = st.spotlight
 	g.scratch = append([]scratchRule(nil), st.scratch...)
@@ -4709,6 +4903,9 @@ func marshalPolicyYAML(pf *policyFile) []byte {
 		for _, serverName := range sortedPolicyServerNames(pf.Servers) {
 			server := pf.Servers[serverName]
 			fmt.Fprintf(&b, "  %s:\n", yamlPolicyString(serverName))
+			if server.TrustMetadata {
+				b.WriteString("    trust_metadata: true\n")
+			}
 			if len(server.Tools) == 0 {
 				b.WriteString("    tools: {}\n")
 				continue
@@ -5485,7 +5682,7 @@ func (g *Guard) fromHost(line []byte) (forward []byte, reply []byte) {
 	}
 
 	g.mu.Lock()
-	reason, quarantined := g.quarantined[name]
+	reason, quarantined := g.quarantined[pinKey("tool", name)]
 	g.mu.Unlock()
 	tainted, origin := g.taintState()
 	pol := g.currentPolicy()
@@ -5750,16 +5947,49 @@ func (g *Guard) fromServer(line []byte) []byte {
 		g.event("unmatched_response", nil)
 		return line
 	}
+	pol := g.currentPolicy()
 	switch p.method {
-	case "tools/list":
-		g.inspectToolsList(f["result"])
+	case "initialize":
+		if !pol.trustMetadata && initializeHasInstructions(f["result"]) {
+			g.latchReason("initialize", "TAINT_SERVER_INSTRUCTIONS")
+		}
+		if stripped := stripServerMetadata(f); stripped != nil {
+			return stripped
+		}
 		return line
+	case "tools/list":
+		g.inspectDefinitions("tool", "name", f["result"], "tools")
+		if stripped := stripServerMetadata(f); stripped != nil {
+			return stripped
+		}
+		return line
+	case "resources/list":
+		g.inspectDefinitions("resource", "uri", f["result"], "resources")
+		if stripped := stripServerMetadata(f); stripped != nil {
+			return stripped
+		}
+		return line
+	case "resources/templates/list":
+		g.inspectDefinitions("resource_template", "uriTemplate", f["result"], "resourceTemplates")
+		if stripped := stripServerMetadata(f); stripped != nil {
+			return stripped
+		}
+		return line
+	case "prompts/list":
+		g.inspectDefinitions("prompt", "name", f["result"], "prompts")
+		if stripped := stripServerMetadata(f); stripped != nil {
+			return stripped
+		}
+		return line
+	case "completion/complete":
+		if !pol.trustMetadata {
+			g.latchReason("completion/complete", "TAINT_SERVER_COMPLETION")
+		}
 	case "tools/call", "resources/read", "prompts/get":
 		origin := p.tool
 		if origin == "" {
 			origin = p.method
 		}
-		pol := g.currentPolicy()
 		if p.method == "tools/call" && pol.trust[p.tool] {
 			return line
 		}
@@ -5769,6 +5999,86 @@ func (g *Guard) fromServer(line []byte) []byte {
 		}
 	}
 	return line
+}
+
+// initializeHasInstructions treats a present but non-string instructions field
+// as content the Guard cannot classify, so it fails closed and latches.
+func initializeHasInstructions(raw json.RawMessage) bool {
+	var result map[string]json.RawMessage
+	if json.Unmarshal(raw, &result) != nil {
+		return false
+	}
+	value, ok := result["instructions"]
+	if !ok {
+		return false
+	}
+	var text string
+	if json.Unmarshal(value, &text) == nil {
+		return text != ""
+	}
+	return !bytes.Equal(bytes.TrimSpace(value), []byte("null"))
+}
+
+// stripServerMetadata removes invisible characters from instructions and from
+// description/title fields before the host sees them. It returns nil when the
+// frame is unchanged.
+func stripServerMetadata(f frame) []byte {
+	dec := json.NewDecoder(bytes.NewReader(f["result"]))
+	dec.UseNumber()
+	var result any
+	if dec.Decode(&result) != nil {
+		return nil
+	}
+	if !stripMetadataStrings(result) {
+		return nil
+	}
+	raw, err := json.Marshal(result)
+	if err != nil {
+		return nil
+	}
+	out := make(map[string]json.RawMessage, len(f))
+	for k, v := range f {
+		out[k] = v
+	}
+	out["result"] = raw
+	b, err := json.Marshal(out)
+	if err != nil {
+		return nil
+	}
+	return b
+}
+
+func stripMetadataStrings(v any) bool {
+	changed := false
+	switch t := v.(type) {
+	case map[string]any:
+		for key, value := range t {
+			if metadataKey(key) {
+				if s, ok := value.(string); ok {
+					if clean := stripInvisible(s); clean != s {
+						t[key] = clean
+						changed = true
+					}
+				}
+			}
+			if stripMetadataStrings(value) {
+				changed = true
+			}
+		}
+	case []any:
+		for _, value := range t {
+			if stripMetadataStrings(value) {
+				changed = true
+			}
+		}
+	}
+	return changed
+}
+
+func metadataKey(key string) bool {
+	return strings.EqualFold(key, "description") ||
+		strings.EqualFold(key, "title") ||
+		strings.EqualFold(key, "instructions")
 }
 
 func (g *Guard) latch(origin string) {
@@ -6137,50 +6447,167 @@ func (g *Guard) datamark(f frame, origin string, orig []byte) []byte {
 
 // ---------------------------------------------------------------- manifest pinning
 
-func (g *Guard) inspectToolsList(raw json.RawMessage) {
-	var res struct {
-		Tools []map[string]any `json:"tools"`
-	}
+func (g *Guard) inspectDefinitions(kind, nameKey string, raw json.RawMessage, listKey string) {
+	var res map[string]json.RawMessage
 	if json.Unmarshal(raw, &res) != nil {
 		return
 	}
+	var items []map[string]any
+	if json.Unmarshal(res[listKey], &items) != nil {
+		return
+	}
+	pol := g.currentPolicy()
+	type pinEvent struct {
+		kind   string
+		name   string
+		reason string
+	}
+	var events []pinEvent
+	var alerts []string
 	changed := false
+	latch := false
+
 	g.mu.Lock()
-	for _, t := range res.Tools {
-		name, _ := t["name"].(string)
+	for _, item := range items {
+		name, _ := item[nameKey].(string)
 		if name == "" {
 			continue
 		}
-		b, _ := json.Marshal(t) // map keys are sorted, so the encoding is stable
+		key := pinKey(kind, name)
+		b, _ := json.Marshal(item) // map keys are sorted, so the encoding is stable
 		sum := sha256.Sum256(b)
 		h := hex.EncodeToString(sum[:])
-		old, seen := g.pins[name]
+		description := pinMetadataText(item)
+		hasMetadata := hasDefinitionMetadata(item)
+		old, seen := g.pins[key]
 
 		reason := ""
 		switch {
-		case containsInvisible(t):
-			reason = "hidden characters in tool definition"
-		case seen && old != h:
+		case containsInvisible(item):
+			reason = "hidden characters in " + kind + " definition"
+		case seen && old.SHA256 != h:
 			reason = "definition changed since it was pinned"
 		}
 		if reason != "" {
-			if g.quarantined[name] != reason {
-				g.event("tool_quarantined", map[string]any{"tool": name, "reason": reason})
-				alert("tool %q quarantined: %s", name, reason)
+			if hasMetadata && !pol.trustMetadata {
+				// A quarantined definition is still content the host may see
+				// (and non-tool definitions are not blocked by the call path),
+				// so metadata that cannot be pinned must taint as well.
+				latch = true
 			}
-			g.quarantined[name] = reason
+			if g.quarantined[key] != reason {
+				events = append(events, pinEvent{kind: kind + "_quarantined", name: name, reason: reason})
+				alerts = append(alerts, fmt.Sprintf("%s %q quarantined: %s", kind, name, reason))
+			}
+			g.quarantined[key] = reason
 			continue
 		}
-		delete(g.quarantined, name)
+		delete(g.quarantined, key)
 		if !seen {
-			g.pins[name] = h
+			g.pins[key] = pinEntry{Kind: kind, Name: name, Description: description, SHA256: h}
 			changed = true
-			g.event("tool_pinned", map[string]any{"tool": name})
+			events = append(events, pinEvent{kind: kind + "_pinned", name: name})
+			if hasMetadata && !pol.trustMetadata {
+				latch = true
+			}
+		} else if old.Description == "" && description != "" {
+			// A pin written before metadata was tracked has no reviewable
+			// description. Treat the first sight of that metadata as untrusted
+			// until a human runs `pins review`.
+			old.Description = description
+			g.pins[key] = old
+			changed = true
+			if !old.Reviewed && !pol.trustMetadata {
+				latch = true
+			}
 		}
 	}
 	g.mu.Unlock()
+
+	for _, event := range events {
+		fields := map[string]any{"kind": kind, "name": event.name}
+		if kind == "tool" {
+			fields = map[string]any{"tool": event.name}
+		}
+		if event.reason != "" {
+			fields["reason"] = event.reason
+		}
+		g.event(event.kind, fields)
+	}
+	for _, message := range alerts {
+		alert("%s", message)
+	}
 	if changed {
 		g.savePins()
+	}
+	if latch {
+		g.latchReason("server_metadata", "TAINT_SERVER_METADATA")
+	}
+}
+
+func pinMetadataText(v any) string {
+	var parts []string
+	collectPinMetadata(v, &parts)
+	return strings.Join(parts, "\n")
+}
+
+func hasDefinitionMetadata(v any) bool {
+	switch t := v.(type) {
+	case map[string]any:
+		for key, value := range t {
+			if metadataKey(key) && metadataValuePresent(value) {
+				return true
+			}
+			if hasDefinitionMetadata(value) {
+				return true
+			}
+		}
+	case []any:
+		for _, value := range t {
+			if hasDefinitionMetadata(value) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func metadataValuePresent(v any) bool {
+	switch t := v.(type) {
+	case nil:
+		return false
+	case string:
+		return t != ""
+	case []any:
+		return len(t) > 0
+	case map[string]any:
+		return len(t) > 0
+	default:
+		return true
+	}
+}
+
+func collectPinMetadata(v any, parts *[]string) {
+	switch t := v.(type) {
+	case map[string]any:
+		keys := make([]string, 0, len(t))
+		for key := range t {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			value := t[key]
+			if metadataKey(key) {
+				if text, ok := value.(string); ok && text != "" {
+					*parts = append(*parts, text)
+				}
+			}
+			collectPinMetadata(value, parts)
+		}
+	case []any:
+		for _, value := range t {
+			collectPinMetadata(value, parts)
+		}
 	}
 }
 
@@ -6210,33 +6637,85 @@ func (g *Guard) loadPins(reset bool) error {
 			return fmt.Errorf("pin signature verification failed: %w", err)
 		}
 	}
-	var pins map[string]string
-	if json.Unmarshal(b, &pins) != nil || pins == nil {
+	pins, err := parsePinStore(b)
+	if err != nil {
 		g.event("pins_unreadable", nil)
-		return fmt.Errorf("pin file is not a JSON object")
-	}
-	// A null or malformed value unmarshals into an empty string without an
-	// error and would brick that tool on the next tools/list. Refuse the whole
-	// file instead: only a hex SHA-256 is a pin this build wrote.
-	for name, h := range pins {
-		if name == "" || len(h) != sha256.Size*2 {
-			g.event("pins_unreadable", nil)
-			return fmt.Errorf("pin file contains an empty name or a value that is not a SHA-256 hash")
-		}
-		if _, err := hex.DecodeString(h); err != nil {
-			g.event("pins_unreadable", nil)
-			return fmt.Errorf("pin file contains a value that is not a SHA-256 hash")
-		}
+		return err
 	}
 	g.pins = pins
 	return nil
+}
+
+func validPinHash(h string) bool {
+	if len(h) != sha256.Size*2 {
+		return false
+	}
+	_, err := hex.DecodeString(h)
+	return err == nil
+}
+
+func parsePinStore(data []byte) (map[string]pinEntry, error) {
+	var raw map[string]json.RawMessage
+	if json.Unmarshal(data, &raw) != nil || raw == nil {
+		return nil, fmt.Errorf("pin file is not a JSON object")
+	}
+	if _, hasVersion := raw["version"]; hasVersion {
+		if _, hasPins := raw["pins"]; !hasPins {
+			return nil, fmt.Errorf("pin file is missing its pins map")
+		}
+		var store pinStoreFile
+		if err := decodePolicyJSON(data, &store); err != nil {
+			return nil, fmt.Errorf("pin file is not a valid pin store")
+		}
+		if store.Version != pinStoreVersion {
+			return nil, fmt.Errorf("pin file has unsupported version %d", store.Version)
+		}
+		if store.Pins == nil {
+			return nil, fmt.Errorf("pin file has no pins map")
+		}
+		for key, entry := range store.Pins {
+			switch entry.Kind {
+			case "tool", "resource", "prompt", "resource_template":
+			default:
+				return nil, fmt.Errorf("pin file contains an unknown pin kind")
+			}
+			if entry.Name == "" || pinKey(entry.Kind, entry.Name) != key {
+				return nil, fmt.Errorf("pin file contains an invalid pin identity")
+			}
+			if !validPinHash(entry.SHA256) {
+				return nil, fmt.Errorf("pin file contains a value that is not a SHA-256 hash")
+			}
+		}
+		return store.Pins, nil
+	}
+	var legacy map[string]string
+	if json.Unmarshal(data, &legacy) != nil || legacy == nil {
+		return nil, fmt.Errorf("pin file is not a JSON object")
+	}
+	pins := make(map[string]pinEntry, len(legacy))
+	for name, h := range legacy {
+		if name == "" {
+			return nil, fmt.Errorf("pin file contains an empty name or a value that is not a SHA-256 hash")
+		}
+		if !validPinHash(h) {
+			return nil, fmt.Errorf("pin file contains a value that is not a SHA-256 hash")
+		}
+		pins[pinKey("tool", name)] = pinEntry{Kind: "tool", Name: name, SHA256: h}
+	}
+	return pins, nil
+}
+
+func marshalPinStore(pins map[string]pinEntry) []byte {
+	store := pinStoreFile{Version: pinStoreVersion, Pins: pins}
+	b, _ := json.MarshalIndent(store, "", "  ")
+	return b
 }
 
 func (g *Guard) pinsSignaturePath() string { return g.pinsPath() + signatureSuffix }
 
 func (g *Guard) savePins() {
 	g.mu.Lock()
-	b, _ := json.MarshalIndent(g.pins, "", "  ")
+	b := marshalPinStore(g.pins)
 	signKey := g.signKey
 	verifyKey := g.verifyKey
 	g.mu.Unlock()
@@ -9827,26 +10306,11 @@ func (d *doctorRun) checkPins(s doctorServer, findings *[]doctorFinding) (bool, 
 			"inspect the file, or restart with `--reset-pins` to trust every tool as new"))
 		return true, false
 	}
-	var pins map[string]string
-	if json.Unmarshal(b, &pins) != nil || pins == nil {
+	if _, err := parsePinStore(b); err != nil {
 		*findings = append(*findings, newDoctorFinding("PINS_UNREADABLE", "error", s.Client, s.ConfigPath, s.Name,
-			fmt.Sprintf("pin file %q is not a valid JSON hash map", cleanForDialog(path, 160)),
+			fmt.Sprintf("pin file %q is not a valid pin store", cleanForDialog(path, 160)),
 			"inspect the file, or restart with `--reset-pins` to trust every tool as new"))
 		return true, false
-	}
-	for name, h := range pins {
-		if name == "" || len(h) != sha256.Size*2 {
-			*findings = append(*findings, newDoctorFinding("PINS_UNREADABLE", "error", s.Client, s.ConfigPath, s.Name,
-				fmt.Sprintf("pin file %q contains a value that is not a SHA-256 hash", cleanForDialog(path, 160)),
-				"inspect the file, or restart with `--reset-pins` to trust every tool as new"))
-			return true, false
-		}
-		if _, err := hex.DecodeString(h); err != nil {
-			*findings = append(*findings, newDoctorFinding("PINS_UNREADABLE", "error", s.Client, s.ConfigPath, s.Name,
-				fmt.Sprintf("pin file %q contains a value that is not a SHA-256 hash", cleanForDialog(path, 160)),
-				"inspect the file, or restart with `--reset-pins` to trust every tool as new"))
-			return true, false
-		}
 	}
 	return true, true
 }

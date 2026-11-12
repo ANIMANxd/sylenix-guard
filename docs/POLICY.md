@@ -110,6 +110,19 @@ sylenix-guard pins verify --name filesystem --state-dir ~/.sylenix-poc --pubkey 
 the replacement is signed on the next `tools/list`; without one, it stays
 in-memory only.
 
+Pins record the kind, name, description, SHA-256 and review state of every
+pinned tool, resource, prompt and resource template. To inspect them and approve
+each definition:
+
+```bash
+sylenix-guard pins review --name filesystem --state-dir ~/.sylenix-poc
+```
+
+The command prints each definition's name and full description and asks `y/N`
+per item. Approved entries are written with `"reviewed": true`. If the pin file
+is signed, pass `--policy-key` so the reviewed store is verified and re-signed;
+without the key the command refuses to modify a signed store.
+
 `doctor --require-signatures` reports a policy or pin file as `UNSIGNED_POLICY`
 or `UNSIGNED_PINS` when no valid signature can be verified. If the wrapper has
 `--policy-pubkey`, doctor verifies with that key.
@@ -180,6 +193,11 @@ allowlist:
 
 servers:
   demo:
+    # true trusts this server's initialize instructions, definition
+    # descriptions/titles and completion values; they no longer latch
+    # TAINT_SERVER_INSTRUCTIONS, TAINT_SERVER_METADATA or
+    # TAINT_SERVER_COMPLETION. Default false.
+    trust_metadata: false
     tools:
       read_ticket:
         class: read
@@ -201,9 +219,18 @@ servers:
 ```
 
 `servers` may be omitted or empty for a policy that only sets global values.
-The shorter `servers.<name>.<tool>` form is also accepted. A tool that is not
-listed defaults to `exec`, the most restrictive class that can still be approved
-by a human; it is never treated as a read tool.
+The shorter `servers.<name>.<tool>` form is also accepted, with
+`trust_metadata` alongside the tool entries. A tool that is not listed defaults
+to `exec`, the most restrictive class that can still be approved by a human; it
+is never treated as a read tool.
+
+`trust_metadata` defaults to false. On first sight, non-empty initialize
+instructions, definition descriptions/titles and completion values latch
+`TAINT_SERVER_INSTRUCTIONS`, `TAINT_SERVER_METADATA` and
+`TAINT_SERVER_COMPLETION`. Set it to true only for a server whose metadata you
+have reviewed and trust. In team mode the local policy can narrow a remote
+`true` to `false`, but it cannot turn on metadata trust that the team floor did
+not grant.
 
 ## Built-in profiles
 

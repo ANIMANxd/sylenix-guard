@@ -21,6 +21,21 @@
   `SYLENIX_SESSION` / `--session` and a 0600 session latch file; startup adoption
   and `clear-taint` cover every Guard, `install` writes the session env, and
   `doctor` reports `SHARED_TAINT_OFF` when wrappers do not share a session.
+- Latched `TAINT_SERVER_INSTRUCTIONS` for non-empty `initialize` instructions
+  unless `servers.<name>.trust_metadata: true`.
+- Pinned tool, resource, prompt and resource-template definitions in one signed
+  pin file and latched `TAINT_SERVER_METADATA` on first sight when a description
+  or title is non-empty, unless metadata is trusted or the pin was reviewed.
+- Latched `TAINT_SERVER_COMPLETION` for `completion/complete` responses unless
+  metadata is trusted; the shared session latch carries all three reasons to
+  sibling Guards.
+- Stripped invisible characters from forwarded instructions and from
+  description/title fields on definition lists.
+- Added `sylenix-guard pins review --name <server>` to print each pinned
+  definition and record `"reviewed": true`, re-signing with `--policy-key` when
+  the store is signed.
+- Removed F5 from `KNOWN_FAIL` and added `tests/probes/test_server_metadata.py`
+  for metadata taint, `trust_metadata`, reviewed pins and signed review.
 
 ## 2026-11-11
 

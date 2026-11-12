@@ -173,7 +173,8 @@ def case_invisible():
         s = Session(d, env={"FAKE_PLAIN_UNICODE": "1"})
         s.start()
         r = s.call("write_file")
-        check("ordinary non-ASCII text (accents, CJK, emoji) is not quarantined", "result" in r, str(r))
+        check("ordinary non-ASCII text (accents, CJK, emoji) is not quarantined",
+              rule(r) != "MANIFEST_QUARANTINE", str(r))
         s.close()
 
 

@@ -32,6 +32,7 @@ probe-test: build
 	python3 tests/probes/test_install.py
 	python3 tests/probes/test_version.py
 	python3 tests/probes/test_redteam_2026_11.py
+	python3 tests/probes/test_server_metadata.py
 
 proxy-test: build
 	python3 tests/probes/test_http_proxy.py
