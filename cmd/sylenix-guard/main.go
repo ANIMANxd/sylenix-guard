@@ -166,11 +166,13 @@ type scratchRule struct {
 	dir  string
 }
 
-// grant is a time-bounded approval: calls to tool need no prompt until expires,
-// as long as every path argument stays inside dir (any path when dir is empty).
+// grant is a time-bounded approval. A protected grant covers only the exact
+// canonical files the human approved; any other grant covers calls to tool
+// whose every path argument stays inside dir (any path when dir is empty).
 type grant struct {
 	tool      string
 	dir       string
+	files     []string // exact canonical files for a protected grant
 	expires   time.Time
 	human     bool // recorded by the dialog, not by --grant
 	protected bool // the approved call was itself a protected target
@@ -5376,10 +5378,14 @@ func (g *Guard) fromHost(line []byte) (forward []byte, reply []byte) {
 				}
 				if pol.approve == "dialog" {
 					scope := scopeDir(scan.paths)
-					decision, note := askHuman(name, args, scan, origin, grantScopeNote(name, scope))
+					decision, note := askHuman(name, args, scan, origin, grantScopeNote(name, scope, scan.protected, len(scan.paths)))
 					g.event("approval", map[string]any{"tool": name, "granted": decision != "deny", "decision": decision, "class": class, "note": note, "arg_keys": argKeys(args)})
 					if decision == "grant" {
-						g.addGrant(name, scope, grantTTL, scan.protected)
+						var files []string
+						if scan.protected {
+							files = canonicalPathList(scan.paths)
+						}
+						g.addGrant(name, scope, files, grantTTL, scan.protected)
 						g.event("grant_recorded", map[string]any{"tool": name, "scope": scopeKind(scope), "ttl_seconds": int(grantTTL.Seconds())})
 					}
 					if decision != "deny" {
@@ -5465,10 +5471,14 @@ func (g *Guard) fromHost(line []byte) (forward []byte, reply []byte) {
 	}
 	if pol.approve == "dialog" {
 		scope := scopeDir(scan.paths)
-		decision, note := askHuman(name, args, scan, origin, grantScopeNote(name, scope))
+		decision, note := askHuman(name, args, scan, origin, grantScopeNote(name, scope, scan.protected, len(scan.paths)))
 		g.event("approval", map[string]any{"tool": name, "granted": decision != "deny", "decision": decision, "class": class, "note": note, "arg_keys": argKeys(args)})
 		if decision == "grant" {
-			g.addGrant(name, scope, grantTTL, scan.protected)
+			var files []string
+			if scan.protected {
+				files = canonicalPathList(scan.paths)
+			}
+			g.addGrant(name, scope, files, grantTTL, scan.protected)
 			g.event("grant_recorded", map[string]any{"tool": name, "scope": scopeKind(scope), "ttl_seconds": int(grantTTL.Seconds())})
 		}
 		if decision != "deny" {
@@ -7028,9 +7038,11 @@ func pathsResolvable(paths []string) bool {
 	return true
 }
 
-// scopeDir narrows a grant to the deepest directory that holds every path of
-// the approved call. No paths, an unresolvable path, or a filesystem root all
-// mean the grant covers the whole tool (which is what the button says).
+// scopeDir narrows a non-protected grant to the deepest directory that holds
+// every path of the approved call. No paths, an unresolvable path, or a
+// filesystem root all mean the grant covers the whole tool (which is what the
+// button says). Protected grants keep this directory for relative-path
+// resolution, but their authority is their exact files list.
 func scopeDir(paths []string) string {
 	var scope string
 	for _, p := range paths {
@@ -7057,17 +7069,59 @@ func scopeDir(paths []string) string {
 	return scope
 }
 
-// addGrant records one time-bounded approval from the dialog or the --grant flag.
-func (g *Guard) addGrant(tool, dir string, ttl time.Duration, protected bool) {
+// canonicalPathList returns the canonical form of each path, de-duplicated.
+// Paths that cannot be canonicalized are omitted, so the resulting grant covers
+// less than the call, never more.
+func canonicalPathList(paths []string) []string {
+	out := make([]string, 0, len(paths))
+	seen := make(map[string]bool, len(paths))
+	for _, p := range paths {
+		canonical, ok := canonicalPath(p)
+		if !ok {
+			continue
+		}
+		if !seen[canonical] {
+			out = append(out, canonical)
+			seen[canonical] = true
+		}
+	}
+	return out
+}
+
+// allPathsInGrantFiles reports whether every call path is one of the exact
+// canonical files in the grant. Empty path or file sets never match.
+func allPathsInGrantFiles(paths, files []string) bool {
+	if len(paths) == 0 || len(files) == 0 {
+		return false
+	}
+	approved := make(map[string]bool, len(files))
+	for _, file := range files {
+		approved[file] = true
+	}
+	for _, p := range paths {
+		canonical, ok := canonicalPath(p)
+		if !ok || !approved[canonical] {
+			return false
+		}
+	}
+	return true
+}
+
+// addGrant records one time-bounded approval from the dialog. A protected
+// approval also carries the exact canonical files the human approved.
+func (g *Guard) addGrant(tool, dir string, files []string, ttl time.Duration, protected bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	g.grants = append(g.grants, grant{tool: tool, dir: dir, expires: time.Now().Add(ttl), human: true, protected: protected})
+	g.grants = append(g.grants, grant{
+		tool: tool, dir: dir, files: append([]string(nil), files...),
+		expires: time.Now().Add(ttl), human: true, protected: protected,
+	})
 }
 
 // grantAllows reports whether a live grant covers this call. Expired grants are
-// dropped along the way; a directory-scoped grant only covers calls whose every
-// path argument stays inside that directory. Protected targets ignore --grant
-// seeds and need a human grant recorded for a protected call.
+// dropped along the way. A protected grant matches only the exact canonical
+// files it recorded; a non-protected grant keeps the directory scope. A
+// protected call never uses a non-protected grant.
 func (g *Guard) grantAllows(tool string, paths []string, protected bool) bool {
 	now := time.Now()
 	g.mu.Lock()
@@ -7080,6 +7134,12 @@ func (g *Guard) grantAllows(tool string, paths []string, protected bool) bool {
 		}
 		kept = append(kept, gr)
 		if gr.tool != tool || (protected && (!gr.human || !gr.protected)) {
+			continue
+		}
+		if gr.protected {
+			if gr.human && allPathsInGrantFiles(paths, gr.files) {
+				allowed = true
+			}
 			continue
 		}
 		if gr.dir == "" {
@@ -7206,7 +7266,8 @@ func dialogContent(args map[string]any) string {
 }
 
 // askHuman shows one OS dialog with three outcomes: deny, allow this one call,
-// or allow this tool (scoped to the call's directory when it has one) for 15m.
+// or allow this tool for 15m. A protected call's grant covers the exact files
+// it touched; any other grant covers the call's directory when it has one.
 // The message keeps classified targets in full and summarizes content, so one
 // padded field cannot hide the field a human needs to see.
 func askHuman(tool string, args map[string]any, scan callScan, origin, scopeNote string) (decision, note string) {
@@ -7383,7 +7444,17 @@ exit 1
 `
 
 // grantScopeNote tells the human exactly what the third button authorizes.
-func grantScopeNote(tool, scope string) string {
+func grantScopeNote(tool, scope string, protected bool, fileCount int) string {
+	if protected {
+		switch {
+		case fileCount == 1:
+			return "this exact file for 15 minutes (this session only)"
+		case fileCount > 1:
+			return fmt.Sprintf("these %d exact files for 15 minutes (this session only)", fileCount)
+		default:
+			return "this exact protected target for 15 minutes (this session only)"
+		}
+	}
 	if scope == "" {
 		return fmt.Sprintf("any call to %s for 15 minutes (this session only)", cleanForDialog(tool, 80))
 	}

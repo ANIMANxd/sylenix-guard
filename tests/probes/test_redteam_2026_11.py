@@ -37,14 +37,15 @@ REDTEAM_SERVER = os.path.join(ROOT, "tests", "probes", "redteam_server.py")
 PROFILE_SERVER = os.path.join(ROOT, "tests", "probes", "profile_server.py")
 
 # Cases that fail on the commit before the corresponding fix. Remove a case
-# from this set in the commit that fixes it. F2, F3a-F3e and F4 were fixed by
-# the read-class scan, exact-key tools/call rewrite and structured dialog, so
-# they no longer belong here. F2-read and F3-meta are compatibility controls,
-# not expected failures: they pass before and after the fixes. F2-dialog and
-# F4-github exercise new paths; they fail before the fix and pass after.
+# from this set in the commit that fixes it. F2, F3a-F3e, F4 and F6 were fixed
+# by the read-class scan, exact-key tools/call rewrite, structured dialog and
+# exact-file grants, so they no longer belong here. F2-read and F3-meta are
+# compatibility controls, not expected failures: they pass before and after the
+# fixes. F2-dialog and F4-github exercise new paths; they fail before the fix
+# and pass after.
 KNOWN_FAIL = {
     "F1",
-    "F5", "F6",
+    "F5",
     "F7a", "F7b", "F7c",
     "F8", "F9",
 }
@@ -838,20 +839,26 @@ def case_f6(dialog_bin):
             s.start()
             s.call("read_ticket")
             first = s.call("write_file", {"path": agents})
-            before = len(dialog_messages(log))
+            first_messages = dialog_messages(log)
+            before = len(first_messages)
             second = s.call("write_file", {"path": workflow})
             after = len(dialog_messages(log))
         finally:
             s.close()
+        problems = []
         if "result" not in first:
-            return False, "the 15m grant did not allow the first protected write: %s" % first
+            problems.append("the 15m grant did not allow the first protected write: %s" % first)
         if before < 1:
-            return False, "the first protected write did not show a dialog"
+            problems.append("the first protected write did not show a dialog")
+        if "this exact file for 15 minutes" not in "\n".join(first_messages).lower():
+            problems.append("the protected approval note did not say this exact file for 15 minutes")
         if after <= before:
-            return False, ("the second protected write rode the first grant: "
-                           "%d dialog(s) before, %d after" % (before, after))
+            problems.append("the second protected write rode the first grant: "
+                            "%d dialog(s) before, %d after" % (before, after))
         if "result" not in second:
-            return False, "the fresh dialog did not allow the second write: %s" % second
+            problems.append("the fresh dialog did not allow the second write: %s" % second)
+        if problems:
+            return False, "; ".join(problems)
         return True, ""
 
 

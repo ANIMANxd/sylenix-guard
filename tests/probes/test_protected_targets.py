@@ -263,7 +263,8 @@ def dialog_approval_test():
         r = s.call("write_file", {"path": os.path.join(out, "AGENTS.md")})
         check("dialog: protected target can be approved", "result" in r, str(r)[:120])
         r = s.call("write_file", {"path": os.path.join(out, "CLAUDE.md")})
-        check("dialog: a human 15m grant covers protected targets", "result" in r, str(r)[:120])
+        check("dialog: a second protected target can be approved with a fresh grant",
+              "result" in r, str(r)[:120])
         r = s.call("write_file", {"path": os.path.join(out, ".git", "config")})
         check("dialog: .git/config remains hard blocked",
               "result" not in r and rule(r) == "SENSITIVE_TARGET", f"rule={rule(r)}")

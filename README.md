@@ -189,9 +189,10 @@ requires authorization that the agent cannot grant itself.
    autostart, package-manager credentials (`.npmrc`, `.pypirc`, `.netrc`), cron,
    launchd, systemd user units, Windows Startup, and Guard's own state/key
    directories (including the active `--state-dir`) are `SENSITIVE_TARGET` after
-   taint. They never use a grant or scratch shortcut; with `--approve dialog` they
-   require a human decision, except the hard-blocked `.git`, `.env`, key and Guard
-   state/key paths above. After taint, read-class tools may still read
+   taint. They never use a scratch shortcut or a non-protected grant; with
+   `--approve dialog` they require a human decision, and a protected grant covers
+   only the exact file(s) approved. The hard-blocked `.git`, `.env`, key and Guard
+   state/key paths above still cannot be approved. After taint, read-class tools may still read
    non-credential protected files (agent instructions, CI files, shell rc files);
    credential paths (`.ssh`, `.npmrc`, `.pypirc`, `.netrc`) are blocked or
    prompted, and Guard state/key paths stay hard-blocked.
@@ -199,8 +200,9 @@ requires authorization that the agent cannot grant itself.
    every path argument stays inside `DIR` are forwarded without a prompt.
 4. **Authorization.** Everything else is denied (`-32000 TAINT_SINK`), or, with
    `--approve dialog`, presented to a human with three choices: **Deny**, **Allow Once**,
-   **Allow Tool for 15m**. A 15-minute approval is scoped to the directory the approved
-   call touched and is held in memory for the life of the process.
+   **Allow Tool for 15m**. A 15-minute approval for a protected target is scoped
+   to the exact file(s) the approved call touched; other approvals are scoped to
+   the directory. Grants are held in memory for the life of the process.
 
 ## Current state
 
@@ -244,7 +246,9 @@ wraps one MCP server per process over stdio or Streamable HTTP.
   `CLEAR_TAINT` audit event
 - `stats` audit summary with approval prompts per active hour
 - Scratch-directory write policy (`--allow-write-under`)
-- Time-bounded, directory-scoped human approvals (dialog and `--grant`)
+- Time-bounded approvals: dialog grants are exact-file for protected targets and
+  directory-scoped otherwise; `--grant` seeds are directory-scoped and never
+  satisfy a protected call
 - Native approval dialogs: osascript (macOS), zenity (Linux), PowerShell form (Windows)
 - JSON-lines audit log that never records argument values
 - Fail-closed handling of malformed, duplicate, batched and oversize frames

@@ -126,8 +126,8 @@ machine account; there is no HSM or remote signer.
 3. Input validation and flag expansion:
    - `--approve` must be `deny` or `dialog` when explicitly set.
    - `--allow-write-under` becomes `[]scratchRule`, with `TOOL=DIR` support.
-   - `--grant` becomes seeded in-memory grants, with `TOOL[:DIR]=DURATION`
-     parsing.
+   - `--grant` becomes seeded non-protected in-memory grants, with
+     `TOOL[:DIR]=DURATION` parsing.
 4. Name and state-directory defaults. The default name is the
    server command's basename; the default state directory is `~/.sylenix-poc`.
 5. State directory creation with mode `0700` and audit-log open with mode
@@ -167,7 +167,7 @@ All in `cmd/sylenix-guard/main.go`:
 | `frame` | `map[string]json.RawMessage` for one JSON-RPC object | `main.go` |
 | `pendingReq` | Tracks the method and tool name for an outstanding request id | `main.go` |
 | `scratchRule` | One `--allow-write-under` entry: optional tool plus directory | `main.go` |
-| `grant` | One time-bounded approval: tool, optional directory, expiry, human/protected flags | `main.go` |
+| `grant` | One time-bounded approval: tool, optional directory, exact protected files, expiry, human/protected flags | `main.go` |
 | `policyFile` | Strict on-disk policy schema | `main.go` |
 | `policyTool` | Per-tool class, extra path keys, allow paths, trust | `main.go` |
 | `policyProfile` | Built-in classification table for a known server family | `main.go` |
@@ -239,15 +239,17 @@ with HTTP 200; notifications get HTTP 202. The HTTP transport never calls
        call is ambiguous or protected.
     5. **Live grant** (`grantAllows`): a
        time-bounded grant can allow the call only when there is no egress and no
-       ambiguity, and every path stays inside the grant's directory (or the
-       grant is tool-wide and paths resolve safely). Protected calls require a
-       human-recorded protected grant.
+       ambiguity. A protected grant matches only the exact canonical files it
+       recorded; a non-protected grant requires every path to stay inside its
+       directory (or be tool-wide with resolvable paths). Protected calls never
+       use a non-protected grant.
     6. **Scratch write** (`scratchAllows`): no
        prompt while every path stays inside an `--allow-write-under` root. No
        recognizable path means no scratch shortcut.
     7. **Dialog** (`askHuman`): with
        `--approve dialog`, offer Deny / Allow Once / Allow Tool for 15m.
-       A grant records a directory scope and is held in memory.
+       A protected grant records the exact files; other grants record a
+       directory scope. Both are held in memory.
     8. **Default deny**: `-32000 TAINT_SINK`.
 
 A blocked request gets an error frame only when it has an id; notifications are
@@ -439,7 +441,7 @@ same names through `registerGuardFlags` and `runProxyCommand`.
 | `--no-spotlight` | `main.go` | `applyPolicy` sets `spotlight`; `fromServer` skips `datamark` for tool results; `datamark`. Note this also skips invisible-character stripping, not only the wrapper. |
 | `--reset-pins` | `main.go` | `loadPins` removes the pin file and its signature, logs `pins_reset`, then repins on the next `tools/list`. |
 | `--allow-write-under` | `main.go` | Repeatable `stringList`; parsed into `scratchRule`, canonicalized at startup; `applyPolicy`; scratch branch; `scratchAllows`; `protectedCall` checks relative names; `start` event logs the raw specs. |
-| `--grant` | `main.go` | Repeatable `stringList`; parsed into seeded grants; stored in `Guard.grants`; `grantAllows`; protected calls require a human grant; dialog grant recording. |
+| `--grant` | `main.go` | Repeatable `stringList`; parsed into seeded non-protected grants; stored in `Guard.grants`; `grantAllows`; protected calls ignore them; dialog grant recording stores exact files for protected targets. |
 
 ### 9.2 Subcommand flags
 
@@ -707,12 +709,12 @@ scope limits; some are worth fixing.
     redirects, or pin IPs (`main.go`, `POC_SPIKE.md`). Scratch
     path checks resolve symlinks but leave a check-to-write race
     (`main.go`, `POC_SPIKE.md`).
-19. **A directory-scoped grant is broader than one call.** `addGrant` records
-    tool plus directory; `grantAllows` allows any call to that tool whose paths
-    stay inside the directory for 15 minutes (`main.go`). A human
-    approval for one protected file can therefore cover other protected files
-    in the same directory while the grant is live. `POC_SPIKE.md`
-    documents the broader grant scope.
+19. **A grant is broader than one call, but protected grants are exact-file.**
+    `addGrant` records the tool and either the exact canonical files (protected
+    targets) or a directory (non-protected calls). `grantAllows` matches exact
+    files for a protected grant and directory membership for a non-protected
+    grant, for 15 minutes (`main.go`). A human approval for one protected file
+    does not cover another protected file. `POC_SPIKE.md` documents the scope.
 20. **Dialog mode blocks the calling transport while a dialog is open.**
     `askHuman` runs synchronously in the stdio host-to-server goroutine
     (`main.go`; `POC_SPIKE.md`). In stdio mode that

@@ -13,6 +13,10 @@
 - Restructured the approval dialog to show the tool, every path/destination
   target with its protected category, short remaining arguments, and content
   byte counts with previews; padded content can no longer hide a target.
+- Scoped a protected target's 15-minute grant to the exact canonical files the
+  human approved and stated that scope in the dialog, while non-protected grants
+  keep their directory scope; a non-protected grant still never satisfies a
+  protected call.
 
 ## 2026-11-11
 
