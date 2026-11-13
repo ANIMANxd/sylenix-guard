@@ -52,6 +52,23 @@ The Guard contains actions on the MCP channel; it does not make a model
 trustworthy, and it does not cover host built-in tools, attachments or pasted
 text. See the limitations in `README.md` and `POC_SPIKE.md`.
 
+## Red-team findings
+
+We thank the red-team reviewers who reported the November 2026 findings. F1-F9
+are fixed in **v0.1.2**:
+
+| ID | Finding |
+|---|---|
+| F1 | Shared taint did not cover sibling server processes in one client session. |
+| F2 | Read-class tools could read sensitive credential and config paths after taint. |
+| F3 | `tools/call` key and name differentials could make the Guard check a different call than the server ran (F3a-F3e). |
+| F4 | Padded arguments could hide the real target from the approval dialog. |
+| F5 | Initialize instructions and server definition metadata did not latch taint. |
+| F6 | A protected-target grant could cover more than the exact approved file. |
+| F7 | Embedded resources, forged markers and additional invisible ranges bypassed result sanitisation (F7a-F7c). |
+| F8 | Some read-class profile tools wrote files or used a database query path that was not read-only. |
+| F9 | Profile matching truncated scoped package paths under `node_modules`. |
+
 ## Response expectations
 
 We aim to acknowledge a private report within **3 working days**. After that we

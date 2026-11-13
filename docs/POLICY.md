@@ -227,10 +227,11 @@ is never treated as a read tool.
 `trust_metadata` defaults to false. On first sight, non-empty initialize
 instructions, definition descriptions/titles and completion values latch
 `TAINT_SERVER_INSTRUCTIONS`, `TAINT_SERVER_METADATA` and
-`TAINT_SERVER_COMPLETION`. Set it to true only for a server whose metadata you
-have reviewed and trust. In team mode the local policy can narrow a remote
-`true` to `false`, but it cannot turn on metadata trust that the team floor did
-not grant.
+`TAINT_SERVER_COMPLETION`. Already-pinned unchanged definitions do not re-taint,
+and pins marked `"reviewed": true` by `pins review` are accepted on restart. Set
+`trust_metadata` to true only for a server whose metadata you have reviewed and
+trust. In team mode the local policy can narrow a remote `true` to `false`, but
+it cannot turn on metadata trust that the team floor did not grant.
 
 ## Built-in profiles
 

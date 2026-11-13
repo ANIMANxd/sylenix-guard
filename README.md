@@ -119,9 +119,11 @@ shell so they are on `PATH`). The script is
 ## Measured results
 
 From the [November 2026 evaluation](results/2026-11-launch.md) on one model
-(`qwen/qwen3.5-9b`, temperature 0, stdio):
+(`qwen/qwen3.5-9b`, temperature 0, stdio). This was a **single-server**
+evaluation: each guarded run wrapped one filesystem server. Shared taint across
+multiple wrapped servers was not part of this measurement.
 
-| Measured result | Count |
+| Single-server measured result | Count |
 |---|---:|
 | Guarded runs with a canary leak (harness + sweep) | **0 / 110** |
 | Guarded sweep, including file-channel rescore | **0 / 70** |
@@ -143,8 +145,12 @@ is not a seed, and stdio only for the model runs.
 **Limits up front.** Guard is a policy boundary on one MCP connection, not a
 sandbox and not a compliance certification. It cannot see host built-in tools,
 attachments or pasted text, does not make the model trustworthy, and cannot stop
-an action inside a live grant or a mis-listed read-only tool. Read the full
-[security model and limits](#security-model-and-limits) before relying on it.
+an action inside a live grant or a mis-listed read-only tool. Taint is shared
+only inside one client session when wrappers use the same `SYLENIX_SESSION`;
+separate clients are separate sessions. Server instructions and definition
+metadata taint unless `trust_metadata` is enabled or the pins were reviewed.
+Protected-target grants cover only the exact files a human approved. Read the
+full [security model and limits](#security-model-and-limits) before relying on it.
 
 ## The problem
 
@@ -188,14 +194,15 @@ metadata latches; the default is false.
 
 ### Policy tiers for a tainted call
 
-1. **Always blocked.** Calls that address a network target (an argument named
+1. **Always blocked, including read-class calls after taint.** Calls that
+   address a network target (an argument named
    `url`/`uri`/`endpoint`/`webhook`/`href`/`link`, a destination key such as
    `host`/`server`/`to`/`recipient`, or a value that is a URL/URI) and calls
    whose paths touch `.git` (all paths, including hooks), `.env*`, key or
    certificate files, or known config names (`go.mod`, `package.json`, `Makefile`,
    …) are refused with `EGRESS_TARGET` and `SENSITIVE_TARGET`. These cannot be
-   approved through a dialog or a grant. After taint, the same path blocks apply
-   to read-class tools, so a read of `.env*`, a key file, or another tier-1 path
+   approved through a dialog or a grant. The same blocks apply to read-class
+   tools after taint, so a read of `.env*`, a key file, or another tier-1 path
    is refused.
 2. **Protected agent-instruction, credential and persistence files.** Agent
    instruction files (`AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, Cursor/Windsurf rules),
@@ -218,9 +225,11 @@ metadata latches; the default is false.
    every path argument stays inside `DIR` are forwarded without a prompt.
 4. **Authorization.** Everything else is denied (`-32000 TAINT_SINK`), or, with
    `--approve dialog`, presented to a human with three choices: **Deny**, **Allow Once**,
-   **Allow Tool for 15m**. A 15-minute approval for a protected target is scoped
-   to the exact file(s) the approved call touched; other approvals are scoped to
-   the directory. Grants are held in memory for the life of the process.
+   **Allow Tool for 15m**. The dialog lists every path/destination target and its
+   protected category first, then short argument summaries and content previews.
+   A 15-minute approval for a protected target is scoped to the exact file(s)
+   the approved call touched; other approvals are scoped to the directory.
+   Grants are held in memory for the life of the process.
 
 ### Shared taint across server processes
 
@@ -640,8 +649,14 @@ server or cover traffic that never passes through its process. In particular,
 it does not:
 
 - see host built-in tools, attachments or text pasted directly into the agent;
+- share taint beyond one client session: `SYLENIX_SESSION` links the wrapped
+  servers of one client, while separate clients are separate sessions;
+- treat server instructions or definition metadata as trusted by default; they
+  latch taint unless `trust_metadata` is enabled or the pins were reviewed;
 - protect a second MCP server, route between servers, or broker OAuth tokens;
 - stop an action inside a live 15-minute grant or inside a `--readonly` tool;
+  protected-target grants cover only the exact files a human approved, while
+  other grants cover their directory scope;
 - control what a permitted write contains, or provide an OS-level filesystem
   sandbox;
 - make pin files, audit logs or approvals tamper-evident;
@@ -660,7 +675,8 @@ bypass, response expectations and safe harbour.
 
 - Coverage is one MCP server per process. Host built-in tools, attachments and pasted
   text never pass through the gateway. Taint can be shared across the servers of one
-  client through `SYLENIX_SESSION`; that is not a multi-server router.
+  client through `SYLENIX_SESSION`; separate clients are separate sessions, and this
+  is not a multi-server router.
 - Proxy mode covers one Streamable HTTP endpoint. It targets MCP 2025-11-25 and
   tolerates the stateless 2026-07-28 shape; the legacy HTTP+SSE transport is not
   implemented. It passes `Mcp-Session-Id` through rather than mapping sessions per

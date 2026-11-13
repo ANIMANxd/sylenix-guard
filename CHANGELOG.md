@@ -58,6 +58,9 @@
   added `@scope/pkg` tokens from `node_modules` paths.
 - Removed F8 and F9 from `KNOWN_FAIL` and added
   `tests/probes/test_profile_classes_2026_11.py`.
+- Credited F1-F9 in `SECURITY.md` and listed them as fixed in v0.1.2.
+- Documented shared-taint scope, metadata trust/review, exact-file grants,
+  `SHARED_TAINT_OFF` and the single-server evaluation scope.
 
 ## 2026-11-11
 

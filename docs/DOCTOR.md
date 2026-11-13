@@ -126,7 +126,7 @@ cannot be used and `risk` for a configuration weakness.
 | `RISKY_SCRATCH` | `--allow-write-under` or policy `allow_paths` covers the home directory, the repository root, an ancestor of either, a filesystem root, or a path that cannot be resolved. | Narrow it to a project subdirectory, for example `<repo>/out`. |
 | `TRUST_ON_EGRESS` | A trusted tool is configured on a server that has at least one egress-class tool. Results from trusted tools do not latch taint. | Remove `--trust` / `trust: true` for that server. |
 | `APPROVALS_OFF` | Effective approval mode is `deny`, so the OS dialog is disabled and tainted sinks are hard-blocked rather than reviewed. | Set `--approve dialog` in the wrapper or `approval: dialog` in the policy. |
-| `SHARED_TAINT_OFF` | A client config wraps two or more servers but at least one wrapper has no non-empty `SYLENIX_SESSION` environment value or `--session` flag, so taint is not shared across those processes. | Re-run `sylenix-guard install`, or add `SYLENIX_SESSION` to every wrapped entry. |
+| `SHARED_TAINT_OFF` | A client config wraps two or more servers but at least one wrapper has no non-empty `SYLENIX_SESSION` environment value or `--session` flag, so taint is not shared across those processes. Sharing is scoped to one client session; separate clients are separate sessions. | Re-run `sylenix-guard install`, or add the same `SYLENIX_SESSION` to every wrapped entry. |
 | `UNSIGNED_POLICY` | `--require-signatures` was set and the policy has no valid signature for the configured public key. | Sign with `policy sign` and add `--policy-pubkey` to the wrapper. |
 | `UNSIGNED_PINS` | `--require-signatures` was set and the pin file has no valid signature for the configured public key. | Sign with `pins sign` or run with `--policy-key` so new pins are signed. |
 | `OUTDATED_GUARD` | The wrapper metadata version is older than this build, or the Guard binary in the wrapper is older than the running doctor. | Upgrade Guard and re-run `sylenix-guard install`. |
@@ -136,7 +136,7 @@ cannot be used and `risk` for a configuration weakness.
 | `SERVER_INVALID` | A server entry is not an object, has no non-empty string command, has a command with surrounding spaces, has a non-array/non-string `args`, has an unsupported type, or has an empty/control-character name. | Make it a stdio entry with a string command and a string args array. |
 | `WRAPPER_INVALID` | A Guard wrapper has no `--` separator, an unknown or malformed Guard flag, malformed `_sylenixGuard` metadata, no server command after `--`, or a wrapped server command with control characters or surrounding spaces. | Re-run `sylenix-guard install` or fix the Guard flags. |
 | `POLICY_INVALID` | The policy cannot be read or validated, or has no entry for the effective server name. | Run `sylenix-guard policy validate <file>` and fix it. |
-| `PINS_UNREADABLE` | The pin file exists but is not a regular file, is too large, cannot be read, or is not a JSON map of SHA-256 hashes. The guard refuses to start in this state. | Inspect the file, or restart with `--reset-pins`. |
+| `PINS_UNREADABLE` | The pin file exists but is not a regular file, is too large, cannot be read, or is not a valid versioned pin store with SHA-256 entries. The guard refuses to start in this state. | Inspect the file, or restart with `--reset-pins`. |
 
 ## Version check
 
