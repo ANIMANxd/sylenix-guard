@@ -4528,12 +4528,31 @@ var builtinProfiles = []policyProfile{
 		),
 	},
 	{
+		// The archived server-postgres "query" tool does not enforce a
+		// read-only transaction, and COPY ... TO PROGRAM is available on a
+		// superuser connection. Treat it as write; only the CrystalDBA server's
+		// restricted-mode query keeps the read class below.
 		name:   "postgres",
-		source: "npm @modelcontextprotocol/server-postgres 0.6.2; postgres-mcp 0.3.0",
+		source: "npm @modelcontextprotocol/server-postgres 0.6.2",
 		identifiers: []string{
 			"@modelcontextprotocol/server-postgres", "server-postgres",
-			"mcp-server-postgres", "mcp_server_postgres", "postgres-mcp",
-			"mcp/postgres", "postgres",
+			"mcp-server-postgres", "mcp_server_postgres", "mcp/postgres", "postgres",
+		},
+		tools: mergeProfileTools(
+			profileToolSet("read",
+				"list_schemas", "list_objects", "get_object_details",
+				"explain_query", "get_top_queries", "analyze_workload_indexes",
+				"analyze_query_indexes", "analyze_db_health",
+			),
+			profileToolSet("write", "query", "execute_sql"),
+		),
+	},
+	{
+		name:   "postgres-mcp",
+		source: "postgres-mcp 0.3.0 (CrystalDBA)",
+		identifiers: []string{
+			"postgres-mcp", "postgres_mcp", "crystaldba/postgres-mcp",
+			"mcp/postgres-mcp", "mcp/postgres_mcp",
 		},
 		tools: mergeProfileTools(
 			profileToolSet("read",
@@ -4564,10 +4583,10 @@ var builtinProfiles = []policyProfile{
 				"browser_localstorage_get", "browser_localstorage_list",
 				"browser_network_request", "browser_network_requests",
 				"browser_route_list", "browser_sessionstorage_get",
-				"browser_sessionstorage_list", "browser_snapshot", "browser_storage_state",
-				"browser_take_screenshot", "browser_verify_element_visible",
-				"browser_verify_list_visible", "browser_verify_text_visible",
-				"browser_verify_value", "browser_wait_for", "puppeteer_screenshot",
+				"browser_sessionstorage_list", "browser_storage_state",
+				"browser_verify_element_visible", "browser_verify_list_visible",
+				"browser_verify_text_visible", "browser_verify_value", "browser_wait_for",
+				"puppeteer_screenshot",
 			),
 			profileToolSet("write",
 				"browser_annotate", "browser_click", "browser_close",
@@ -4580,13 +4599,13 @@ var builtinProfiles = []policyProfile{
 				"browser_mouse_click_xy", "browser_mouse_down", "browser_mouse_drag_xy",
 				"browser_mouse_move_xy", "browser_mouse_up", "browser_mouse_wheel",
 				"browser_network_state_set", "browser_pdf_save", "browser_press_key",
-				"browser_resize", "browser_resume", "browser_route",
+				"browser_resize", "browser_resume", "browser_route", "browser_snapshot",
 				"browser_sessionstorage_clear", "browser_sessionstorage_delete",
 				"browser_sessionstorage_set", "browser_set_storage_state",
 				"browser_select_option", "browser_start_recording", "browser_start_tracing",
 				"browser_start_video", "browser_stop_recording", "browser_stop_tracing",
-				"browser_stop_video", "browser_tabs", "browser_type", "browser_unroute",
-				"browser_video_chapter",
+				"browser_stop_video", "browser_tabs", "browser_take_screenshot",
+				"browser_type", "browser_unroute", "browser_video_chapter",
 				"browser_video_hide_actions", "browser_video_show_actions",
 				"puppeteer_click", "puppeteer_fill", "puppeteer_hover", "puppeteer_select",
 			),
@@ -4636,7 +4655,7 @@ var builtinProfiles = []policyProfile{
 				"get_user_profile", "search_assignable_users", "get_issue_watchers",
 				"get_issue", "search", "search_fields", "get_field_options",
 				"get_project_issues", "get_transitions", "get_worklog",
-				"download_attachments", "get_issue_images", "get_agile_boards",
+				"get_issue_images", "get_agile_boards",
 				"get_board_issues", "get_sprints_from_board", "get_sprint_issues",
 				"get_link_types", "batch_get_changelogs", "get_project_issue_types",
 				"get_create_fields", "get_project_versions", "get_project_components",
@@ -4649,7 +4668,7 @@ var builtinProfiles = []policyProfile{
 				"jira_get_issue", "jira_search", "jira_search_fields",
 				"jira_search_assignable_users", "jira_get_transitions", "jira_get_worklog",
 				"jira_get_user_profile", "jira_get_issue_watchers", "jira_get_issue_images",
-				"jira_download_attachments", "jira_get_project_issues",
+				"jira_get_project_issues",
 				"jira_get_projects", "jira_get_all_projects", "jira_search_projects",
 				"jira_get_issue_types", "jira_get_create_fields", "jira_get_project_fields",
 				"jira_get_project_versions", "jira_get_project_components",
@@ -4667,6 +4686,7 @@ var builtinProfiles = []policyProfile{
 			profileToolSet("write",
 				"add_watcher", "remove_watcher", "create_issue", "batch_create_issues",
 				"update_issue", "assign_issue", "delete_issue", "move_issue",
+				"download_attachments", "jira_download_attachments",
 				"add_comment", "edit_comment", "add_worklog", "link_to_epic",
 				"create_issue_link", "create_remote_issue_link", "remove_issue_link",
 				"transition_issue", "create_sprint", "update_sprint",
@@ -4720,7 +4740,12 @@ func normalizeProfileToken(t string) string {
 	t = strings.TrimSuffix(t, ".exe")
 	t = strings.TrimPrefix(t, "./")
 	if i := strings.LastIndex(t, "@"); i > 0 {
-		t = t[:i] // @scope/pkg@version -> @scope/pkg
+		// Strip only a trailing @version on the final path segment. An @ that
+		// starts a scope inside a path is package syntax, not a version.
+		segmentStart := strings.LastIndexAny(t[:i], `/\`) + 1
+		if i > segmentStart && !strings.ContainsAny(t[i+1:], `/\`) {
+			t = t[:i]
+		}
 	}
 	return t
 }
@@ -4739,6 +4764,36 @@ func profileMatchTokens(args []string) []string {
 		add(arg)
 		add(path.Base(strings.ReplaceAll(arg, `\`, "/")))
 		add(filepath.Base(arg))
+		for _, scoped := range nodeModuleScopeTokens(arg) {
+			add(scoped)
+		}
+	}
+	return out
+}
+
+func nodeModuleScopeTokens(t string) []string {
+	t = strings.ReplaceAll(t, `\`, "/")
+	const prefix = "node_modules/"
+	var out []string
+	addPackage := func(rest string) {
+		parts := strings.SplitN(rest, "/", 3)
+		if len(parts) >= 2 && len(parts[0]) > 1 && strings.HasPrefix(parts[0], "@") && parts[1] != "" {
+			out = append(out, parts[0]+"/"+parts[1])
+		}
+	}
+	if strings.HasPrefix(t, prefix) {
+		addPackage(t[len(prefix):])
+	}
+	offset := 0
+	marker := "/" + prefix
+	for {
+		i := strings.Index(t[offset:], marker)
+		if i < 0 {
+			break
+		}
+		i += offset + len(marker)
+		addPackage(t[i:])
+		offset = i
 	}
 	return out
 }
@@ -4754,7 +4809,7 @@ func profileMatchScore(p *policyProfile, tokens []string) int {
 				score = 1000 + len(id)
 			case strings.HasSuffix(token, "/"+id):
 				score = 500 + len(id)
-			case strings.Contains(token, id):
+			case len(id) > 5 && profileWholeTokenMatch(token, id):
 				score = 100 + len(id)
 			}
 			if score > best {
@@ -4763,6 +4818,35 @@ func profileMatchScore(p *policyProfile, tokens []string) int {
 		}
 	}
 	return best
+}
+
+// profileWholeTokenMatch accepts an identifier only when both sides sit on a
+// package/path boundary. Short generic names such as git or shell use exact or
+// basename matches only, so a package like digital-ocean-mcp cannot select them.
+func profileWholeTokenMatch(token, id string) bool {
+	for offset := 0; offset < len(token); {
+		i := strings.Index(token[offset:], id)
+		if i < 0 {
+			return false
+		}
+		i += offset
+		beforeOK := i == 0 || profileTokenBoundary(token[i-1])
+		after := i + len(id)
+		afterOK := after == len(token) || profileTokenBoundary(token[after])
+		if beforeOK && afterOK {
+			return true
+		}
+		offset = i + 1
+	}
+	return false
+}
+
+func profileTokenBoundary(b byte) bool {
+	switch b {
+	case '-', '_', '/', '@', '.':
+		return true
+	}
+	return false
 }
 
 // selectPolicyProfile applies policy.profile first, then auto-detection by

@@ -289,9 +289,10 @@ wraps one MCP server per process over stdio or Streamable HTTP.
 - Versioned policy file (`--policy` or `<state-dir>/policy.yaml`) with per-tool
   classes, path keys, allow paths, trust, sensitive patterns, egress host lists,
   approval mode and spotlight; flags remain and override the file
-- Built-in profiles for filesystem, git, GitHub, fetch, shell, Slack, Postgres,
-  browser (Playwright/Puppeteer), Notion and Jira, selected automatically from
-  the server command/package name and overridable per tool
+- Built-in profiles for filesystem, git, GitHub, fetch, shell, Slack, Postgres
+  (legacy and CrystalDBA `postgres-mcp`), browser (Playwright/Puppeteer), Notion
+  and Jira, selected automatically from the server command/package name and
+  overridable per tool
 - Server-command allowlist with exact command/args entries and optional SHA-256
   of the binary or package lock; `sylenix-guard allow <name>` and install
   pre-population
@@ -539,11 +540,12 @@ allow/deny lists and the approval mode. Unknown tools default to `exec`; unknown
 fields, duplicate keys, bad versions and malformed patterns stop the guard at
 startup instead of being ignored. The file is read once at startup.
 
-Built-in profiles cover filesystem, git, GitHub, fetch, shell, Slack, Postgres,
-browser (Playwright/Puppeteer), Notion and Jira. The profile is selected from
-the server command/package name (with `--name` as a fallback), and a policy
-entry for a tool overrides the profile. Use `profile: auto` (default),
-`profile: none`, or `profile: <name>` in the policy file to control it.
+Built-in profiles cover filesystem, git, GitHub, fetch, shell, Slack, Postgres
+(legacy and CrystalDBA `postgres-mcp`), browser (Playwright/Puppeteer), Notion
+and Jira. The profile is selected from the server command/package name (with
+`--name` as a fallback), and a policy entry for a tool overrides the profile.
+Use `profile: auto` (default), `profile: none`, or `profile: <name>` in the
+policy file to control it.
 
 The policy file also holds the server-command allowlist. Entries match the
 exact command and argument list, with optional `*`/`?` argument patterns and an

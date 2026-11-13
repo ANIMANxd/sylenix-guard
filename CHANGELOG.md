@@ -46,6 +46,18 @@
 - Extended `isInvisible` with U+FE00-FE0F, U+2800, U+1D173-1D17A and U+FFFC;
   removed F7a-F7c from `KNOWN_FAIL` and added
   `tests/probes/test_datamark_2026_11.py`.
+- Classified Jira attachment downloads as write.
+- Classified Playwright screenshot and snapshot tools as write while keeping
+  console and network-request reads read-only.
+- Split the Postgres profile: legacy `server-postgres` `query` is write, while
+  CrystalDBA `postgres-mcp` keeps restricted-mode `query` read.
+- Restricted profile matching to exact, path-suffix or whole-token boundary
+  matches; short names such as git, shell, fetch and jira no longer match inside
+  unrelated package names.
+- Fixed `@version` stripping so scoped package paths are not truncated, and
+  added `@scope/pkg` tokens from `node_modules` paths.
+- Removed F8 and F9 from `KNOWN_FAIL` and added
+  `tests/probes/test_profile_classes_2026_11.py`.
 
 ## 2026-11-11
 

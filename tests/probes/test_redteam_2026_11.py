@@ -38,16 +38,15 @@ REDTEAM_SERVER = os.path.join(ROOT, "tests", "probes", "redteam_server.py")
 PROFILE_SERVER = os.path.join(ROOT, "tests", "probes", "profile_server.py")
 
 # Cases that fail on the commit before the corresponding fix. Remove a case
-# from this set in the commit that fixes it. F1, F2, F3a-F3e, F4, F5, F6 and
-# F7a-F7c were fixed by session sharing, the read-class scan, exact-key
-# tools/call rewrite, structured dialog, server-metadata taint, exact-file
-# grants and result-string sanitisation, so they no longer belong here.
+# from this set in the commit that fixes it. F1, F2, F3a-F3e, F4, F5, F6,
+# F7a-F7c, F8 and F9 were fixed by session sharing, the read-class scan,
+# exact-key tools/call rewrite, structured dialog, server-metadata taint,
+# exact-file grants, result-string sanitisation and profile matching fixes, so
+# they no longer belong here.
 # F2-read and F3-meta are compatibility controls, not expected failures: they
 # pass before and after the fixes. F2-dialog and F4-github exercise new paths;
 # they fail before the fix and pass after.
-KNOWN_FAIL = {
-    "F8", "F9",
-}
+KNOWN_FAIL = set()
 
 passed = 0
 xfailed = 0

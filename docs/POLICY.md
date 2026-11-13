@@ -243,6 +243,12 @@ selection; `profile: none` disables it; `profile: <name>` forces one. An unknown
 profile name is a startup error. `playwright` and `puppeteer` are aliases for
 `browser`, `postgresql` for `postgres`, and `atlassian` for `jira`.
 
+Short generic identifiers such as `git`, `shell`, `fetch` and `jira` match only
+an exact command/package token or a path basename. Other identifiers must also
+sit on a `-`, `_`, `/`, `@` or `.` boundary. Scoped packages found below
+`node_modules` are matched as `@scope/pkg`, and a trailing `@version` is removed
+without truncating a scoped package path.
+
 A policy entry for a tool replaces the profile's class for that tool, even when
 the entry only adds `path_keys` or `allow_paths`. To make a profile tool
 unknown/restrictive again, set `class: exec`.
@@ -255,10 +261,18 @@ unknown/restrictive again, set `class: exec`.
 | `fetch` | PyPI `mcp-server-fetch` 2026.11.4 | `mcp-server-fetch`, `mcp_server_fetch`, `mcp/fetch` |
 | `shell` | npm `mcp-shell` 0.1.3, `@mkusaka/mcp-shell-server` 0.1.1, `@mako10k/mcp-shell-server` 2.8.1 | `mcp-shell`, `mcp-shell-server`, `@mkusaka/mcp-shell-server` |
 | `slack` | npm `@modelcontextprotocol/server-slack` 2025.4.25 | `@modelcontextprotocol/server-slack`, `mcp-server-slack`, `mcp/slack` |
-| `postgres` | npm `@modelcontextprotocol/server-postgres` 0.6.2 and `postgres-mcp` 0.3.0 | `@modelcontextprotocol/server-postgres`, `mcp-server-postgres`, `postgres-mcp` |
+| `postgres` | npm `@modelcontextprotocol/server-postgres` 0.6.2 | `@modelcontextprotocol/server-postgres`, `mcp-server-postgres`, `mcp/postgres` |
+| `postgres-mcp` | `postgres-mcp` 0.3.0 (CrystalDBA) | `postgres-mcp`, `crystaldba/postgres-mcp`, `mcp/postgres-mcp` |
 | `browser` | npm `@playwright/mcp` 0.0.84 and `@modelcontextprotocol/server-puppeteer` 2025.5.12 | `@playwright/mcp`, `playwright-mcp`, `mcp-server-puppeteer` |
 | `notion` | npm `@notionhq/notion-mcp-server` 2.6.1 (Notion API 2025-09-03) | `@notionhq/notion-mcp-server`, `notion-mcp-server`, `mcp/notion` |
 | `jira` | PyPI `mcp-atlassian` 0.23.1 | `mcp-atlassian`, `mcp_atlassian`, `jira-mcp-atlassian` |
+
+The legacy `postgres` profile treats `query` as write because that server does
+not enforce a read-only transaction. The `postgres-mcp` profile keeps `query`
+read for CrystalDBA's restricted mode; `execute_sql` is write in both. Jira's
+attachment downloads and Playwright's screenshot/snapshot tools are write
+because they create files, while `browser_console_messages` and
+`browser_network_requests` remain read.
 
 Profiles are conservative defaults, not a trust decision you can skip: review
 the class of any write, exec or egress tool before relying on it, and override
