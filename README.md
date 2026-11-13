@@ -163,7 +163,7 @@ requires authorization that the agent cannot grant itself.
 | Component | Mechanism |
 |---|---|
 | Manifest guard | Tool, resource, prompt and resource-template definitions are pinned on first sight. A changed tool definition, or one containing hidden characters, quarantines the tool. |
-| Ingress sanitizer | Tool results are wrapped in `<untrusted_tool_result>` markers; instructions and definition descriptions/titles are stripped of zero-width, bidi and other invisible characters before the host sees them. |
+| Ingress sanitizer | Tool-result text is wrapped in `<untrusted_tool_result>` markers; every string in every result item, plus instructions, definition metadata and resource/prompt text, is stripped of zero-width, bidi and other invisible characters before the host sees it. Fake markers are neutralised case-insensitively. |
 | Taint tracking | Any result from a non-trusted tool, resource read, prompt fetch, non-JSON server output, unmatched response, or server-to-client request/notification carrying text or resource content marks the session as tainted. So do initialize instructions, first-sight descriptions/titles on tools, resources, templates and prompts, and completion values. |
 | Flow control | While a session is tainted, only explicitly read-only tools run freely. Every other call is evaluated against the policy tiers below. |
 | Fail-closed framing | Batch frames, duplicate keys, duplicate ids, and unparseable or oversize frames are refused with a JSON-RPC error. Whatever can survive does; whatever cannot is refused. |
@@ -282,7 +282,8 @@ wraps one MCP server per process over stdio or Streamable HTTP.
   events, a disk outbox while offline, JSON export, RFC 5424 syslog output, a
   token-login server-rendered audit dashboard, and date-range CSV/PDF evidence
   exports; the event schema never includes argument values or content
-- Result datamarking and invisible-character stripping, including `structuredContent`
+- Result datamarking and invisible-character stripping across text, embedded
+  resources, resource links, annotations, resource/prompt text and `structuredContent`
 - Session taint tracking with default-deny flow control
 - Hard blocks for network targets and sensitive paths
 - Versioned policy file (`--policy` or `<state-dir>/policy.yaml`) with per-tool
@@ -729,7 +730,9 @@ bypass, response expectations and safe harbour.
   present; without a key, `--require-signatures` reports the file as unsigned
   rather than assuming it is safe. It never executes the configured server or
   Guard binary.
-- Datamarking breaks some emoji sequences and some Persian and Indic text.
+- Invisible-character stripping breaks some emoji sequences and some Persian and
+  Indic text; removing variation selectors such as U+FE0F also changes emoji
+  presentation.
 - The dialog is not biometric: long or confusable arguments can mislead, and while it is
   open the host's other requests wait. The Windows dialog was exercised in the 7-day
   trial (one denied write); `demo/manual_dialog_test.py` remains the manual check.

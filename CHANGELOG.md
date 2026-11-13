@@ -36,6 +36,16 @@
   the store is signed.
 - Removed F5 from `KNOWN_FAIL` and added `tests/probes/test_server_metadata.py`
   for metadata taint, `trust_metadata`, reviewed pins and signed review.
+- Stripped invisible characters from every string in every tool-result content
+  item, including embedded `resource.text`, resource-link labels and
+  annotations, and prefixed embedded resource text with an untrusted-origin marker.
+- Stripped invisible characters and neutralised forged trust markers in
+  `resources/read` contents text and `prompts/get` message text.
+- Neutralised opening and closing `untrusted_tool_result` markers
+  case-insensitively and after normalising fullwidth angle brackets.
+- Extended `isInvisible` with U+FE00-FE0F, U+2800, U+1D173-1D17A and U+FFFC;
+  removed F7a-F7c from `KNOWN_FAIL` and added
+  `tests/probes/test_datamark_2026_11.py`.
 
 ## 2026-11-11
 

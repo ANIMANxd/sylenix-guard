@@ -31,7 +31,7 @@ def tools():
     if os.environ.get("FAKE_INVISIBLE"):
         desc = "".join(chr(int(h, 16)) for h in os.environ["FAKE_INVISIBLE"].split(","))
     if os.environ.get("FAKE_PLAIN_UNICODE"):
-        desc = "Écrire un fichier 日本語 🙂 ❤\ufe0f"
+        desc = "Écrire un fichier 日本語 🙂"
     obj = {"type": "object", "properties": {"path": {"type": "string"}}}
     return [
         {"name": "read_ticket", "description": "", "inputSchema": obj},

@@ -5997,8 +5997,80 @@ func (g *Guard) fromServer(line []byte) []byte {
 		if pol.spotlight && p.method == "tools/call" {
 			return g.datamark(f, origin, line)
 		}
+		if p.method == "resources/read" || p.method == "prompts/get" {
+			if stripped := stripReadOrPromptText(f, p.method); stripped != nil {
+				return stripped
+			}
+		}
 	}
 	return line
+}
+
+// stripReadOrPromptText removes invisible characters and deactivates forged
+// trust markers in the model-visible text of resource and prompt results. These
+// results are not wrapped, so their schema stays intact.
+func stripReadOrPromptText(f frame, method string) []byte {
+	dec := json.NewDecoder(bytes.NewReader(f["result"]))
+	dec.UseNumber()
+	var result map[string]any
+	if dec.Decode(&result) != nil {
+		return nil
+	}
+	changed := false
+	sanitizeField := func(m map[string]any) {
+		s, ok := m["text"].(string)
+		if !ok {
+			return
+		}
+		if clean := neutralizeMarkers(stripInvisible(s)); clean != s {
+			m["text"] = clean
+			changed = true
+		}
+	}
+	switch method {
+	case "resources/read":
+		contents, _ := result["contents"].([]any)
+		for _, item := range contents {
+			if m, ok := item.(map[string]any); ok {
+				sanitizeField(m)
+			}
+		}
+	case "prompts/get":
+		messages, _ := result["messages"].([]any)
+		for _, item := range messages {
+			m, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			switch content := m["content"].(type) {
+			case map[string]any:
+				sanitizeField(content)
+			case []any:
+				for _, part := range content {
+					if pm, ok := part.(map[string]any); ok {
+						sanitizeField(pm)
+					}
+				}
+			}
+		}
+	}
+	if !changed {
+		return nil
+	}
+	raw, err := json.Marshal(result)
+	if err != nil {
+		return nil
+	}
+	out := make(map[string]json.RawMessage, len(f))
+	for k, v := range f {
+		out[k] = v
+	}
+	out["result"] = raw
+	b, err := json.Marshal(out)
+	if err != nil {
+		return nil
+	}
+	return b
 }
 
 // initializeHasInstructions treats a present but non-string instructions field
@@ -6402,20 +6474,38 @@ func (g *Guard) datamark(f frame, origin string, orig []byte) []byte {
 	if json.Unmarshal(f["result"], &res) != nil {
 		return orig
 	}
-	var content []map[string]any
-	if json.Unmarshal(res["content"], &content) != nil {
+	dec := json.NewDecoder(bytes.NewReader(res["content"]))
+	dec.UseNumber()
+	var content []any
+	if dec.Decode(&content) != nil {
 		return orig
 	}
-	for _, c := range content {
-		if c["type"] != "text" {
-			continue
-		}
-		s, ok := c["text"].(string)
+	for i, item := range content {
+		// Every string in the item is untrusted, including embedded resource
+		// text, resource-link labels and annotations. Only text items are
+		// wrapped, because wrapping another type breaks its schema.
+		item = neutralizeAll(stripAll(item))
+		content[i] = item
+		c, ok := item.(map[string]any)
 		if !ok {
 			continue
 		}
-		s = strings.ReplaceAll(stripInvisible(s), "</untrusted_tool_result", "</untrusted_tool_result_")
-		c["text"] = fmt.Sprintf("<untrusted_tool_result origin=%q integrity=\"untrusted\">\n%s\n</untrusted_tool_result>", origin, s)
+		switch c["type"] {
+		case "text":
+			s, ok := c["text"].(string)
+			if !ok {
+				continue
+			}
+			c["text"] = fmt.Sprintf("<untrusted_tool_result origin=%q integrity=\"untrusted\">\n%s\n</untrusted_tool_result>", origin, s)
+		case "resource":
+			resource, ok := c["resource"].(map[string]any)
+			if !ok {
+				continue
+			}
+			if s, ok := resource["text"].(string); ok {
+				resource["text"] = fmt.Sprintf("[untrusted resource from %s]\n%s", cleanForDialog(origin, 120), s)
+			}
+		}
 	}
 	nc, err := json.Marshal(content)
 	if err != nil {
@@ -8409,12 +8499,19 @@ func isInvisible(r rune) bool {
 		r == 0x061C,                                        // Arabic letter mark
 		r == 0x115F, r == 0x1160, r == 0x3164, r == 0xFFA0, // Hangul fillers
 		r == 0x17B4, r == 0x17B5, // Khmer inherent vowels
-		r == 0x180E,                // Mongolian vowel separator
-		r >= 0x200B && r <= 0x200F, // zero-width and direction marks
-		r >= 0x2028 && r <= 0x202E, // line and paragraph separators, bidi embeddings and overrides
-		r >= 0x2060 && r <= 0x206F, // word joiner, invisible operators, deprecated format controls
+		r == 0x180E,                  // Mongolian vowel separator
+		r >= 0x200B && r <= 0x200F,   // zero-width and direction marks
+		r >= 0x2028 && r <= 0x202E,   // line and paragraph separators, bidi embeddings and overrides
+		r >= 0x2060 && r <= 0x206F,   // word joiner, invisible operators, deprecated format controls
+		r == 0x2800,                  // braille pattern blank
+		r >= 0x1D173 && r <= 0x1D17A, // musical symbol formatting (begin/end beam, tie, slur, phrase)
+		// Variation selectors. Stripping U+FE0F changes emoji presentation
+		// (for example text vs emoji rendering) but it is also a common way to
+		// hide characters from a reader.
+		r >= 0xFE00 && r <= 0xFE0F,
 		r == 0xFEFF,
 		r >= 0xFFF9 && r <= 0xFFFB,   // interlinear annotation
+		r == 0xFFFC,                  // object replacement character
 		r >= 0xE0000 && r <= 0xE007F, // Unicode tag characters
 		r >= 0xE0100 && r <= 0xE01EF: // variation selectors supplement
 		return true
@@ -8523,6 +8620,62 @@ func stripAll(v any) any {
 		return t
 	}
 	return v
+}
+
+// neutralizeAll applies neutralizeMarkers to every string value.
+func neutralizeAll(v any) any {
+	switch t := v.(type) {
+	case string:
+		return neutralizeMarkers(t)
+	case []any:
+		for i := range t {
+			t[i] = neutralizeAll(t[i])
+		}
+		return t
+	case map[string]any:
+		for k, x := range t {
+			t[k] = neutralizeAll(x)
+		}
+		return t
+	}
+	return v
+}
+
+// neutralizeMarkers makes a forged trust marker readable but inert. It accepts
+// either case and both opening and closing forms, inserts "_" after the marker
+// name, and normalises fullwidth angle brackets before the check.
+func neutralizeMarkers(s string) string {
+	s = strings.NewReplacer("\uFF1C", "<", "\uFF1E", ">").Replace(s)
+	const marker = "untrusted_tool_result"
+	var b strings.Builder
+	last := 0
+	for i := 0; i < len(s); {
+		if s[i] == '<' {
+			if i+1+len(marker) <= len(s) && strings.EqualFold(s[i+1:i+1+len(marker)], marker) {
+				end := i + 1 + len(marker)
+				b.WriteString(s[last:end])
+				b.WriteByte('_')
+				last = end
+				i = end
+				continue
+			}
+			if i+2+len(marker) <= len(s) && s[i+1] == '/' &&
+				strings.EqualFold(s[i+2:i+2+len(marker)], marker) {
+				end := i + 2 + len(marker)
+				b.WriteString(s[last:end])
+				b.WriteByte('_')
+				last = end
+				i = end
+				continue
+			}
+		}
+		i++
+	}
+	if last == 0 {
+		return s
+	}
+	b.WriteString(s[last:])
+	return b.String()
 }
 
 // hasFoldCollidingKeys reports whether any JSON object inside b contains two
